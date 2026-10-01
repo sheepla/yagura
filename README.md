@@ -6,8 +6,9 @@ preview on the right, and puts the mode, the position in the tree and anything
 that needs saying on the status bar.
 
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
-M1 (the static file tree) and M2 (the preview content). The git baseline and the
-diff, filesystem watching and the finders are not implemented yet.
+M1 (the static file tree) and M2 (the preview content, with syntax
+highlighting). The git baseline and the diff, filesystem watching and the
+finders are not implemented yet.
 
 ## Status
 
@@ -15,8 +16,8 @@ diff, filesystem watching and the finders are not implemented yet.
 | --- | --- | --- |
 | M0 | CLI, terminal lifecycle, Flux loop, theme, layout, store loop | done |
 | M1 | `core/fsmodel`, lazy tree, sorting, scrolling, icons, status bar, keymap | done |
-| M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling | done |
-| M2+ | syntax highlighting, baseline and diff, watching, finders, help, editor | not started |
+| M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting | done |
+| M2+ | baseline and diff, watching, finders, markdown, help, editor | not started |
 
 ## Build
 
@@ -104,6 +105,14 @@ and 2000 lines, and the header says so rather than letting a short body look
 like a whole file. Binary files are recognised by a NUL byte in their first
 8 KiB and shown by kind and size. `r` reads the shown file again, keeping the
 body and the scroll position in place until the new document has arrived.
+
+The same read also gives every line its meaning. `syntect` parses the file on
+that blocking task and the theme maps the scopes onto the terminal's 16 colors,
+so a keyword, a string, a comment, a number, a type and a function are told
+apart without the program ever choosing a color itself. The syntax definitions
+load the first time something is highlighted rather than at startup, and the
+run stops at 10,000 lines or 150 ms, with `highlight truncated` in the header
+when it does.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 

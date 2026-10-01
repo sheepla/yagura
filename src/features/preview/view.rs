@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::app::state::AppState;
+use crate::core::highlight::{self, Semantic};
 use crate::core::preview::{Doc, human_size};
 use crate::core::text::sanitize_os;
 use crate::ui::theme::{Role, Theme};
@@ -83,16 +84,19 @@ fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
         .len()
         .min(state.preview.scroll_line.saturating_add(height));
     for index in state.preview.scroll_line..end {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:>4} ", index + 1),
-                state.theme.style(Role::PreviewGutter),
-            ),
-            Span::styled(
-                cut(&doc.lines[index], state.preview.scroll_col, width),
-                state.theme.style(Role::PreviewText),
-            ),
-        ]));
+        let runs = doc.spans.get(index).map(Vec::as_slice).unwrap_or_default();
+        let mut spans = vec![Span::styled(
+            format!("{:>4} ", index + 1),
+            state.theme.style(Role::PreviewGutter),
+        )];
+        spans.extend(cut(
+            &doc.lines[index],
+            runs,
+            state.preview.scroll_col,
+            width,
+            &state.theme,
+        ));
+        lines.push(Line::from(spans));
     }
     while lines.len() < height {
         lines.push(Line::default());
@@ -100,20 +104,61 @@ fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     Text::from(lines)
 }
 
-/// Keeps the columns from `from` on, for a pane that does not wrap.
-fn cut(text: &str, from: usize, width: usize) -> String {
-    if from == 0 {
-        return crate::core::text::truncate_to_width(text, width);
+/// One line, cut to the pane and split by what each run of it means.
+///
+/// The gaps between runs mean nothing and are drawn as the pane's own text,
+/// so a line the reader never highlighted still comes out whole.
+fn cut<'a>(
+    line: &'a str,
+    runs: &'a [highlight::Span],
+    from: usize,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    let window = crate::core::text::window(line, from, width);
+    let base = theme.style(Role::PreviewText);
+    let mut out = Vec::new();
+    let mut cursor = window.start;
+    for run in runs {
+        if run.end <= window.start {
+            continue;
+        }
+        if run.start >= window.end {
+            break;
+        }
+        let start = run.start.max(window.start);
+        let end = run.end.min(window.end);
+        if start > cursor {
+            out.push(Span::styled(&line[cursor..start], base));
+        }
+        if end > start {
+            out.push(Span::styled(
+                &line[start..end],
+                theme.style(role(run.semantic)),
+            ));
+        }
+        cursor = end;
     }
-    let skipped = text
-        .chars()
-        .scan(0usize, |column, ch| {
-            *column += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            Some(*column)
-        })
-        .take_while(|column| *column <= from)
-        .count();
-    crate::core::text::truncate_to_width(&text[skipped..], width)
+    if cursor < window.end {
+        out.push(Span::styled(&line[cursor..window.end], base));
+    }
+    if window.cut {
+        out.push(Span::styled("…", base));
+    }
+    out
+}
+
+/// The role a meaning is drawn with.
+fn role(semantic: Semantic) -> Role {
+    match semantic {
+        Semantic::Plain => Role::PreviewText,
+        Semantic::Keyword => Role::SyntaxKeyword,
+        Semantic::String => Role::SyntaxString,
+        Semantic::Comment => Role::SyntaxComment,
+        Semantic::Number => Role::SyntaxNumber,
+        Semantic::Type => Role::SyntaxType,
+        Semantic::Function => Role::SyntaxFunction,
+    }
 }
 
 fn line_of_hint(frame: &mut Frame<'_>, area: Rect, hint: &str, theme: &Theme) {
@@ -134,6 +179,7 @@ mod tests {
     use crate::core::preview::{BinaryKind, Language};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
 
     fn state() -> AppState {
         AppState::new(
@@ -150,7 +196,7 @@ mod tests {
         )
     }
 
-    fn buffer(state: &AppState) -> String {
+    fn draw(state: &AppState) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("terminal");
         terminal
             .draw(|frame| {
@@ -162,7 +208,11 @@ mod tests {
                 );
             })
             .expect("draw");
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer(state: &AppState) -> String {
+        let buffer = draw(state);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -208,6 +258,8 @@ mod tests {
             lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             truncated: false,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: None,
             link_target: None,
@@ -257,6 +309,8 @@ mod tests {
             lines: Vec::new(),
             truncated: false,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: Some(BinaryKind::Image),
             link_target: None,
@@ -280,6 +334,8 @@ mod tests {
             lines: Vec::new(),
             truncated: false,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: Some(BinaryKind::Image),
             link_target: None,
@@ -302,6 +358,8 @@ mod tests {
             lines: vec!["body".to_owned()],
             truncated: true,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: None,
             link_target: None,
@@ -340,6 +398,8 @@ mod tests {
             lines: vec![long],
             truncated: false,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: None,
             link_target: None,
@@ -352,6 +412,82 @@ mod tests {
         assert!(
             !text.contains(&"x".repeat(40)),
             "the line was not cut:\n{text}"
+        );
+    }
+
+    /// A one-line document whose meanings the reader already knows.
+    fn highlighted() -> AppState {
+        let mut state = state();
+        state.preview.viewport = 4;
+        let doc = Doc {
+            rel: PathBuf::from("a.rs"),
+            name: "a.rs".into(),
+            size: 19,
+            language: Language::Rust,
+            lines: vec!["let n = 42; // note".to_owned()],
+            spans: vec![vec![
+                highlight::Span {
+                    start: 0,
+                    end: 3,
+                    semantic: Semantic::Type,
+                },
+                highlight::Span {
+                    start: 6,
+                    end: 7,
+                    semantic: Semantic::Keyword,
+                },
+                highlight::Span {
+                    start: 8,
+                    end: 10,
+                    semantic: Semantic::Number,
+                },
+                highlight::Span {
+                    start: 12,
+                    end: 19,
+                    semantic: Semantic::Comment,
+                },
+            ]],
+            truncated: false,
+            too_large: false,
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+        };
+        state.preview.path = Some(doc.rel.clone());
+        state.preview.set_doc(doc);
+        state
+    }
+
+    #[test]
+    fn a_highlighted_line_is_drawn_in_its_meanings() {
+        let buffer = draw(&highlighted());
+        // The gutter takes five columns, so the line starts at column five.
+        assert_eq!(buffer[(5, 1)].fg, Color::Yellow, "let");
+        assert_eq!(buffer[(8, 1)].fg, Color::Reset, "the gap after it");
+        assert_eq!(buffer[(11, 1)].fg, Color::Magenta, "=");
+        assert_eq!(buffer[(13, 1)].fg, Color::Cyan, "42");
+        assert_eq!(buffer[(17, 1)].fg, Color::DarkGray, "// note");
+        assert!(buffer[(17, 1)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn a_terminal_without_colors_keeps_the_attributes() {
+        let mut state = highlighted();
+        state.theme = Theme::new(true);
+        let buffer = draw(&state);
+        for column in 5..=16 {
+            assert_eq!(
+                buffer[(column, 1)].fg,
+                Color::Reset,
+                "column {column} still had a color"
+            );
+        }
+        let comment = &buffer[(17, 1)];
+        assert_eq!(comment.fg, Color::Reset);
+        assert!(
+            comment.modifier.contains(Modifier::DIM),
+            "a comment without color has nothing left to say"
         );
     }
 }

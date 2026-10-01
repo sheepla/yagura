@@ -471,6 +471,8 @@ fn a_selection_asks_the_preview_for_a_file_and_for_nothing_else() {
                 lines: vec!["late".to_owned()],
                 truncated: false,
                 too_large: false,
+                spans: Vec::new(),
+                highlight_truncated: false,
                 invalid_utf8: false,
                 binary: None,
                 link_target: None,

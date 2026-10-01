@@ -28,6 +28,18 @@ pub enum Role {
     StatusPosition,
     StatusMuted,
     TooSmall,
+    /// A word the language is built on: `let`, `if`, an operator.
+    SyntaxKeyword,
+    /// The contents of a quoted string.
+    SyntaxString,
+    /// A remark left for a reader.
+    SyntaxComment,
+    /// A number written out.
+    SyntaxNumber,
+    /// A name of a type.
+    SyntaxType,
+    /// The name a function is called by.
+    SyntaxFunction,
 }
 
 /// Resolves roles to styles for one terminal.
@@ -73,6 +85,12 @@ fn color(role: Role) -> Color {
         Role::PreviewPlaceholder | Role::PreviewGutter => Color::DarkGray,
         Role::StatusMode => Color::Black,
         Role::StatusPosition => Color::Reset,
+        Role::SyntaxKeyword => Color::Magenta,
+        Role::SyntaxString => Color::Green,
+        Role::SyntaxComment => Color::DarkGray,
+        Role::SyntaxNumber => Color::Cyan,
+        Role::SyntaxType => Color::Yellow,
+        Role::SyntaxFunction => Color::Blue,
     }
 }
 
@@ -89,7 +107,8 @@ fn modifiers(role: Role) -> Modifier {
         | Role::PreviewPlaceholder
         | Role::PreviewGutter
         | Role::TooSmall
-        | Role::PaneBorder => Modifier::DIM,
+        | Role::PaneBorder
+        | Role::SyntaxComment => Modifier::DIM,
         Role::StatusInfo
         | Role::StatusMessage
         | Role::StatusPosition
@@ -97,7 +116,12 @@ fn modifiers(role: Role) -> Modifier {
         | Role::TreeSymlink
         | Role::TreeUnreadable
         | Role::PreviewText
-        | Role::PreviewHeader => Modifier::empty(),
+        | Role::PreviewHeader
+        | Role::SyntaxKeyword
+        | Role::SyntaxString
+        | Role::SyntaxNumber
+        | Role::SyntaxType
+        | Role::SyntaxFunction => Modifier::empty(),
     }
 }
 
@@ -113,6 +137,12 @@ mod tests {
             Role::TreeDirectory,
             Role::StatusError,
             Role::StatusInfo,
+            Role::SyntaxKeyword,
+            Role::SyntaxString,
+            Role::SyntaxComment,
+            Role::SyntaxNumber,
+            Role::SyntaxType,
+            Role::SyntaxFunction,
         ] {
             let style = theme.style(role);
             let color = style.fg.expect("a color");
@@ -142,11 +172,41 @@ mod tests {
         }
     }
 
+    /// Six meanings shown in one pane must not look like one another.
+    #[test]
+    fn each_syntax_color_is_its_own() {
+        let theme = Theme::new(false);
+        let roles = [
+            Role::SyntaxKeyword,
+            Role::SyntaxString,
+            Role::SyntaxComment,
+            Role::SyntaxNumber,
+            Role::SyntaxType,
+            Role::SyntaxFunction,
+        ];
+        let colors: Vec<_> = roles
+            .iter()
+            .map(|role| theme.style(*role).fg.expect("a color"))
+            .collect();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(
+                !colors[..index].contains(color),
+                "{:?} was used twice",
+                roles[index]
+            );
+        }
+    }
+
     #[test]
     fn no_color_keeps_attributes_but_drops_colors() {
         let colored = Theme::new(false);
         let plain = Theme::new(true);
-        for role in [Role::TreeDirectory, Role::StatusError, Role::StatusMode] {
+        for role in [
+            Role::TreeDirectory,
+            Role::StatusError,
+            Role::StatusMode,
+            Role::SyntaxComment,
+        ] {
             let with_color = colored.style(role);
             let without_color = plain.style(role);
             assert!(with_color.fg.is_some());

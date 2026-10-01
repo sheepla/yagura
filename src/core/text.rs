@@ -91,22 +91,80 @@ pub fn display_width(text: &str) -> usize {
 
 /// Truncates `text` to at most `max` columns, marking the cut with `…`.
 pub fn truncate_to_width(text: &str, max: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max {
+    let window = window(text, 0, max);
+    if !window.cut {
         return text.to_owned();
     }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut width = 0;
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > budget {
-            break;
-        }
-        out.push(ch);
-        width += ch_width;
-    }
+    let mut out = text[..window.end].to_owned();
     out.push('…');
     out
+}
+
+/// The part of `text` a pane that does not wrap can show.
+///
+/// Byte offsets into `text`, so that a line can be cut once and then sliced by
+/// meaning as well as by columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Window {
+    /// Byte offset the window starts at, `from` columns into the line.
+    pub start: usize,
+    /// Byte offset the window ends at.
+    pub end: usize,
+    /// The line continues past `end`, so a `…` belongs after it.
+    pub cut: bool,
+}
+
+/// The window of `text` from column `from` that fits in `width` columns.
+pub fn window(text: &str, from: usize, width: usize) -> Window {
+    let start = skip_offset(text, from);
+    let visible = &text[start..];
+    if UnicodeWidthStr::width(visible) <= width {
+        return Window {
+            start,
+            end: text.len(),
+            cut: false,
+        };
+    }
+    // One column of the pane belongs to the ellipsis.
+    let budget = width.saturating_sub(1);
+    Window {
+        start,
+        end: start + fit_offset(visible, budget),
+        cut: true,
+    }
+}
+
+/// Byte offset where the first `max` columns of `text` end.
+///
+/// A character that does not fit is left out whole, so the offset always falls
+/// on a character boundary.
+fn fit_offset(text: &str, max: usize) -> usize {
+    let mut width = 0;
+    let mut offset = 0;
+    for (index, ch) in text.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max {
+            break;
+        }
+        width += ch_width;
+        offset = index + ch.len_utf8();
+    }
+    offset
+}
+
+/// Byte offset where `from` columns of scrolling have been passed.
+///
+/// A character the window starts in the middle of is kept: dropping it would
+/// leave a gap where the pane begins.
+fn skip_offset(text: &str, from: usize) -> usize {
+    let mut width = 0;
+    for (index, ch) in text.char_indices() {
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width > from {
+            return index;
+        }
+    }
+    text.len()
 }
 
 fn push_control_picture(out: &mut String, ch: char) {

@@ -146,3 +146,35 @@ fn a_file_that_cannot_be_read_says_so() {
     state.set_error("cannot preview README.md: permission denied (os error 13)");
     assert_snapshot!("preview_failed_text", render_text(&state));
 }
+
+#[test]
+fn a_program_is_shown_with_a_color_per_meaning() {
+    let dir = fixture();
+    // Written at the root, because the fixture only ever expands the root and
+    // a nested file would have no node to be selected by.
+    std::fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    let n = 42; // count\n}\n",
+    )
+    .expect("write");
+    let state = preview_state(dir.path(), "main.rs", false);
+    assert_snapshot!("preview_program_text", render_text(&state));
+    assert_snapshot!("preview_program_styles", render_row_styles(&state));
+}
+
+#[test]
+fn a_program_without_colors_paints_no_colors() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("write");
+    let state = preview_state(dir.path(), "main.rs", true);
+    assert_snapshot!("preview_program_no_color_styles", render_row_styles(&state));
+    for color in colors_in_frame(&state) {
+        assert!(
+            matches!(
+                color,
+                Color::Reset | Color::White | Color::Gray | Color::Black
+            ),
+            "unexpected color {color:?} in a NO_COLOR frame"
+        );
+    }
+}

@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 161
+expression: render_text(&state)
+---
+┌root──────────────────────────┐┌main.rs  39 B─────────────────────────────────┐
+│▾d root                       │   1 fn main() {                                
+│  ▸d docs                     │   2     let n = 42; // count                   
+│  ▸d src                      │   3 }                                          
+│   f main.rs                  │                                                
+│   f README.md                │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+└──────────────────────────────┘                                                
+ NORMAL                                                            rust 4/5 Top

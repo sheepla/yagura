@@ -205,6 +205,8 @@ mod tests {
             lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             truncated: false,
             too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: None,
             link_target: None,

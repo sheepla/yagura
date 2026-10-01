@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use crate::core::highlight::Span;
 use crate::core::text::{self, sanitize};
 
 /// Bytes read from a file. Anything past this is dropped.
@@ -234,10 +235,17 @@ pub struct Doc {
     pub language: Language,
     /// Lines, sanitized, without their line endings.
     pub lines: Vec<String>,
+    /// The runs of meaning inside each line, by the same index as `lines`.
+    ///
+    /// Empty when the language has nothing to color, and never a different
+    /// length from `lines` when it has (§9.3).
+    pub spans: Vec<Vec<Span>>,
     /// The file was longer than [`MAX_BYTES`].
     pub truncated: bool,
     /// The file had more lines than [`MAX_LINES`].
     pub too_large: bool,
+    /// Highlighting stopped at its line or time limit; the rest is plain.
+    pub highlight_truncated: bool,
     /// The bytes were not valid UTF-8 and were replaced.
     pub invalid_utf8: bool,
     /// Set when the file is binary; only the kind and the size are shown then.
@@ -287,6 +295,9 @@ impl Doc {
         if self.invalid_utf8 {
             notes.push("invalid UTF-8".to_owned());
         }
+        if self.highlight_truncated {
+            notes.push("highlight truncated".to_owned());
+        }
         for note in notes {
             header.push_str("  ");
             header.push_str(&note);
@@ -327,8 +338,10 @@ pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
             size,
             language: Language::default(),
             lines: Vec::new(),
+            spans: Vec::new(),
             truncated: false,
             too_large: false,
+            highlight_truncated: false,
             invalid_utf8: false,
             binary: Some(kind),
             link_target,
@@ -340,18 +353,24 @@ pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
     let language = Language::detect(rel, &text);
     let (lines, too_large) = split_lines(&sanitize(&text));
 
-    Ok(Doc {
+    let mut doc = Doc {
         rel: rel.to_path_buf(),
         name,
         size,
         language,
         lines,
+        spans: Vec::new(),
         truncated,
         too_large,
+        highlight_truncated: false,
         invalid_utf8,
         binary: None,
         link_target,
-    })
+    };
+    // The pane draws colour, so a document is not ready until it has its
+    // spans. This is the one place that runs on the worker anyway.
+    crate::core::highlight::fill(&mut doc);
+    Ok(doc)
 }
 
 /// Splits sanitized text into lines, dropping the tail past [`MAX_LINES`].
@@ -691,5 +710,32 @@ mod tests {
         assert!(header.starts_with("a.png  image"), "{header}");
         assert!(!header.contains("truncated"), "{header}");
         assert!(!header.contains("invalid"), "{header}");
+    }
+
+    #[test]
+    fn a_program_comes_back_with_the_meaning_of_each_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "main.rs", b"fn main() {\n    // hi\n}\n");
+        let doc = load_doc(&path, Path::new("main.rs")).expect("doc");
+        assert_eq!(doc.language, Language::Rust);
+        assert_eq!(doc.spans.len(), doc.lines.len());
+        assert!(!doc.spans[0].is_empty(), "the first line came back plain");
+        assert!(!doc.highlight_truncated);
+
+        // A language with nothing to color keeps no runs at all, so the view
+        // never has to tell the two cases apart by language.
+        let path = write(&dir, "notes.txt", b"just words\n");
+        let doc = load_doc(&path, Path::new("notes.txt")).expect("doc");
+        assert!(doc.spans.is_empty());
+    }
+
+    #[test]
+    fn the_header_says_when_the_colour_stopped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "main.rs", b"fn main() {}\n");
+        let mut doc = load_doc(&path, Path::new("main.rs")).expect("doc");
+        doc.highlight_truncated = true;
+        let header = doc.header();
+        assert!(header.contains("highlight truncated"), "{header}");
     }
 }
