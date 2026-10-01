@@ -62,9 +62,9 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         Command::ToggleExpand => toggle_selected(state, &mut effects),
         Command::OpenPreview => open_selected(state, &mut effects),
 
-        // The preview pane owns the scroll commands and the reload; the tree
-        // only has to not claim them, so that the root reducer can route them
-        // there.
+        // The preview pane owns the scroll commands and the reload, and the
+        // root reducer owns the baseline toggle; the tree only has to not
+        // claim them, so that the root reducer can route them there.
         Command::ScrollDown
         | Command::ScrollUp
         | Command::ScrollPageDown
@@ -77,7 +77,8 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         | Command::ScrollRight
         | Command::ScrollPageLeft
         | Command::ScrollPageRight
-        | Command::Reload => {}
+        | Command::Reload
+        | Command::ToggleBaseline => {}
     }
     state.tree.refresh();
     effects

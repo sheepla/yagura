@@ -28,4 +28,11 @@ pub enum Effect {
         /// Generation the request was issued with.
         generation: u64,
     },
+    /// Rebuild the baseline (git status for now, a snapshot scan later).
+    BuildBaseline {
+        /// Which baseline to build.
+        kind: crate::core::baseline::Kind,
+        /// Incremented for every rebuild; older results are dropped.
+        ver: u64,
+    },
 }

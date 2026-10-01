@@ -1,9 +1,11 @@
 //! Composition root of the state: one field per concern, one place to change.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 pub use crate::cli::Config;
+use crate::core::baseline::{ChangedEntry, Kind, Phase};
 use crate::core::fsmodel::NodeId;
 use crate::features::preview::PreviewState;
 use crate::features::tree::TreeState;
@@ -122,6 +124,36 @@ impl Message {
     }
 }
 
+/// What the tree and preview know about the baseline.
+#[derive(Debug)]
+pub struct BaselineState {
+    /// The baseline the user is currently looking at.
+    pub kind: Kind,
+    pub phase: Phase,
+    /// Number of the newest build; a result carrying another one is stale.
+    pub ver: u64,
+    /// True once the root is known to sit in a git work tree; gates `B`.
+    pub repo: bool,
+    /// `HEAD` of the last build, for the header line.
+    pub head_oid: Option<String>,
+    /// Every file that differs from the baseline, relative to the root.
+    pub changed: BTreeMap<PathBuf, ChangedEntry>,
+}
+
+impl BaselineState {
+    /// The state before the first build answers.
+    fn new(kind: Kind) -> Self {
+        Self {
+            kind,
+            phase: Phase::Loading,
+            ver: 1,
+            repo: false,
+            head_oid: None,
+            changed: BTreeMap::new(),
+        }
+    }
+}
+
 /// The single source of truth for the UI.
 pub struct AppState {
     pub config: Config,
@@ -138,6 +170,7 @@ pub struct AppState {
     pub message: Option<Message>,
     pub tree: TreeState,
     pub preview: PreviewState,
+    pub baseline: BaselineState,
     /// Set once a quit action has been handled.
     pub quitting: bool,
     /// Immutable rendering decisions derived from the configuration.
@@ -150,9 +183,16 @@ impl AppState {
         let theme = Theme::new(config.no_color);
         let icons = Icons::new(config.icons);
         let model = crate::core::fsmodel::FsModel::new(config.root.clone());
+        // `Auto` starts out as the git baseline; the first build answers
+        // whether there is a repository and falls back if there is not.
+        let kind = match config.baseline {
+            crate::cli::BaselineKind::Snapshot => Kind::Snapshot,
+            crate::cli::BaselineKind::Auto | crate::cli::BaselineKind::Head => Kind::Head,
+        };
         let mut state = Self {
             tree: TreeState::new(model),
             preview: PreviewState::default(),
+            baseline: BaselineState::new(kind),
             theme,
             icons,
             config,
@@ -202,6 +242,10 @@ impl AppState {
                 rel: PathBuf::new(),
             },
             Effect::ScheduleTick,
+            Effect::BuildBaseline {
+                kind: self.baseline.kind,
+                ver: self.baseline.ver,
+            },
         ]
     }
 
@@ -355,10 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_loads_the_root_only() {
+    fn startup_loads_the_root_and_builds_the_baseline() {
         let state = state();
         let effects = state.startup_effects();
-        assert_eq!(effects.len(), 2);
+        assert_eq!(effects.len(), 3);
         assert_eq!(
             effects[0],
             Effect::LoadDir {
@@ -368,6 +412,13 @@ mod tests {
             }
         );
         assert_eq!(effects[1], Effect::ScheduleTick);
+        assert_eq!(
+            effects[2],
+            Effect::BuildBaseline {
+                kind: Kind::Head,
+                ver: 1
+            }
+        );
     }
 
     #[test]

@@ -13,6 +13,8 @@ pub enum Command {
     Back,
     ToggleTree,
     CyclePreviewMode,
+    /// Switch between the git baseline and the startup snapshot.
+    ToggleBaseline,
 
     // Tree navigation.
     MoveDown,

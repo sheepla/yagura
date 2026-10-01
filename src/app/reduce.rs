@@ -4,10 +4,14 @@
 //! returns the work to do next. It never touches the filesystem, the clock or
 //! a channel (invariants I1 and I2). Time arrives inside the actions.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use crate::app::action::Action;
 use crate::app::command::Command;
 use crate::app::effect::Effect;
 use crate::app::state::AppState;
+use crate::core::baseline::{Built, ChangedEntry, Kind};
 use crate::features::{preview, tree};
 use crate::input::keymap;
 
@@ -30,6 +34,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     {
         return preview::reducer::on_loaded(state, rel, generation, result);
     }
+    if let Action::BaselineReady { ver, built } = action {
+        return apply_baseline(state, ver, built);
+    }
+    if let Action::Command(Command::ToggleBaseline) = action {
+        return toggle_baseline(state);
+    }
     match &action {
         Action::Resize { width, height } => {
             state.size = (*width, *height);
@@ -51,7 +61,8 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         Action::Paste(_)
         | Action::Command(_)
         | Action::DirLoaded { .. }
-        | Action::PreviewLoaded { .. } => {
+        | Action::PreviewLoaded { .. }
+        | Action::BaselineReady { .. } => {
             // The tree owns the selection, the preview owns the scroll, and the
             // selection decides what the preview should be showing.
             let mut effects = Vec::new();
@@ -88,6 +99,64 @@ fn preview_scrolls(command: Command) -> bool {
             | Command::ScrollPageRight
             | Command::Reload
     )
+}
+
+/// `B`: switch between the git baseline and the startup snapshot.
+///
+/// Outside a repository there is nothing to toggle, so the key does nothing
+/// (spec, key table).
+fn toggle_baseline(state: &mut AppState) -> Vec<Effect> {
+    if !state.baseline.repo {
+        return Vec::new();
+    }
+    state.baseline.kind = state.baseline.kind.other();
+    state.baseline.ver += 1;
+    vec![Effect::BuildBaseline {
+        kind: state.baseline.kind,
+        ver: state.baseline.ver,
+    }]
+}
+
+/// Swaps in a finished baseline. The previous one stays visible until this
+/// moment, so a rebuild never blanks the tree (design, baseline section).
+fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
+    if ver != state.baseline.ver {
+        return Vec::new();
+    }
+    state.baseline.kind = built.kind;
+    state.baseline.phase = built.phase;
+    state.baseline.repo = built.repo;
+    state.baseline.head_oid = built.head_oid;
+    state.baseline.changed = merge_changed(&state.baseline.changed, built.changed);
+    if matches!(state.config.baseline, crate::cli::BaselineKind::Auto)
+        && !built.repo
+        && state.baseline.kind == Kind::Head
+    {
+        // `auto` degrades to a snapshot outside a repository and says so.
+        state.baseline.kind = Kind::Snapshot;
+    }
+    if let Some(message) = built.message {
+        state.set_info(message);
+    }
+    Vec::new()
+}
+
+/// The fresh status replaces the set, but a path the app has already seen
+/// keeps the time it was first recorded at: only a watch can observe a newer
+/// change, and it writes that time into the entry itself (design, git
+/// baseline section).
+fn merge_changed(
+    old: &BTreeMap<PathBuf, ChangedEntry>,
+    new: BTreeMap<PathBuf, ChangedEntry>,
+) -> BTreeMap<PathBuf, ChangedEntry> {
+    new.into_iter()
+        .map(|(path, mut entry)| {
+            if let Some(previous) = old.get(&path) {
+                entry.changed_at = previous.changed_at;
+            }
+            (path, entry)
+        })
+        .collect()
 }
 
 /// Gives the preview pane its height from the current layout.
@@ -267,5 +336,172 @@ mod tests {
         let before = fingerprint(&state);
         reduce(&mut state, key(KeyCode::Char('j')));
         assert_eq!(fingerprint(&state), before);
+    }
+
+    fn entry(status: crate::core::fsmodel::Status, at: SystemTime) -> ChangedEntry {
+        ChangedEntry {
+            status,
+            changed_at: at,
+        }
+    }
+
+    fn built(
+        repo: bool,
+        head_oid: Option<&str>,
+        changed: BTreeMap<PathBuf, ChangedEntry>,
+    ) -> Built {
+        Built {
+            kind: Kind::Head,
+            phase: if repo {
+                crate::core::baseline::Phase::Ready
+            } else {
+                crate::core::baseline::Phase::Unavailable
+            },
+            repo,
+            head_oid: head_oid.map(str::to_owned),
+            changed,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_baseline_result_is_dropped() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = state();
+        state.baseline.repo = true;
+        let first = built(
+            true,
+            Some("aaa"),
+            BTreeMap::from([(
+                PathBuf::from("a.txt"),
+                entry(Status::Modified, SystemTime::UNIX_EPOCH),
+            )]),
+        );
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: first,
+            },
+        );
+        assert_eq!(state.baseline.head_oid.as_deref(), Some("aaa"));
+
+        // Ticking the build number over for the other baseline.
+        let effects = reduce(&mut state, Action::Command(Command::ToggleBaseline));
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Snapshot,
+                ver: 2
+            }]
+        );
+        assert_eq!(state.baseline.kind, Kind::Snapshot);
+
+        let stale = built(
+            true,
+            Some("bbb"),
+            BTreeMap::from([(
+                PathBuf::from("b.txt"),
+                entry(Status::Modified, SystemTime::UNIX_EPOCH),
+            )]),
+        );
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: stale,
+            },
+        );
+        assert_eq!(
+            state.baseline.head_oid.as_deref(),
+            Some("aaa"),
+            "a result from an older build replaced the current one"
+        );
+        assert!(
+            state
+                .baseline
+                .changed
+                .contains_key(PathBuf::from("a.txt").as_path())
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_a_snapshot_outside_a_repository() {
+        let mut state = state();
+        let built = Built {
+            kind: Kind::Head,
+            phase: crate::core::baseline::Phase::Unavailable,
+            repo: false,
+            head_oid: None,
+            changed: BTreeMap::new(),
+            message: Some("not a git repository".to_owned()),
+        };
+        reduce(&mut state, Action::BaselineReady { ver: 1, built });
+        assert_eq!(state.baseline.kind, Kind::Snapshot);
+        assert_eq!(
+            state.baseline.phase,
+            crate::core::baseline::Phase::Unavailable
+        );
+        assert_eq!(
+            state.visible_message().map(|message| message.text.as_str()),
+            Some("not a git repository")
+        );
+    }
+
+    #[test]
+    fn b_does_nothing_outside_a_repository() {
+        let mut state = state();
+        assert!(!state.baseline.repo);
+        let effects = reduce(&mut state, Action::Command(Command::ToggleBaseline));
+        assert!(effects.is_empty());
+        assert_eq!(state.baseline.kind, Kind::Head);
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_first_change_time_of_a_path() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = state();
+        let first_seen = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let first = built(
+            true,
+            None,
+            BTreeMap::from([(PathBuf::from("a.txt"), entry(Status::Modified, first_seen))]),
+        );
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: first,
+            },
+        );
+
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        let rebuild = built(
+            true,
+            None,
+            BTreeMap::from([
+                (PathBuf::from("a.txt"), entry(Status::Deleted, later)),
+                (PathBuf::from("c.txt"), entry(Status::Added, later)),
+            ]),
+        );
+        state.baseline.ver = 2;
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 2,
+                built: rebuild,
+            },
+        );
+        assert_eq!(
+            state.baseline.changed[PathBuf::from("a.txt").as_path()].changed_at,
+            first_seen
+        );
+        assert_eq!(
+            state.baseline.changed[PathBuf::from("c.txt").as_path()].changed_at,
+            later
+        );
+        assert_eq!(state.baseline.changed.len(), 2);
     }
 }

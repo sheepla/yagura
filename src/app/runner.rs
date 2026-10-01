@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::app::action::Action;
 use crate::app::effect::Effect;
-use crate::core::{dirload, preview};
+use crate::core::{baseline, dirload, preview};
 
 /// How often the clock tick fires.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -67,6 +67,17 @@ impl EffectRunner {
                     };
                     if let Err(err) = tx.blocking_send(action) {
                         tracing::debug!(%err, "store is gone, dropping preview");
+                    }
+                });
+            }
+            Effect::BuildBaseline { kind, ver } => {
+                let root = self.root.clone();
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let built = baseline::build(&root, kind, SystemTime::now());
+                    let action = Action::BaselineReady { ver, built };
+                    if let Err(err) = tx.blocking_send(action) {
+                        tracing::debug!(%err, "store is gone, dropping the baseline");
                     }
                 });
             }
@@ -168,6 +179,35 @@ mod tests {
             .expect("no tick in time")
             .expect("channel closed");
         assert!(matches!(action, Action::Tick { .. }));
+    }
+
+    #[tokio::test]
+    async fn building_a_baseline_sends_its_result_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        // If the temp directory happens to sit inside a repository the
+        // assertions on the content would not hold, so the round trip is all
+        // that is checked then.
+        let inside_repo = crate::core::baseline::git::probe(dir.path()).is_ok();
+        runner.run(Effect::BuildBaseline {
+            kind: crate::core::baseline::Kind::Head,
+            ver: 3,
+        });
+        let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no baseline in time")
+            .expect("channel closed");
+        let Action::BaselineReady { ver, built } = action else {
+            panic!("expected a baseline result");
+        };
+        assert_eq!(ver, 3);
+        assert_eq!(built.kind, crate::core::baseline::Kind::Head);
+        if !inside_repo {
+            assert_eq!(built.phase, crate::core::baseline::Phase::Unavailable);
+            assert!(!built.repo);
+            assert!(built.message.is_some());
+        }
     }
 
     #[tokio::test]

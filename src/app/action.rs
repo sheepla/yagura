@@ -42,4 +42,11 @@ pub enum Action {
         generation: u64,
         result: Result<Doc, PreviewError>,
     },
+    /// The baseline finished rebuilding.
+    BaselineReady {
+        /// Build number the request carried; a mismatch means the result is
+        /// stale and must be dropped (invariant I3).
+        ver: u64,
+        built: crate::core::baseline::Built,
+    },
 }

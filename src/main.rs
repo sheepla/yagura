@@ -8,7 +8,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use yagura::app::{Action, AppState, runner::EffectRunner, store};
-use yagura::cli::{Cli, Config};
+use yagura::cli::{BaselineKind, Cli, Config};
+use yagura::core::baseline::git;
 use yagura::input::task;
 use yagura::terminal::{self, TerminalGuard};
 
@@ -25,6 +26,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
+    // Asking for the git baseline outside a repository is an argument error,
+    // so it is reported before the terminal is touched and the shell stays
+    // clean.
+    if config.baseline == BaselineKind::Head {
+        git::probe(&config.root).context("cannot use --baseline head")?;
+    }
     // Argument errors happen before the terminal is touched, so a bad command
     // line never leaves the user's shell in a strange state.
     let size = ratatui::crossterm::terminal::size().unwrap_or((80, 24));

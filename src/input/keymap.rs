@@ -59,6 +59,7 @@ pub const BINDINGS: &[Binding] = &[
     binding!(BOTH, KeyCode::Esc, NONE, Back),
     binding!(BOTH, KeyCode::Char('t'), NONE, ToggleTree),
     binding!(BOTH, KeyCode::Char('s'), NONE, CyclePreviewMode),
+    binding!(BOTH, KeyCode::Char('B'), NONE, ToggleBaseline),
     binding!(BOTH, KeyCode::Char('r'), NONE, Reload),
     // Tree navigation.
     binding!(TREE, KeyCode::Char('j'), NONE, MoveDown),
@@ -243,6 +244,16 @@ mod tests {
                 Context::Tree,
                 KeyCode::Char('s'),
                 Some(Command::CyclePreviewMode),
+            ),
+            (
+                Context::Tree,
+                KeyCode::Char('B'),
+                Some(Command::ToggleBaseline),
+            ),
+            (
+                Context::Preview,
+                KeyCode::Char('B'),
+                Some(Command::ToggleBaseline),
             ),
             (Context::Tree, KeyCode::Tab, Some(Command::ToggleFocus)),
             (Context::Tree, KeyCode::Esc, Some(Command::Back)),
