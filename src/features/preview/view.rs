@@ -263,6 +263,8 @@ mod tests {
             invalid_utf8: false,
             binary: None,
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -314,6 +316,8 @@ mod tests {
             invalid_utf8: false,
             binary: Some(BinaryKind::Image),
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         doc.lines.clear();
         state.preview.path = Some(doc.rel.clone());
@@ -339,6 +343,8 @@ mod tests {
             invalid_utf8: false,
             binary: Some(BinaryKind::Image),
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -363,6 +369,8 @@ mod tests {
             invalid_utf8: false,
             binary: None,
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -403,6 +411,8 @@ mod tests {
             invalid_utf8: false,
             binary: None,
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -453,6 +463,8 @@ mod tests {
             invalid_utf8: false,
             binary: None,
             link_target: None,
+            diff: None,
+            diff_note: None,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);

@@ -476,6 +476,8 @@ fn a_selection_asks_the_preview_for_a_file_and_for_nothing_else() {
                 invalid_utf8: false,
                 binary: None,
                 link_target: None,
+                diff: None,
+                diff_note: None,
             }),
         },
     );

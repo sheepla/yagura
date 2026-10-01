@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use crate::core::diff::{Diff, MAX_DIFF_LINES, Row};
 use crate::core::highlight::Span;
 use crate::core::text::{self, sanitize};
 
@@ -252,6 +253,14 @@ pub struct Doc {
     pub binary: Option<BinaryKind>,
     /// Target of a symbolic link, shown instead of following it.
     pub link_target: Option<PathBuf>,
+    /// The line diff against the baseline, once a diff mode drew one.
+    ///
+    /// [`Self::lines`] holds the text of every row while this holds the rows
+    /// themselves, so a row and its kind can never drift apart. Empty when the
+    /// reader asked for the plain content (§9.2).
+    pub diff: Option<Diff>,
+    /// Why a diff mode fell back to the plain content.
+    pub diff_note: Option<DiffNote>,
 }
 
 impl Doc {
@@ -298,6 +307,13 @@ impl Doc {
         if self.highlight_truncated {
             notes.push("highlight truncated".to_owned());
         }
+        // The diff note says what the body itself cannot: why there is no
+        // diff, or that it is only an approximation.
+        if let Some(note) = self.diff_note
+            && !notes.iter().any(|existing| existing == note.label())
+        {
+            notes.push(note.label().to_owned());
+        }
         for note in notes {
             header.push_str("  ");
             header.push_str(&note);
@@ -306,8 +322,54 @@ impl Doc {
     }
 }
 
-/// Reads a file for the preview pane.
+/// The baseline text a diff is computed against (§8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Baseline {
+    /// The baseline could not be loaded; the body falls back to the content.
+    Unavailable,
+    /// The file is not in the baseline; every line counts as added.
+    Absent,
+    /// The baseline content as read from the repository.
+    Bytes(Vec<u8>),
+}
+
+/// Why a diff mode has no diff to draw (§9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffNote {
+    /// No baseline could be resolved.
+    NoBaseline,
+    /// The file matches the baseline.
+    NoChanges,
+    /// The file or the diff passed a size limit.
+    TooLarge,
+    /// The diff ran past its time budget and is only approximate.
+    Approximated,
+}
+
+impl DiffNote {
+    /// The word added to the header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoBaseline => "no baseline",
+            Self::NoChanges => "no changes",
+            Self::TooLarge => "too large",
+            Self::Approximated => "diff approximated",
+        }
+    }
+}
+
+/// Reads a file for the preview pane, as plain content.
 pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
+    load_doc_with(path, rel, None)
+}
+
+/// Reads a file for the preview pane, diffed against a baseline when the
+/// reader asked for a diff.
+pub fn load_doc_with(
+    path: &Path,
+    rel: &Path,
+    baseline: Option<Baseline>,
+) -> Result<Doc, PreviewError> {
     let metadata = std::fs::symlink_metadata(path)?;
     let link_target = if metadata.file_type().is_symlink() {
         std::fs::read_link(path).ok()
@@ -345,6 +407,8 @@ pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
             invalid_utf8: false,
             binary: Some(kind),
             link_target,
+            diff: None,
+            diff_note: None,
         });
     }
 
@@ -366,11 +430,76 @@ pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
         invalid_utf8,
         binary: None,
         link_target,
+        diff: None,
+        diff_note: None,
     };
     // The pane draws colour, so a document is not ready until it has its
     // spans. This is the one place that runs on the worker anyway.
     crate::core::highlight::fill(&mut doc);
+    if let Some(baseline) = baseline {
+        apply_diff(&mut doc, baseline);
+    }
     Ok(doc)
+}
+
+/// Computes the line diff and folds its rows into the document.
+///
+/// The document keeps showing the plain content whenever the diff cannot be
+/// drawn, and a note in the header says why (§9.2).
+fn apply_diff(doc: &mut Doc, baseline: Baseline) {
+    if doc.binary.is_some() {
+        return;
+    }
+    // The reader only ever sees a whole window of the file: diffing a cut
+    // file against the repository would show changes that are not there.
+    if doc.truncated || doc.too_large {
+        doc.diff_note = Some(DiffNote::TooLarge);
+        return;
+    }
+    let base_text = match baseline {
+        Baseline::Unavailable => {
+            doc.diff_note = Some(DiffNote::NoBaseline);
+            return;
+        }
+        Baseline::Absent => String::new(),
+        Baseline::Bytes(bytes) => {
+            let lossy = String::from_utf8_lossy(&bytes);
+            let sanitized = sanitize(&lossy);
+            // A baseline line is never drawn as it is, but the diff engine
+            // and the pane both refuse to look past the column limit.
+            sanitized
+                .lines()
+                .map(cut_wide)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let current = doc.lines.join("\n");
+    let diff = match Diff::compute(&base_text, &current) {
+        Ok(diff) if diff.rows.len() <= MAX_DIFF_LINES => diff,
+        _ => {
+            doc.diff_note = Some(DiffNote::TooLarge);
+            return;
+        }
+    };
+    if diff.stat.is_empty() {
+        doc.diff_note = Some(DiffNote::NoChanges);
+        return;
+    }
+    doc.lines = diff.rows.iter().map(row_text).collect();
+    // A diff row is coloured by its kind alone, so the runs of meaning that
+    // the highlighter found are dropped with the content lines.
+    doc.spans.clear();
+    doc.diff_note = diff.approximated.then_some(DiffNote::Approximated);
+    doc.diff = Some(diff);
+}
+
+/// The words a row shows; a fold spells out what it hides.
+fn row_text(row: &Row) -> String {
+    match row {
+        Row::Context(line) | Row::Added(line) | Row::Removed(line) => line.clone(),
+        Row::Fold(count) => format!("\u{22ef} {count} lines"),
+    }
 }
 
 /// Splits sanitized text into lines, dropping the tail past [`MAX_LINES`].
@@ -737,5 +866,142 @@ mod tests {
         doc.highlight_truncated = true;
         let header = doc.header();
         assert!(header.contains("highlight truncated"), "{header}");
+    }
+
+    #[test]
+    fn a_new_file_diffs_as_every_line_added() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"one\ntwo\n");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Absent)).expect("doc");
+        let diff = doc.diff.expect("a new file must have a diff");
+        assert_eq!(diff.stat.added, 2);
+        assert_eq!(diff.hunks, vec![0]);
+        assert!(
+            diff.rows.iter().all(|row| matches!(row, Row::Added(_))),
+            "{:?}",
+            diff.rows
+        );
+        assert_eq!(doc.lines, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn an_identical_file_reports_no_changes_in_the_header() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"one\ntwo\n");
+        let baseline = Baseline::Bytes(b"one\ntwo\n".to_vec());
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        assert!(doc.diff.is_none());
+        assert_eq!(doc.diff_note, Some(DiffNote::NoChanges));
+        assert_eq!(doc.lines, vec!["one", "two"]);
+        assert!(doc.header().contains("no changes"), "{}", doc.header());
+    }
+
+    #[test]
+    fn a_changed_file_is_folded_into_diff_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"one\ntwo\nthree\n");
+        let baseline = Baseline::Bytes(b"one\nTWO\nthree\n".to_vec());
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        let diff = doc.diff.expect("diff");
+        assert_eq!(diff.hunks, vec![1]);
+        assert_eq!(doc.lines, vec!["one", "TWO", "two", "three"]);
+        let kinds: Vec<&str> = diff
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Context(_) => "context",
+                Row::Added(_) => "added",
+                Row::Removed(_) => "removed",
+                Row::Fold(_) => "fold",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["context", "removed", "added", "context"]);
+    }
+
+    #[test]
+    fn an_unavailable_baseline_falls_back_to_the_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"one\ntwo\n");
+        let doc =
+            load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Unavailable)).expect("doc");
+        assert!(doc.diff.is_none());
+        assert_eq!(doc.diff_note, Some(DiffNote::NoBaseline));
+        assert_eq!(doc.lines, vec!["one", "two"]);
+        assert!(doc.header().contains("no baseline"), "{}", doc.header());
+    }
+
+    #[test]
+    fn a_cut_file_is_not_diffed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let body = (0..MAX_LINES + 5)
+            .map(|i| format!("{i}\n"))
+            .collect::<String>();
+        let path = write(&dir, "long.txt", body.as_bytes());
+        let doc = load_doc_with(&path, Path::new("long.txt"), Some(Baseline::Absent)).expect("doc");
+        assert!(doc.diff.is_none());
+        assert_eq!(doc.diff_note, Some(DiffNote::TooLarge));
+        // The load limit and the skipped diff mean the same thing here, so
+        // the header says it once.
+        assert_eq!(
+            doc.header().matches("too large").count(),
+            1,
+            "{}",
+            doc.header()
+        );
+    }
+
+    #[test]
+    fn a_long_unchanged_run_folds_into_the_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let baseline = (1..=13)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = baseline.replace("line5", "changed");
+        let path = write(&dir, "a.txt", current.as_bytes());
+        let doc = load_doc_with(
+            &path,
+            Path::new("a.txt"),
+            Some(Baseline::Bytes(baseline.into_bytes())),
+        )
+        .expect("doc");
+        assert!(
+            doc.lines.iter().any(|line| line == "\u{22ef} 2 lines"),
+            "{:?}",
+            doc.lines
+        );
+        assert!(doc.diff.is_some());
+    }
+
+    #[test]
+    fn a_baseline_past_the_row_budget_is_not_diffed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"keep\n");
+        let baseline = Baseline::Bytes("line\n".repeat(MAX_DIFF_LINES + 1).into_bytes());
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        assert!(doc.diff.is_none());
+        assert_eq!(doc.diff_note, Some(DiffNote::TooLarge));
+    }
+
+    #[test]
+    fn a_control_sequence_in_the_baseline_never_reaches_the_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"red\n");
+        let baseline = Baseline::Bytes(b"\x1b[31mred\x1b[0m\n".to_vec());
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        assert!(doc.diff.is_some());
+        for line in &doc.lines {
+            assert!(!line.contains('\u{1b}'), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn diff_rows_drop_the_syntax_runs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "main.rs", b"fn main() {}\n");
+        let baseline = Baseline::Bytes(b"fn old() {}\n".to_vec());
+        let doc = load_doc_with(&path, Path::new("main.rs"), Some(baseline)).expect("doc");
+        assert!(doc.diff.is_some());
+        assert!(doc.spans.is_empty(), "colour comes from the row kind now");
     }
 }
