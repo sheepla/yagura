@@ -1,0 +1,194 @@
+//! Text helpers for everything that reaches the terminal.
+//!
+//! Strings that originate outside the process - file contents, file names,
+//! `rg` output, error messages - must pass through [`sanitize`] before they
+//! are drawn, otherwise control sequences in the data could move the cursor,
+//! clear the screen or reorder text (invariant I5).
+
+use std::ffi::OsStr;
+use std::io;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Columns a tab is expanded to.
+pub const TAB_WIDTH: usize = 4;
+
+/// First code point of the Unicode "Control Pictures" block.
+const CONTROL_PICTURE_BASE: u32 = 0x2400;
+
+/// Describes an operating system error in English.
+///
+/// The `Display` of an [`io::Error`] comes from the operating system and is
+/// translated into the language of the machine, so a message that goes to the
+/// user is built from the [`io::ErrorKind`] and the number instead.
+pub fn os_error(err: &io::Error) -> String {
+    let reason = match err.kind() {
+        io::ErrorKind::NotFound => "not found",
+        io::ErrorKind::PermissionDenied => "permission denied",
+        io::ErrorKind::AlreadyExists => "already exists",
+        io::ErrorKind::InvalidInput => "invalid input",
+        io::ErrorKind::InvalidData => "invalid data",
+        io::ErrorKind::UnexpectedEof => "unexpected end of file",
+        io::ErrorKind::TimedOut => "timed out",
+        io::ErrorKind::Interrupted => "interrupted",
+        io::ErrorKind::IsADirectory => "is a directory",
+        io::ErrorKind::NotADirectory => "not a directory",
+        io::ErrorKind::Unsupported => "not supported",
+        io::ErrorKind::OutOfMemory => "out of memory",
+        _ => "failed",
+    };
+    match err.raw_os_error() {
+        Some(code) => format!("{reason} (os error {code})"),
+        None => reason.to_owned(),
+    }
+}
+
+/// Replaces the characters that could confuse the terminal with visible ones.
+///
+/// `\r\n` becomes `\n`, tabs are expanded to [`TAB_WIDTH`] spaces, other C0
+/// controls become control pictures (`ESC` renders as `U+241B` "␛"), `DEL`
+/// becomes "␡", C1 controls become the replacement character and bidirectional
+/// formatting characters become a visible `⟪U+202E⟫` label.
+pub fn sanitize(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    out.push('\n');
+                    chars.next();
+                } else {
+                    push_control_picture(&mut out, ch);
+                }
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str(&" ".repeat(TAB_WIDTH)),
+            '\u{7f}' => out.push('\u{2421}'),
+            c if is_c0(c) => push_control_picture(&mut out, c),
+            '\u{80}'..='\u{9f}' => out.push(char::REPLACEMENT_CHARACTER),
+            c if is_bidi(c) => {
+                out.push('\u{27ea}');
+                out.push_str(&format!("U+{:04X}", c as u32));
+                out.push('\u{27eb}');
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Sanitizes an operating system string, replacing invalid UTF-8 with the
+/// replacement character instead of failing.
+pub fn sanitize_os(name: &OsStr) -> String {
+    sanitize(&name.to_string_lossy())
+}
+
+/// Columns occupied by `text` once drawn.
+pub fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Truncates `text` to at most `max` columns, marking the cut with `…`.
+pub fn truncate_to_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_owned();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
+}
+
+fn push_control_picture(out: &mut String, ch: char) {
+    let code = CONTROL_PICTURE_BASE + ch as u32;
+    // The control pictures block covers every C0 code point and DEL.
+    if let Some(picture) = char::from_u32(code) {
+        out.push(picture);
+    } else {
+        out.push(char::REPLACEMENT_CHARACTER);
+    }
+}
+
+fn is_c0(ch: char) -> bool {
+    (ch as u32) < 0x20
+}
+
+fn is_bidi(ch: char) -> bool {
+    matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_ordinary_text_untouched() {
+        assert_eq!(sanitize("hello あい"), "hello あい");
+    }
+
+    #[test]
+    fn normalizes_crlf_and_lone_cr() {
+        assert_eq!(sanitize("a\r\nb\rc"), "a\nb\u{240d}c");
+    }
+
+    #[test]
+    fn expands_tabs_to_four_columns() {
+        assert_eq!(sanitize("a\tb"), "a    b");
+    }
+
+    #[test]
+    fn replaces_escape_and_nul_with_control_pictures() {
+        assert_eq!(sanitize("\x1b[31m\0\x07"), "\u{241b}[31m\u{2400}\u{2407}");
+    }
+
+    #[test]
+    fn replaces_del_and_c1_controls() {
+        assert_eq!(sanitize("\u{7f}\u{9b}31m"), "\u{2421}\u{fffd}31m");
+    }
+
+    #[test]
+    fn makes_bidi_controls_visible() {
+        assert_eq!(sanitize("a\u{202e}b"), "a\u{27ea}U+202E\u{27eb}b");
+        assert_eq!(sanitize("\u{2066}x"), "\u{27ea}U+2066\u{27eb}x");
+        assert_eq!(sanitize("\u{2069}"), "\u{27ea}U+2069\u{27eb}");
+    }
+
+    #[test]
+    fn sanitize_os_replaces_invalid_utf8() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let name = OsString::from_vec(vec![b'a', 0xff]);
+            assert_eq!(sanitize_os(&name), "a\u{fffd}");
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(sanitize_os(OsStr::new("a")), "a");
+        }
+    }
+
+    #[test]
+    fn measures_east_asian_width() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("あい"), 4);
+    }
+
+    #[test]
+    fn truncates_by_display_width() {
+        assert_eq!(truncate_to_width("abcdef", 4), "abc…");
+        assert_eq!(truncate_to_width("abc", 10), "abc");
+        assert_eq!(truncate_to_width("あい", 3), "あ…");
+        assert_eq!(truncate_to_width("abcdef", 0), "…");
+    }
+}

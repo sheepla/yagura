@@ -1,0 +1,186 @@
+//! Running effects outside the UI loop.
+
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+use tokio::sync::mpsc::Sender;
+
+use crate::app::action::Action;
+use crate::app::effect::Effect;
+use crate::core::{dirload, preview};
+
+/// How often the clock tick fires.
+pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Starts effects and returns their results as actions.
+pub struct EffectRunner {
+    root: PathBuf,
+    ignore_enabled: bool,
+    action_tx: Sender<Action>,
+}
+
+impl EffectRunner {
+    pub fn new(root: PathBuf, ignore_enabled: bool, action_tx: Sender<Action>) -> Self {
+        Self {
+            root,
+            ignore_enabled,
+            action_tx,
+        }
+    }
+
+    /// Runs one effect.
+    ///
+    /// Nothing here runs on the UI thread: reads happen on a blocking worker
+    /// and the clock lives in its own task (invariant I1).
+    pub fn run(&self, effect: Effect) {
+        match effect {
+            Effect::LoadDir {
+                node,
+                generation,
+                rel,
+            } => {
+                let dir = self.root.join(&rel);
+                let ignore_enabled = self.ignore_enabled;
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = dirload::load_dir(&dir, ignore_enabled);
+                    let action = Action::DirLoaded {
+                        node,
+                        generation,
+                        result,
+                    };
+                    // blocking_send is allowed here: this is a blocking worker.
+                    if let Err(err) = tx.blocking_send(action) {
+                        tracing::debug!(%err, "store is gone, dropping listing");
+                    }
+                });
+            }
+            Effect::LoadPreview { rel, generation } => {
+                let path = self.root.join(&rel);
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = preview::load_doc(&path, &rel);
+                    let action = Action::PreviewLoaded {
+                        rel,
+                        generation,
+                        result,
+                    };
+                    if let Err(err) = tx.blocking_send(action) {
+                        tracing::debug!(%err, "store is gone, dropping preview");
+                    }
+                });
+            }
+            Effect::ScheduleTick => self.spawn_clock(),
+        }
+    }
+
+    fn spawn_clock(&self) {
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + TICK_INTERVAL,
+                TICK_INTERVAL,
+            );
+            loop {
+                ticker.tick().await;
+                if tx
+                    .send(Action::Tick {
+                        now: SystemTime::now(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::core::fsmodel::{FsModel, NodeKind};
+
+    #[tokio::test]
+    async fn loading_a_directory_sends_the_listing_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("a.txt"), "x").expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        let model = FsModel::new(dir.path().to_path_buf());
+        let root = model.root_id();
+        runner.run(Effect::LoadDir {
+            node: root,
+            generation: 7,
+            rel: PathBuf::new(),
+        });
+        let action = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no listing in time")
+            .expect("channel closed");
+        let Action::DirLoaded {
+            node,
+            generation,
+            result,
+        } = action
+        else {
+            panic!("expected a directory listing");
+        };
+        assert_eq!(node, root);
+        assert_eq!(generation, 7);
+        let entries = result.expect("listing");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, std::ffi::OsString::from("a.txt"));
+        assert_eq!(entries[0].kind, NodeKind::File);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_reported_as_an_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(PathBuf::from("/definitely/not/here"), true, tx);
+        let model = FsModel::new(PathBuf::from("/definitely/not/here"));
+        let root = model.root_id();
+        runner.run(Effect::LoadDir {
+            node: root,
+            generation: 1,
+            rel: PathBuf::new(),
+        });
+        let action = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no answer in time")
+            .expect("channel closed");
+        let Action::DirLoaded { result, .. } = action else {
+            panic!("expected a directory listing");
+        };
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_clock_ticks_about_once_a_second() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(PathBuf::from("/root"), true, tx);
+        runner.run(Effect::ScheduleTick);
+        let action = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("no tick in time")
+            .expect("channel closed");
+        assert!(matches!(action, Action::Tick { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_result_is_not_sent_after_the_store_is_gone() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let runner = EffectRunner::new(PathBuf::from("/root"), true, tx);
+        drop(rx);
+        let dir = tempfile::tempdir().expect("temp dir");
+        runner.run(Effect::LoadDir {
+            node: FsModel::new(dir.path().to_path_buf()).root_id(),
+            generation: 1,
+            rel: PathBuf::new(),
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

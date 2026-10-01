@@ -1,0 +1,436 @@
+//! Preview state.
+//!
+//! The document itself is built by [`crate::core::preview`] on a blocking
+//! worker; what lives here is the shell around it: which file is shown, which
+//! generation of content is current, where it is scrolled to.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::core::fsmodel::Status;
+use crate::core::preview::{Doc, Language};
+
+/// What the preview pane is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PreviewStatus {
+    /// Nothing is selected, or a directory is.
+    #[default]
+    Empty,
+    /// A load is in flight and no document has arrived yet.
+    Loading,
+    /// A document is on screen.
+    Ready,
+    /// The load failed; the message is on the status bar.
+    Failed,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PreviewState {
+    /// File the preview points at, `None` while a directory is selected.
+    pub path: Option<PathBuf>,
+    /// Incremented on every new target so that late results can be dropped.
+    pub generation: u64,
+    /// Status of the shown file.
+    pub status: Status,
+    /// What the pane is showing.
+    pub preview: PreviewStatus,
+    /// The document, shared with the renderer and with a reload in flight.
+    pub doc: Option<Arc<Doc>>,
+    /// First visible line, zero based.
+    pub scroll_line: usize,
+    /// Leftmost visible column.
+    pub scroll_col: usize,
+    /// Lines in the document.
+    pub total_lines: usize,
+    /// Name of the detected language, `plain` when nothing matched.
+    pub language: String,
+    /// Lines the pane can show; set from the layout when the size changes.
+    pub viewport: usize,
+}
+
+impl PreviewState {
+    /// Points the preview at a new file and starts a new generation.
+    ///
+    /// The document of the previous file is dropped here, because a scroll
+    /// position and a body from two different files do not belong together.
+    pub fn target(&mut self, rel: PathBuf) -> u64 {
+        self.generation += 1;
+        self.path = Some(rel);
+        self.status = Status::Unchanged;
+        self.preview = PreviewStatus::Loading;
+        self.doc = None;
+        self.scroll_line = 0;
+        self.scroll_col = 0;
+        self.total_lines = 0;
+        self.language = Language::Plain.label().to_owned();
+        self.generation
+    }
+
+    /// Forgets the target, e.g. when a directory is selected.
+    pub fn clear(&mut self) {
+        self.path = None;
+        self.preview = PreviewStatus::Empty;
+        self.doc = None;
+        self.scroll_line = 0;
+        self.scroll_col = 0;
+        self.total_lines = 0;
+        self.language = Language::Plain.label().to_owned();
+    }
+
+    /// The language label for the status bar.
+    pub fn language_label(&self) -> &str {
+        if self.language.is_empty() {
+            "plain"
+        } else {
+            &self.language
+        }
+    }
+
+    /// Line shown first, one based, as the status bar reports it.
+    pub fn position(&self) -> usize {
+        if self.total_lines == 0 {
+            0
+        } else {
+            self.scroll_line + 1
+        }
+    }
+
+    /// The lines the pane can show right now.
+    pub fn height(&self) -> usize {
+        self.viewport.max(1)
+    }
+
+    /// The last line the pane can scroll to.
+    pub fn max_scroll(&self) -> usize {
+        self.total_lines.saturating_sub(self.height())
+    }
+
+    /// How far the view is from the end, for the `Top`/`Bot`/`NN%` label.
+    pub fn at_bottom(&self) -> bool {
+        self.total_lines == 0 || self.scroll_line >= self.max_scroll()
+    }
+
+    /// Keeps the scroll inside the document.
+    ///
+    /// A reload can make a document shorter, and a resize can make the pane
+    /// shorter, so every change to the geometry ends here.
+    pub fn clamp(&mut self) {
+        self.scroll_line = self.scroll_line.min(self.max_scroll());
+    }
+
+    /// Scrolls by whole lines, never past either end.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let target = self.scroll_line as isize + delta;
+        self.scroll_line = target.clamp(0, self.max_scroll() as isize) as usize;
+    }
+
+    /// The widest line of the document, in columns.
+    pub fn widest_line(&self) -> usize {
+        self.doc.as_ref().map_or(0, |doc| {
+            doc.lines
+                .iter()
+                .map(|line| crate::core::text::display_width(line))
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// The rightmost column the view can start at, so that the widest line
+    /// still fills the pane instead of scrolling into empty space.
+    pub fn max_scroll_col(&self, width: usize) -> usize {
+        self.widest_line().saturating_sub(width)
+    }
+
+    /// Scrolls horizontally, never past the widest line.
+    pub fn scroll_by_columns(&mut self, delta: isize, width: usize) {
+        let target = self.scroll_col as isize + delta;
+        self.scroll_col = target.clamp(0, self.max_scroll_col(width) as isize) as usize;
+    }
+
+    /// True when a result belongs to the target that is on screen.
+    ///
+    /// The generation is the only thing that says so (invariant I3): a mismatch
+    /// means the user has moved on and the result is stale.
+    pub fn is_current(&self, rel: &PathBuf, generation: u64) -> bool {
+        generation == self.generation && self.path.as_ref() == Some(rel)
+    }
+
+    /// Takes the document that just arrived.
+    pub fn set_doc(&mut self, doc: Doc) {
+        self.total_lines = doc.lines.len();
+        self.language = doc.status_label().to_owned();
+        self.doc = Some(Arc::new(doc));
+        self.preview = PreviewStatus::Ready;
+        // A shorter document must not leave the view below its end.
+        self.clamp();
+    }
+
+    /// Records that the load failed; the message is on the status bar.
+    pub fn set_failed(&mut self) {
+        self.doc = None;
+        self.total_lines = 0;
+        self.preview = PreviewStatus::Failed;
+        self.clamp();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::preview::PreviewError;
+
+    /// Delivers a result the way the reducer does.
+    fn accept(
+        preview: &mut PreviewState,
+        rel: &str,
+        generation: u64,
+        result: Result<Doc, PreviewError>,
+    ) -> bool {
+        if !preview.is_current(&PathBuf::from(rel), generation) {
+            return false;
+        }
+        match result {
+            Ok(doc) => preview.set_doc(doc),
+            Err(_) => preview.set_failed(),
+        }
+        true
+    }
+
+    fn doc(rel: &str, lines: &[&str]) -> Doc {
+        Doc {
+            rel: PathBuf::from(rel),
+            name: rel.into(),
+            size: 1,
+            language: Language::Rust,
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            truncated: false,
+            too_large: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_preview_reports_plain_and_no_position() {
+        let preview = PreviewState::default();
+        assert_eq!(preview.language_label(), "plain");
+        assert_eq!(preview.position(), 0);
+        assert_eq!(preview.generation, 0);
+    }
+
+    #[test]
+    fn the_position_is_one_based_and_starts_at_one() {
+        let mut preview = PreviewState {
+            total_lines: 340,
+            viewport: 10,
+            ..Default::default()
+        };
+        assert_eq!(preview.position(), 1);
+        preview.scroll_line = 11;
+        assert_eq!(preview.position(), 12);
+    }
+
+    #[test]
+    fn the_language_label_falls_back_to_plain() {
+        let preview = PreviewState {
+            language: "rust".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(preview.language_label(), "rust");
+    }
+
+    #[test]
+    fn targeting_a_file_advances_the_generation_and_clears_the_body() {
+        let mut preview = PreviewState::default();
+        preview.target(PathBuf::from("a.rs"));
+        accept(
+            &mut preview,
+            "a.rs",
+            1,
+            Ok(doc("a.rs", &["fn main() {}", ""])),
+        );
+        preview.scroll_line = 1;
+        let generation = preview.target(PathBuf::from("b.rs"));
+        assert_eq!(generation, 2);
+        assert_eq!(preview.preview, PreviewStatus::Loading);
+        assert!(preview.doc.is_none());
+        assert_eq!(preview.scroll_line, 0);
+        assert_eq!(preview.total_lines, 0);
+    }
+
+    #[test]
+    fn a_result_from_an_older_generation_is_dropped() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        let accepted = accept(
+            &mut preview,
+            "a.rs",
+            generation - 1,
+            Ok(doc("a.rs", &["x"])),
+        );
+        assert!(!accepted);
+        assert_eq!(preview.preview, PreviewStatus::Loading);
+    }
+
+    #[test]
+    fn a_result_for_another_path_is_dropped() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        let accepted = accept(&mut preview, "b.rs", generation, Ok(doc("b.rs", &["x"])));
+        assert!(!accepted);
+        assert_eq!(preview.preview, PreviewStatus::Loading);
+    }
+
+    #[test]
+    fn a_loaded_document_becomes_the_body_and_the_language() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        assert!(accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["a", "b", "c"]))
+        ));
+        assert_eq!(preview.preview, PreviewStatus::Ready);
+        assert_eq!(preview.total_lines, 3);
+        assert_eq!(preview.language, "rust");
+        assert_eq!(preview.language_label(), "rust");
+    }
+
+    #[test]
+    fn a_binary_document_reports_its_kind_in_the_status_bar() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.png"));
+        let mut binary = doc("a.png", &[]);
+        binary.binary = Some(crate::core::preview::BinaryKind::Image);
+        assert!(accept(&mut preview, "a.png", generation, Ok(binary)));
+        assert_eq!(preview.language, "image");
+    }
+
+    #[test]
+    fn a_failed_load_is_shown_without_a_body() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        let err = PreviewError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert!(accept(&mut preview, "a.rs", generation, Err(err)));
+        assert_eq!(preview.preview, PreviewStatus::Failed);
+        assert!(preview.doc.is_none());
+        assert_eq!(preview.total_lines, 0);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_scroll_until_the_document_gets_shorter() {
+        let mut preview = PreviewState {
+            viewport: 10,
+            ..Default::default()
+        };
+        let generation = preview.target(PathBuf::from("a.rs"));
+        accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["x"; 100])),
+        );
+        preview.scroll_line = 90;
+        // Same file, new generation: the position survives the swap.
+        let generation = preview.target(PathBuf::from("a.rs"));
+        preview.scroll_line = 90;
+        accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["x"; 100])),
+        );
+        assert_eq!(preview.scroll_line, 90);
+        // Now the file is short: the view clamps to the end instead of
+        // showing an empty pane.
+        let generation = preview.target(PathBuf::from("a.rs"));
+        preview.scroll_line = 90;
+        accept(&mut preview, "a.rs", generation, Ok(doc("a.rs", &["x"; 3])));
+        assert_eq!(preview.scroll_line, 0);
+    }
+
+    #[test]
+    fn scrolling_stops_at_both_ends() {
+        let mut preview = PreviewState {
+            viewport: 10,
+            ..Default::default()
+        };
+        let generation = preview.target(PathBuf::from("a.rs"));
+        accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["x"; 25])),
+        );
+        preview.scroll_by(-5);
+        assert_eq!(preview.scroll_line, 0, "scrolled above the first line");
+        preview.scroll_by(100);
+        assert_eq!(preview.scroll_line, 15, "did not stop at the last page");
+        assert!(preview.at_bottom());
+        preview.scroll_by(1);
+        assert_eq!(preview.scroll_line, 15);
+    }
+
+    #[test]
+    fn a_shorter_pane_pulls_the_view_back() {
+        let mut preview = PreviewState {
+            viewport: 10,
+            ..Default::default()
+        };
+        let generation = preview.target(PathBuf::from("a.rs"));
+        accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["x"; 25])),
+        );
+        preview.scroll_line = 15;
+        preview.viewport = 20;
+        preview.clamp();
+        assert_eq!(preview.scroll_line, 5, "the last page is now shorter");
+    }
+
+    #[test]
+    fn horizontal_scrolling_follows_the_widest_line() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        accept(
+            &mut preview,
+            "a.rs",
+            generation,
+            Ok(doc("a.rs", &["ab", "abcd"])),
+        );
+        // The pane is two columns wide, so the four column line can start one
+        // column to the left and still fill it.
+        assert_eq!(preview.widest_line(), 4);
+        assert_eq!(preview.max_scroll_col(2), 2);
+        preview.scroll_by_columns(2, 2);
+        assert_eq!(preview.scroll_col, 2);
+        preview.scroll_by_columns(100, 2);
+        assert_eq!(preview.scroll_col, 2, "cannot scroll past the widest line");
+        preview.scroll_by_columns(-10, 2);
+        assert_eq!(preview.scroll_col, 0);
+    }
+
+    #[test]
+    fn a_narrow_document_cannot_be_scrolled_sideways() {
+        let mut preview = PreviewState::default();
+        let generation = preview.target(PathBuf::from("a.rs"));
+        accept(&mut preview, "a.rs", generation, Ok(doc("a.rs", &["ab"])));
+        assert_eq!(preview.max_scroll_col(80), 0);
+        preview.scroll_by_columns(5, 80);
+        assert_eq!(preview.scroll_col, 0);
+    }
+
+    #[test]
+    fn clearing_forgets_the_target() {
+        let mut preview = PreviewState::default();
+        preview.target(PathBuf::from("a.rs"));
+        preview.clear();
+        assert_eq!(preview.preview, PreviewStatus::Empty);
+        assert!(preview.path.is_none());
+        assert!(preview.doc.is_none());
+    }
+}

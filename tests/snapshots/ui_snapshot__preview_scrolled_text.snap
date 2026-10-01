@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 117
+expression: render_text(&state)
+---
+┌root──────────────────────────┐┌long.txt  1.7 KiB─────────────────────────────┐
+│▾d root                       │  24 line 24                                    
+│  ▸d docs                     │  25 line 25                                    
+│  ▸d src                      │  26 line 26                                    
+│   f long.txt                 │  27 line 27                                    
+│   f README.md                │  28 line 28                                    
+│                              │  29 line 29                                    
+│                              │  30 line 30                                    
+│                              │  31 line 31                                    
+│                              │  32 line 32                                    
+│                              │  33 line 33                                    
+│                              │  34 line 34                                    
+│                              │  35 line 35                                    
+│                              │  36 line 36                                    
+│                              │  37 line 37                                    
+│                              │  38 line 38                                    
+│                              │  39 line 39                                    
+│                              │  40 line 40                                    
+│                              │  41 line 41                                    
+│                              │  42 line 42                                    
+│                              │  43 line 43                                    
+│                              │  44 line 44                                    
+└──────────────────────────────┘  45 line 45                                    
+ NORMAL                                                         text 24/200 12%

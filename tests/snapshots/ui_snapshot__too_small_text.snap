@@ -1,0 +1,6 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 41
+expression: render_text(&state)
+---
+     terminal too small (50x12, minimum 60x15)

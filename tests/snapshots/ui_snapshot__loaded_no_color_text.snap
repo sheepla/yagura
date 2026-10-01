@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 32
+expression: render_text(&state)
+---
+┌root──────────────────────────┐┌──────────────────────────────────────────────┐
+│▾d root                       │                no file selected                
+│  ▸d docs                     │                                                
+│  ▸d src                      │                                                
+│   f README.md                │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+└──────────────────────────────┘                                                
+ NORMAL                                                           plain 1/4 Top

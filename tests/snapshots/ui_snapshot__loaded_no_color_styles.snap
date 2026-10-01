@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 34
+expression: render_row_styles(&state)
+---
+dim | bold+dim | dim
+dim | reversed+bold+dim | reversed+bold | default | dim | default | dim | default
+dim | bold | dim | bold | default | dim | default
+dim | bold | dim | bold | default | dim | default
+dim | default | dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default | dim | default
+dim | default
+reversed+bold | default

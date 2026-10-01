@@ -1,0 +1,30 @@
+[package]
+name = "yagura"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A TUI file tree watcher for observing what a coding agent is doing"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+ignore = "0.4"
+ratatui = "0.30"
+slotmap = "1.1"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+insta = "1.48"
+proptest = "1.11"
+tempfile = "3.27"
+
+[profile.release]
+lto = "thin"
+strip = true

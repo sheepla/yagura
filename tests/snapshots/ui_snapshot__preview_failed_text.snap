@@ -1,0 +1,29 @@
+---
+source: tests/ui_snapshot.rs
+assertion_line: 143
+expression: render_text(&state)
+---
+┌root──────────────────────────┐┌README.md─────────────────────────────────────┐
+│▾d root                       │ cannot read this file                          
+│  ▸d docs                     │                                                
+│  ▸d src                      │                                                
+│   f README.md                │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+│                              │                                                
+└──────────────────────────────┘                                                
+ NORMAL cannot preview README.md: permission denied (os error 13) plain 4/4 Top
