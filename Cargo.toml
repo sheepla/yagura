@@ -13,6 +13,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 ignore = "0.4"
 ratatui = "0.30"
 slotmap = "1.1"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "dump-load"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-util = "0.7"
