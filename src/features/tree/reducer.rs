@@ -46,7 +46,6 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
             sync_viewport(state);
             crate::app::reduce::sync_preview_viewport(state);
         }
-        Command::CyclePreviewMode => state.preview_mode = state.preview_mode.next(),
 
         Command::MoveDown => navigate(state, Navigation::Down),
         Command::MoveUp => navigate(state, Navigation::Up),
@@ -63,8 +62,9 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         Command::OpenPreview => open_selected(state, &mut effects),
 
         // The preview pane owns the scroll commands and the reload, and the
-        // root reducer owns the baseline toggle; the tree only has to not
-        // claim them, so that the root reducer can route them there.
+        // root reducer owns the baseline toggle and the mode cycle; the tree
+        // only has to not claim them, so that the root reducer can route
+        // them there.
         Command::ScrollDown
         | Command::ScrollUp
         | Command::ScrollPageDown
@@ -78,6 +78,7 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         | Command::ScrollPageLeft
         | Command::ScrollPageRight
         | Command::Reload
+        | Command::CyclePreviewMode
         | Command::ToggleBaseline => {}
     }
     state.tree.refresh();

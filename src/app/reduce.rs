@@ -40,6 +40,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if let Action::Command(Command::ToggleBaseline) = action {
         return toggle_baseline(state);
     }
+    if let Action::Command(Command::CyclePreviewMode) = action {
+        return cycle_preview_mode(state);
+    }
     match &action {
         Action::Resize { width, height } => {
             state.size = (*width, *height);
@@ -117,6 +120,20 @@ fn toggle_baseline(state: &mut AppState) -> Vec<Effect> {
     }]
 }
 
+/// `s`: the next way to show the body.
+///
+/// Switching into or out of a diff re-reads the file, because the two kinds
+/// of body are built differently; between the two diff modes the same rows
+/// are simply drawn another way (§9.2).
+fn cycle_preview_mode(state: &mut AppState) -> Vec<Effect> {
+    let before = state.preview_mode.is_diff();
+    state.preview_mode = state.preview_mode.next();
+    if before == state.preview_mode.is_diff() {
+        return Vec::new();
+    }
+    preview::reducer::reload(state)
+}
+
 /// Swaps in a finished baseline. The previous one stays visible until this
 /// moment, so a rebuild never blanks the tree (design, baseline section).
 fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
@@ -137,6 +154,12 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
     }
     if let Some(message) = built.message {
         state.set_info(message);
+    }
+    // A diff on screen was computed against the baseline that was just
+    // replaced, so it is drawn again against the new one (invariant I3: the
+    // reload's generation discards whatever is still in flight).
+    if state.preview.path.is_some() && state.preview_mode.is_diff() {
+        return preview::reducer::reload(state);
     }
     Vec::new()
 }
@@ -503,5 +526,82 @@ mod tests {
             later
         );
         assert_eq!(state.baseline.changed.len(), 2);
+    }
+
+    #[test]
+    fn cycling_into_or_out_of_a_diff_reloads_the_body() {
+        let mut state = state();
+        state.preview.path = Some(PathBuf::from("a.rs"));
+
+        // Content to InlineDiff: the body has to be rebuilt as a diff.
+        let effects = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::InlineDiff);
+        let generation = state.preview.generation;
+        match effects.into_iter().next().expect("a reload") {
+            Effect::LoadPreview {
+                mode,
+                baseline_ver,
+                generation: loaded,
+                ..
+            } => {
+                assert_eq!(mode, PreviewMode::InlineDiff);
+                assert_eq!(baseline_ver, state.baseline.ver);
+                assert_eq!(loaded, generation);
+            }
+            other => panic!("expected a reload, got {other:?}"),
+        }
+
+        // InlineDiff to SideBySide: the same rows, drawn another way.
+        assert!(
+            reduce(&mut state, Action::Command(Command::CyclePreviewMode)).is_empty(),
+            "the rows do not change between the diff modes"
+        );
+        assert_eq!(state.preview_mode, PreviewMode::SideBySide);
+
+        // SideBySide to Content: the plain body again.
+        let effects = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::Content);
+        match effects.into_iter().next().expect("a reload") {
+            Effect::LoadPreview { mode, .. } => assert_eq!(mode, PreviewMode::Content),
+            other => panic!("expected a reload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_baseline_redraws_a_diff_but_leaves_the_content_alone() {
+        let mut state = state();
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        state.preview_mode = PreviewMode::InlineDiff;
+
+        let effects = reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(true, None, BTreeMap::new()),
+            },
+        );
+        match effects.into_iter().next().expect("a reload") {
+            Effect::LoadPreview {
+                mode, baseline_ver, ..
+            } => {
+                assert_eq!(mode, PreviewMode::InlineDiff);
+                assert_eq!(baseline_ver, 1);
+            }
+            other => panic!("expected a reload, got {other:?}"),
+        }
+
+        state.preview_mode = PreviewMode::Content;
+        state.baseline.ver = 2;
+        assert!(
+            reduce(
+                &mut state,
+                Action::BaselineReady {
+                    ver: 2,
+                    built: built(true, None, BTreeMap::new()),
+                },
+            )
+            .is_empty(),
+            "the plain body does not depend on the baseline"
+        );
     }
 }

@@ -63,6 +63,23 @@ pub struct Built {
     pub message: Option<String>,
 }
 
+/// Reads one file's baseline content.
+pub trait BaselineSource: Send + Sync {
+    /// The baseline content of a path relative to the root.
+    fn blob(&self, rel: &Path) -> Blob;
+}
+
+/// The baseline content of one file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Blob {
+    /// The bytes of the baseline version.
+    Bytes(Vec<u8>),
+    /// The file is not in the baseline at all.
+    Absent,
+    /// The baseline could not be read, so the diff has no side to compare.
+    Unreadable,
+}
+
 /// Builds the baseline for `kind`.
 pub fn build(root: &Path, kind: Kind, now: SystemTime) -> Built {
     match kind {

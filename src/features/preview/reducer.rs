@@ -125,7 +125,7 @@ pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
     }
     state.preview.status = entry.status;
     let generation = state.preview.target(rel.clone());
-    vec![Effect::LoadPreview { rel, generation }]
+    vec![load(state, rel, generation)]
 }
 
 /// Re-reads the shown file without moving the view.
@@ -138,7 +138,19 @@ pub fn reload(state: &mut AppState) -> Vec<Effect> {
     };
     let generation = state.preview.generation + 1;
     state.preview.generation = generation;
-    vec![Effect::LoadPreview { rel, generation }]
+    vec![load(state, rel, generation)]
+}
+
+/// The load the pane needs for what it is currently showing: the mode says
+/// whether a diff is drawn, and the build number pins which baseline it is
+/// drawn against (§8, §9.2).
+fn load(state: &AppState, rel: PathBuf, generation: u64) -> Effect {
+    Effect::LoadPreview {
+        rel,
+        generation,
+        mode: state.preview_mode,
+        baseline_ver: state.baseline.ver,
+    }
 }
 
 /// The document of the shown file, if one has arrived.
@@ -438,5 +450,24 @@ mod tests {
     fn a_reload_without_a_file_asks_for_nothing() {
         let mut state = state();
         assert!(reduce(&mut state, &Action::Command(Command::Reload)).is_empty());
+    }
+
+    #[test]
+    fn a_load_carries_the_mode_and_the_baseline_build() {
+        use crate::app::state::PreviewMode;
+
+        let mut state = with_file();
+        state.preview_mode = PreviewMode::InlineDiff;
+        state.baseline.ver = 7;
+        let effects = sync_target(&mut state);
+        match effects.into_iter().next().expect("a load") {
+            Effect::LoadPreview {
+                mode, baseline_ver, ..
+            } => {
+                assert_eq!(mode, PreviewMode::InlineDiff);
+                assert_eq!(baseline_ver, 7);
+            }
+            other => panic!("expected a preview load, got {other:?}"),
+        }
     }
 }

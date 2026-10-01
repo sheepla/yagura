@@ -1,11 +1,13 @@
 //! The git baseline: the changed set of `git status` against `HEAD`.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
-use super::ChangedEntry;
+use super::{BaselineSource, Blob, ChangedEntry};
 use crate::core::fsmodel::Status;
 
 /// Why the git baseline could not be built.
@@ -100,6 +102,161 @@ fn head_oid(root: &Path) -> Option<String> {
     }
     let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!oid.is_empty()).then_some(oid)
+}
+
+/// Reads committed file contents through one long-lived `git cat-file`.
+///
+/// One process answers every request, so a diff of many files costs one
+/// process instead of one per file. The reader is reached through
+/// [`BaselineSource`] and dropped with the build it belongs to.
+pub struct GitSource {
+    /// `git rev-parse --show-prefix`: where the root sits inside the
+    /// repository, e.g. `src/`. Object names are repository relative.
+    prefix: String,
+    batch: Mutex<Batch>,
+}
+
+impl GitSource {
+    /// Starts a reader for the repository containing `root`.
+    pub fn open(root: &Path) -> std::io::Result<GitSource> {
+        let prefix = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--show-prefix"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Ok(GitSource {
+            prefix,
+            batch: Mutex::new(Batch {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                alive: true,
+            }),
+        })
+    }
+
+    /// The `HEAD:<path>` name of a root relative path, or `None` when the
+    /// path could not be turned into one safely.
+    fn spec(&self, rel: &Path) -> Option<String> {
+        let mut parts = Vec::new();
+        for part in rel.components() {
+            match part {
+                Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+                Component::CurDir => {}
+                // A path out of the root, absolute or with `..`, names a
+                // file the user cannot see in this tree.
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let name = format!("{}{}", self.prefix, parts.join("/"));
+        // A newline would split the request in two and leave the stream one
+        // answer short for every request after it.
+        if name.contains(['\n', '\r']) {
+            return None;
+        }
+        Some(format!("HEAD:{name}"))
+    }
+}
+
+impl BaselineSource for GitSource {
+    fn blob(&self, rel: &Path) -> Blob {
+        let Some(spec) = self.spec(rel) else {
+            return Blob::Unreadable;
+        };
+        match self.batch.lock() {
+            Ok(mut batch) => batch.ask(&spec),
+            Err(_) => Blob::Unreadable,
+        }
+    }
+}
+
+/// The `git cat-file --batch` process and its pipes.
+struct Batch {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    /// False once an answer did not arrive: the stream can no longer be
+    /// trusted to line answers up with requests.
+    alive: bool,
+}
+
+impl Batch {
+    /// Asks for one object and reads its answer.
+    fn ask(&mut self, spec: &str) -> Blob {
+        if !self.alive {
+            return Blob::Unreadable;
+        }
+        let sent = self
+            .stdin
+            .write_all(spec.as_bytes())
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush());
+        if sent.is_err() {
+            self.alive = false;
+            return Blob::Unreadable;
+        }
+        self.read_object()
+    }
+
+    /// Reads one `<oid> blob <size>` frame, or a `<spec> missing` answer.
+    fn read_object(&mut self) -> Blob {
+        let mut header = String::new();
+        match self.stdout.read_line(&mut header) {
+            Ok(0) | Err(_) => {
+                self.alive = false;
+                return Blob::Unreadable;
+            }
+            Ok(_) => {}
+        }
+        let header = header.trim_end_matches(['\r', '\n']);
+        // The answer to a name git cannot resolve is `<spec> missing`.
+        if header == "missing" || header.ends_with(" missing") {
+            return Blob::Absent;
+        }
+        // The last field of the header is the byte count of the frame.
+        let Some(size) = header
+            .rsplit(' ')
+            .next()
+            .and_then(|last| last.parse::<usize>().ok())
+        else {
+            self.alive = false;
+            return Blob::Unreadable;
+        };
+        // The content is followed by one newline the protocol adds itself.
+        let mut frame = vec![0; size + 1];
+        if self.stdout.read_exact(&mut frame).is_err() {
+            self.alive = false;
+            return Blob::Unreadable;
+        }
+        frame.truncate(size);
+        Blob::Bytes(frame)
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Parses `git status --porcelain=v2 -z` output.
@@ -314,5 +471,45 @@ mod tests {
         let head = build(dir.path(), now()).expect("build");
         assert!(head.changed.is_empty());
         assert!(head.head_oid.is_some());
+    }
+
+    #[test]
+    fn the_source_reads_the_committed_content_not_the_working_one() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").expect("write");
+
+        let source = GitSource::open(dir.path()).expect("source");
+        assert_eq!(
+            source.blob(Path::new("a.txt")),
+            Blob::Bytes(b"one\n".to_vec())
+        );
+        // A file git has never seen has no baseline side at all.
+        assert_eq!(source.blob(Path::new("new.txt")), Blob::Absent);
+    }
+
+    #[test]
+    fn the_source_works_from_a_subdirectory_of_the_repository() {
+        let dir = repo();
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        std::fs::write(dir.path().join("sub/inner.txt"), "deep\n").expect("write");
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "sub"]);
+
+        let source = GitSource::open(&dir.path().join("sub")).expect("source");
+        assert_eq!(
+            source.blob(Path::new("inner.txt")),
+            Blob::Bytes(b"deep\n".to_vec())
+        );
+        // The root's files are named from the subdirectory, not from here.
+        assert_eq!(source.blob(Path::new("a.txt")), Blob::Absent);
+    }
+
+    #[test]
+    fn a_path_that_cannot_name_an_object_is_refused() {
+        let dir = repo();
+        let source = GitSource::open(dir.path()).expect("source");
+        assert_eq!(source.blob(Path::new("bad\nname.txt")), Blob::Unreadable);
+        assert_eq!(source.blob(Path::new("../outside.txt")), Blob::Unreadable);
+        assert_eq!(source.blob(Path::new("")), Blob::Unreadable);
     }
 }

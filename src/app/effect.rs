@@ -27,6 +27,11 @@ pub enum Effect {
         rel: PathBuf,
         /// Generation the request was issued with.
         generation: u64,
+        /// How the body should be shown; a diff mode asks for a baseline.
+        mode: crate::app::state::PreviewMode,
+        /// Baseline build the diff is against. A build that moved on in the
+        /// meantime has to answer with no baseline instead of a stale one.
+        baseline_ver: u64,
     },
     /// Rebuild the baseline (git status for now, a snapshot scan later).
     BuildBaseline {
