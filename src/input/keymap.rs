@@ -61,6 +61,10 @@ pub const BINDINGS: &[Binding] = &[
     binding!(BOTH, KeyCode::Char('s'), NONE, CyclePreviewMode),
     binding!(BOTH, KeyCode::Char('B'), NONE, ToggleBaseline),
     binding!(BOTH, KeyCode::Char('r'), NONE, Reload),
+    // Hunk navigation: only a diff has hunks, so the reducer ignores these
+    // outside the diff modes.
+    binding!(BOTH, KeyCode::Char('n'), NONE, NextHunk),
+    binding!(BOTH, KeyCode::Char('N'), NONE, PrevHunk),
     // Tree navigation.
     binding!(TREE, KeyCode::Char('j'), NONE, MoveDown),
     binding!(TREE, KeyCode::Char('k'), NONE, MoveUp),
@@ -259,6 +263,18 @@ mod tests {
             (Context::Tree, KeyCode::Esc, Some(Command::Back)),
             (Context::Tree, KeyCode::Char('r'), Some(Command::Reload)),
             (Context::Preview, KeyCode::Char('r'), Some(Command::Reload)),
+            (Context::Tree, KeyCode::Char('n'), Some(Command::NextHunk)),
+            (
+                Context::Preview,
+                KeyCode::Char('n'),
+                Some(Command::NextHunk),
+            ),
+            (Context::Tree, KeyCode::Char('N'), Some(Command::PrevHunk)),
+            (
+                Context::Preview,
+                KeyCode::Char('N'),
+                Some(Command::PrevHunk),
+            ),
             (
                 Context::Preview,
                 KeyCode::Char('j'),

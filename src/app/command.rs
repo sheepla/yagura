@@ -45,6 +45,9 @@ pub enum Command {
     ScrollRight,
     ScrollPageLeft,
     ScrollPageRight,
+    /// The next / previous hunk of the diff, from either pane.
+    NextHunk,
+    PrevHunk,
     /// Read the shown file again, keeping the scroll where it is.
     ///
     /// Watches are not in yet, so this is the only way to pick up a file that

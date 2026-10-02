@@ -100,6 +100,8 @@ fn preview_scrolls(command: Command) -> bool {
             | Command::ScrollRight
             | Command::ScrollPageLeft
             | Command::ScrollPageRight
+            | Command::NextHunk
+            | Command::PrevHunk
             | Command::Reload
     )
 }

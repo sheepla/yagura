@@ -28,6 +28,10 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
     if matches!(command, Command::Reload) {
         return reload(state);
     }
+    // So does a jump between hunks, but only a drawn diff has hunks.
+    if matches!(command, Command::NextHunk | Command::PrevHunk) {
+        return jump_hunk(state, command);
+    }
     // Scrolling is the preview's own business and only when it has focus; the
     // same key means something else in the tree.
     if state.focus != Focus::Preview {
@@ -49,6 +53,35 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         Command::ScrollPageLeft => state.preview.scroll_by_columns(-width, width as usize),
         Command::ScrollPageRight => state.preview.scroll_by_columns(width, width as usize),
         _ => return Vec::new(),
+    }
+    Vec::new()
+}
+
+/// `n` / `N`: the next or the previous hunk of the diff.
+///
+/// The rows of the document are the rows of the diff, so a hunk's index is
+/// a line to scroll to. Outside a diff, or with no such jump left in the
+/// direction asked for, the view stays where it is.
+fn jump_hunk(state: &mut AppState, command: Command) -> Vec<Effect> {
+    if !state.preview_mode.is_diff() {
+        return Vec::new();
+    }
+    let target = state
+        .preview
+        .doc
+        .as_ref()
+        .and_then(|doc| doc.diff.as_ref())
+        .and_then(|diff| {
+            let here = state.preview.scroll_line;
+            match command {
+                Command::NextHunk => diff.hunks.iter().copied().find(|hunk| *hunk > here),
+                Command::PrevHunk => diff.hunks.iter().rev().copied().find(|hunk| *hunk < here),
+                _ => None,
+            }
+        });
+    if let Some(target) = target {
+        state.preview.scroll_line = target;
+        state.preview.clamp();
     }
     Vec::new()
 }
@@ -443,6 +476,78 @@ mod tests {
             load_effects(effects),
             vec![(PathBuf::from("a.rs"), state.preview.generation)]
         );
+    }
+
+    /// A state whose preview shows a diff with a hunk near each end.
+    fn diff_loaded() -> (AppState, Vec<usize>) {
+        use crate::app::state::PreviewMode;
+        use crate::core::diff::Diff;
+
+        let baseline = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut changed: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        changed[2] = "changed early".to_owned();
+        changed[35] = "changed late".to_owned();
+        let diff = Diff::compute(&baseline, &changed.join("\n")).expect("a diff");
+        let hunks = diff.hunks.clone();
+        assert!(
+            hunks.len() >= 2,
+            "the fixture needs several hunks: {hunks:?}"
+        );
+
+        let mut state = state();
+        state.preview_mode = PreviewMode::InlineDiff;
+        // A one line pane keeps every hunk scrollable to, so the test is
+        // about picking hunks rather than about the height of the view.
+        state.preview.viewport = 1;
+        let mut doc = sample("a.rs", &[]);
+        doc.lines = (0..diff.rows.len())
+            .map(|row| format!("row {row}"))
+            .collect();
+        doc.diff = Some(diff);
+        state.preview.set_doc(doc);
+        (state, hunks)
+    }
+
+    #[test]
+    fn n_and_n_step_through_the_hunks_of_the_diff() {
+        let (mut state, hunks) = diff_loaded();
+        // From the top, the first press lands on the first hunk.
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, hunks[0]);
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, hunks[1]);
+        // The last hunk is as far as the key goes.
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, hunks[1]);
+        reduce(&mut state, &Action::Command(Command::PrevHunk));
+        assert_eq!(state.preview.scroll_line, hunks[0]);
+        // And there is no hunk above the first one.
+        reduce(&mut state, &Action::Command(Command::PrevHunk));
+        assert_eq!(state.preview.scroll_line, hunks[0]);
+    }
+
+    #[test]
+    fn hunk_jumping_works_from_the_tree_and_only_in_a_diff() {
+        let (mut state, hunks) = diff_loaded();
+        state.focus = Focus::Tree;
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, hunks[0]);
+
+        // The content mode has no hunks to jump to.
+        state.preview_mode = crate::app::state::PreviewMode::Content;
+        state.preview.scroll_line = 0;
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, 0);
+
+        // And neither has a plain document in a diff mode.
+        state.preview_mode = crate::app::state::PreviewMode::InlineDiff;
+        let plain = sample("a.rs", &["only", "context"]);
+        state.preview.set_doc(plain);
+        reduce(&mut state, &Action::Command(Command::NextHunk));
+        assert_eq!(state.preview.scroll_line, 0);
     }
 
     #[test]
