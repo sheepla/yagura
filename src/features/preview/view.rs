@@ -7,12 +7,13 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::state::{AppState, PreviewMode};
 use crate::core::diff::Row;
+use crate::core::fsmodel::{Node, Status};
 use crate::core::highlight::{self, Semantic};
 use crate::core::preview::{Doc, human_size};
 use crate::core::text;
 use crate::core::text::sanitize_os;
 use crate::ui::theme::{Role, Theme};
-use crate::ui::{pane, placeholder};
+use crate::ui::{pane_line, placeholder};
 
 use super::state::PreviewStatus;
 
@@ -38,7 +39,36 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             None => String::new(),
         },
     };
-    frame.render_widget(pane(&title, &state.theme), area);
+    // The icon and the status come from the tree's node, which is the one
+    // place both of them are known (§6).
+    let node = shown_node(state);
+    let mut spans = Vec::new();
+    if let Some(node) = node {
+        spans.push(Span::styled(
+            format!("{} ", state.icons.for_kind(node.kind)),
+            state.theme.style(Role::PaneTitle),
+        ));
+    }
+    spans.push(Span::styled(title, state.theme.style(Role::PaneTitle)));
+    if let Some(node) = node
+        && node.status != Status::Unchanged
+    {
+        spans.push(Span::styled(
+            format!("  {}", node.status.label()),
+            state.theme.style(Role::for_status(node.status)),
+        ));
+    }
+    frame.render_widget(pane_line(Line::from(spans), &state.theme), area);
+}
+
+/// The tree node of the file the preview points at, when there is one.
+fn shown_node(state: &AppState) -> Option<&Node> {
+    state
+        .preview
+        .path
+        .as_deref()
+        .and_then(|path| state.tree.model.lookup(path))
+        .and_then(|id| state.tree.model.get(id))
 }
 
 /// Draws the body: the document, or why there is none.
@@ -53,6 +83,12 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let Some(doc) = state.preview.doc.as_deref() else {
         let hint = match state.preview.preview {
             PreviewStatus::Loading => "loading…",
+            // A file the baseline still has speaks for itself (§6).
+            PreviewStatus::Failed
+                if shown_node(state).is_some_and(|node| node.status == Status::Deleted) =>
+            {
+                "file deleted"
+            }
             PreviewStatus::Failed => "cannot read this file",
             _ => {
                 if state.preview_mode.is_diff() {
@@ -440,6 +476,53 @@ mod tests {
         let text = buffer(&state);
         assert!(text.contains("we\u{241b}[31mird.rs"));
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_header_shows_the_icon_and_the_status_of_the_shown_file() {
+        use crate::core::fsmodel::NodeKind;
+
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let node =
+            state
+                .tree
+                .model
+                .insert_child(root, std::ffi::OsStr::new("a.rs"), NodeKind::File);
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        let unchanged = buffer(&state);
+        assert!(
+            unchanged.contains("f a.rs"),
+            "the icon of the shown file is missing: {unchanged:?}"
+        );
+        assert!(
+            !unchanged.contains("Modified"),
+            "an unchanged file wears a status: {unchanged:?}"
+        );
+
+        state.tree.model.get_mut(node).expect("node").status = Status::Modified;
+        let modified = buffer(&state);
+        assert!(modified.contains("f a.rs  Modified"), "{modified:?}");
+    }
+
+    #[test]
+    fn a_failed_load_of_a_deleted_file_says_file_deleted() {
+        use crate::core::fsmodel::NodeKind;
+
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let node =
+            state
+                .tree
+                .model
+                .insert_child(root, std::ffi::OsStr::new("a.rs"), NodeKind::File);
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        state.preview.set_failed();
+        state.tree.model.get_mut(node).expect("node").status = Status::Deleted;
+        assert!(buffer(&state).contains("file deleted"));
+
+        state.tree.model.get_mut(node).expect("node").status = Status::Unchanged;
+        assert!(buffer(&state).contains("cannot read this file"));
     }
 
     #[test]

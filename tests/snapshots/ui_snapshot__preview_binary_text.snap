@@ -1,9 +1,9 @@
 ---
 source: tests/ui_snapshot.rs
-assertion_line: 125
+assertion_line: 131
 expression: render_text(&state)
 ---
-┌root──────────────────────────┐┌logo.png  image  8 B──────────────────────────┐
+┌root──────────────────────────┐┌f logo.png  image  8 B────────────────────────┐
 │▾d root                       │                   image · 8 B                  
 │  ▸d docs                     │                                                
 │  ▸d src                      │                                                

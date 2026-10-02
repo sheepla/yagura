@@ -7,6 +7,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::core::fsmodel::Status;
+
 /// What a piece of text means, not how it looks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -25,6 +27,12 @@ pub enum Role {
     DiffAdded,
     /// A line only the baseline has, in a diff.
     DiffRemoved,
+    /// A file changed against the baseline (`M`).
+    StatusModified,
+    /// A file the baseline does not have (`A`).
+    StatusAdded,
+    /// A file only the baseline has (`D`).
+    StatusDeleted,
     StatusMode,
     StatusMessage,
     StatusError,
@@ -44,6 +52,19 @@ pub enum Role {
     SyntaxType,
     /// The name a function is called by.
     SyntaxFunction,
+}
+
+impl Role {
+    /// The role a baseline status is drawn in, in a tree row and in the
+    /// preview header.
+    pub fn for_status(status: Status) -> Role {
+        match status {
+            Status::Unchanged => Role::TreeText,
+            Status::Modified => Role::StatusModified,
+            Status::Added => Role::StatusAdded,
+            Status::Deleted => Role::StatusDeleted,
+        }
+    }
 }
 
 /// Resolves roles to styles for one terminal.
@@ -83,11 +104,11 @@ fn color(role: Role) -> Color {
         Role::PaneTitle | Role::TreeText | Role::PreviewText | Role::StatusMessage => Color::Reset,
         Role::TreeDirectory => Color::Blue,
         Role::TreeSymlink => Color::Cyan,
-        Role::TreeUnreadable | Role::StatusError => Color::Red,
+        Role::TreeUnreadable | Role::StatusError | Role::StatusDeleted => Color::Red,
         Role::TreeSelected => Color::Reset,
-        Role::PreviewHeader | Role::StatusInfo => Color::Yellow,
+        Role::PreviewHeader | Role::StatusInfo | Role::StatusModified => Color::Yellow,
         Role::PreviewPlaceholder | Role::PreviewGutter => Color::DarkGray,
-        Role::DiffAdded => Color::Green,
+        Role::DiffAdded | Role::StatusAdded => Color::Green,
         Role::DiffRemoved => Color::Red,
         Role::StatusMode => Color::Black,
         Role::StatusPosition => Color::Reset,
@@ -125,6 +146,9 @@ fn modifiers(role: Role) -> Modifier {
         | Role::PreviewHeader
         | Role::DiffAdded
         | Role::DiffRemoved
+        | Role::StatusModified
+        | Role::StatusAdded
+        | Role::StatusDeleted
         | Role::SyntaxKeyword
         | Role::SyntaxString
         | Role::SyntaxNumber

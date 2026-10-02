@@ -165,6 +165,7 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
     if let Some(message) = built.message {
         state.set_info(message);
     }
+    apply_changed(state);
     // A diff on screen was computed against the baseline that was just
     // replaced, so it is drawn again against the new one (invariant I3: the
     // reload's generation discards whatever is still in flight).
@@ -172,6 +173,15 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
         return preview::reducer::reload(state);
     }
     Vec::new()
+}
+
+/// Writes the changed set into the tree: every node gets its status, a file
+/// deleted on disk keeps a row of its own, and the rows are rebuilt to show
+/// them (design §11.1).
+pub fn apply_changed(state: &mut AppState) {
+    state.tree.model.sync_baseline(&state.baseline.changed);
+    state.tree.bump();
+    state.tree.refresh();
 }
 
 /// The fresh status replaces the set, but a path the app has already seen
@@ -644,5 +654,88 @@ mod tests {
         reduce(&mut state, Action::Command(Command::CyclePreviewMode));
         assert_eq!(state.preview_mode, PreviewMode::SideBySide);
         assert!(state.visible_message().is_none());
+    }
+
+    #[test]
+    fn the_baseline_marks_the_tree_and_a_listing_keeps_the_deleted_rows() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        use crate::core::fsmodel::{DirEntry, NodeKind, Status};
+
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let docs = state
+            .tree
+            .model
+            .insert_child(root, OsStr::new("docs"), NodeKind::Dir);
+        let readme = state
+            .tree
+            .model
+            .insert_child(root, OsStr::new("README.md"), NodeKind::File);
+        state.tree.load_gen.insert(docs, 1);
+
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(
+                    true,
+                    Some("aaa"),
+                    BTreeMap::from([
+                        (
+                            PathBuf::from("README.md"),
+                            entry(Status::Deleted, SystemTime::UNIX_EPOCH),
+                        ),
+                        (
+                            PathBuf::from("docs/gone.txt"),
+                            entry(Status::Deleted, SystemTime::UNIX_EPOCH),
+                        ),
+                    ]),
+                ),
+            },
+        );
+        assert_eq!(
+            state.tree.model.get(readme).map(|node| node.status),
+            Some(Status::Deleted)
+        );
+        let gone = state
+            .tree
+            .model
+            .lookup(Path::new("docs/gone.txt"))
+            .expect("the deleted file keeps a row");
+        assert_eq!(
+            state.tree.model.get(gone).map(|node| node.kind),
+            Some(NodeKind::File)
+        );
+
+        // The listing of docs has no gone.txt in it, so the merge prunes the
+        // row; the baseline puts it back before the frame is drawn.
+        reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: docs,
+                generation: 1,
+                result: Ok(vec![DirEntry {
+                    name: OsStr::new("other.txt").to_os_string(),
+                    kind: NodeKind::File,
+                    link_target: None,
+                    unreadable: false,
+                }]),
+            },
+        );
+        assert!(
+            state
+                .tree
+                .model
+                .lookup(Path::new("docs/gone.txt"))
+                .is_some(),
+            "the row of the deleted file vanished after a listing"
+        );
+        assert_eq!(
+            state.tree.model.get(readme).map(|node| node.status),
+            Some(Status::Deleted),
+            "the listing of another directory cleared a status"
+        );
     }
 }

@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::core::fsmodel::Status;
 use crate::core::preview::{Doc, Language};
 
 /// What the preview pane is showing.
@@ -30,8 +29,6 @@ pub struct PreviewState {
     pub path: Option<PathBuf>,
     /// Incremented on every new target so that late results can be dropped.
     pub generation: u64,
-    /// Status of the shown file.
-    pub status: Status,
     /// What the pane is showing.
     pub preview: PreviewStatus,
     /// The document, shared with the renderer and with a reload in flight.
@@ -56,7 +53,6 @@ impl PreviewState {
     pub fn target(&mut self, rel: PathBuf) -> u64 {
         self.generation += 1;
         self.path = Some(rel);
-        self.status = Status::Unchanged;
         self.preview = PreviewStatus::Loading;
         self.doc = None;
         self.scroll_line = 0;

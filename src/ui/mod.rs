@@ -54,8 +54,16 @@ impl FrameSync {
 
 /// A bordered pane with a title.
 pub fn pane<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    pane_line(
+        Line::from(Span::styled(title, theme.style(Role::PaneTitle))),
+        theme,
+    )
+}
+
+/// A bordered pane with a title built from separately styled pieces.
+pub fn pane_line<'a>(title: Line<'a>, theme: &Theme) -> Block<'a> {
     Block::bordered()
-        .title(Span::styled(title, theme.style(Role::PaneTitle)))
+        .title(title)
         .border_style(theme.style(Role::PaneBorder))
 }
 

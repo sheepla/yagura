@@ -8,7 +8,6 @@ use tokio::sync::mpsc::Sender;
 
 use crate::app::action::Action;
 use crate::app::effect::Effect;
-use crate::app::state::PreviewMode;
 use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
 use crate::core::preview::Baseline;
 use crate::core::{dirload, preview};
@@ -74,8 +73,14 @@ impl EffectRunner {
                 let tx = self.action_tx.clone();
                 let slot = Arc::clone(&self.baseline);
                 tokio::task::spawn_blocking(move || {
-                    let baseline = resolve_baseline(&slot, baseline_ver, &rel, mode);
-                    let result = preview::load_doc_with(&path, &rel, baseline);
+                    // A content view of a file that still exists needs no
+                    // baseline; a diff, or a file that is gone, does: the
+                    // baseline is also what a deleted file is read from (§6).
+                    let present = std::fs::symlink_metadata(&path).is_ok();
+                    let want_diff = mode.is_diff();
+                    let baseline =
+                        resolve_baseline(&slot, baseline_ver, &rel, want_diff || !present);
+                    let result = preview::load_doc_with(&path, &rel, baseline, want_diff);
                     let action = Action::PreviewLoaded {
                         rel,
                         generation,
@@ -137,18 +142,20 @@ impl EffectRunner {
     }
 }
 
-/// The baseline to diff against, or `None` for the plain content.
+/// The baseline to diff against, or `None` for the plain content on disk.
 ///
 /// A diff mode always answers with a baseline: when the build the request
 /// names is not the one the runner holds, the answer is "no baseline" rather
-/// than content from a baseline that has already been replaced.
+/// than content from a baseline that has already been replaced. The reader
+/// of a content view asks for the same answer only when the file itself is
+/// gone, and then the baseline is its content (§6).
 fn resolve_baseline(
     slot: &BaselineSlot,
     baseline_ver: u64,
     rel: &Path,
-    mode: PreviewMode,
+    ask: bool,
 ) -> Option<Baseline> {
-    if !mode.is_diff() {
+    if !ask {
         return None;
     }
     let source = slot.lock().ok().and_then(|guard| {
@@ -184,6 +191,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::app::state::PreviewMode;
     use crate::core::fsmodel::{FsModel, NodeKind};
 
     #[tokio::test]

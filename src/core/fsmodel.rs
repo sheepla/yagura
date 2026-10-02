@@ -5,13 +5,14 @@
 //! generation, so a stale id to a removed node is detected instead of silently
 //! addressing a different node.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use slotmap::{DenseSlotMap, new_key_type};
 
+use crate::core::baseline::ChangedEntry;
 use crate::core::diff::DiffStat;
 
 new_key_type! {
@@ -45,6 +46,28 @@ pub enum Status {
     Modified,
     Added,
     Deleted,
+}
+
+impl Status {
+    /// The word shown in the preview header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "Unchanged",
+            Self::Modified => "Modified",
+            Self::Added => "Added",
+            Self::Deleted => "Deleted",
+        }
+    }
+
+    /// The letter shown in a tree row.
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Unchanged => " ",
+            Self::Modified => "M",
+            Self::Added => "A",
+            Self::Deleted => "D",
+        }
+    }
 }
 
 /// Diff statistics of a node.
@@ -304,6 +327,66 @@ impl FsModel {
             node.skeleton = true;
         }
     }
+
+    /// Applies the baseline's changed set to the tree (design §11.1).
+    ///
+    /// Every node takes its status back from the set, and a file that exists
+    /// only in the baseline keeps a node of its own so the tree can show it
+    /// as `D`. A changed file inside a directory no listing has reached yet
+    /// simply waits for that listing; the next call covers it.
+    pub fn sync_baseline(&mut self, changed: &BTreeMap<PathBuf, ChangedEntry>) {
+        for (_, node) in self.arena.iter_mut() {
+            node.status = Status::Unchanged;
+        }
+        for (rel, entry) in changed {
+            if let Some(id) = self.lookup(rel) {
+                if let Some(node) = self.arena.get_mut(id) {
+                    node.status = entry.status;
+                    node.changed_at = Some(entry.changed_at);
+                }
+            } else if entry.status == Status::Deleted {
+                self.synthesize_deleted(rel, entry);
+            }
+        }
+    }
+
+    /// Adds the node of a file that only exists in the baseline, together
+    /// with any directory above it that no listing has created yet.
+    fn synthesize_deleted(&mut self, rel: &Path, entry: &ChangedEntry) {
+        let mut names = Vec::new();
+        for component in rel.components() {
+            let std::path::Component::Normal(name) = component else {
+                // Paths are relative and normalized (invariant I9): anything
+                // else has no node to stand under.
+                return;
+            };
+            names.push(name);
+        }
+        let Some((last, rest)) = names.split_last() else {
+            return;
+        };
+        let mut parent = self.root_id();
+        for name in rest {
+            match self.child_id(parent, name) {
+                Some(id) => parent = id,
+                None => {
+                    let id = self.insert_child(parent, name, NodeKind::Dir);
+                    // The directory never appeared in a listing, so it is a
+                    // placeholder standing in for the changed file below it.
+                    self.mark_skeleton(id);
+                    parent = id;
+                }
+            }
+        }
+        let id = match self.child_id(parent, last) {
+            Some(id) => id,
+            None => self.insert_child(parent, last, NodeKind::File),
+        };
+        if let Some(node) = self.arena.get_mut(id) {
+            node.status = entry.status;
+            node.changed_at = Some(entry.changed_at);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,5 +479,89 @@ mod tests {
         assert_ne!(a, b);
         assert!(model.get(a).is_none());
         assert!(model.get(b).is_some());
+    }
+
+    fn changed(status: Status) -> ChangedEntry {
+        ChangedEntry {
+            status,
+            changed_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn the_changed_set_marks_the_nodes_it_names_and_forgets_them_again() {
+        let mut model = model();
+        let a = model.insert_child(model.root_id(), os("a.txt"), NodeKind::File);
+        let keep = model.insert_child(model.root_id(), os("keep.txt"), NodeKind::File);
+        model.sync_baseline(&BTreeMap::from([(
+            PathBuf::from("a.txt"),
+            changed(Status::Modified),
+        )]));
+        assert_eq!(
+            model.get(a).map(|node| (node.status, node.changed_at)),
+            Some((Status::Modified, Some(SystemTime::UNIX_EPOCH)))
+        );
+        assert_eq!(
+            model.get(keep).map(|node| node.status),
+            Some(Status::Unchanged)
+        );
+        model.sync_baseline(&BTreeMap::new());
+        assert_eq!(
+            model.get(a).map(|node| node.status),
+            Some(Status::Unchanged),
+            "a rebuild that no longer lists the file keeps its old status"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_keeps_a_node_under_a_directory_no_listing_has_reached() {
+        let mut model = model();
+        model.sync_baseline(&BTreeMap::from([
+            (PathBuf::from("gone.txt"), changed(Status::Deleted)),
+            (PathBuf::from("deep/gone.txt"), changed(Status::Deleted)),
+        ]));
+        let gone = model
+            .lookup(Path::new("gone.txt"))
+            .expect("the deleted file keeps a row");
+        assert_eq!(
+            model.get(gone).map(|node| (node.kind, node.status)),
+            Some((NodeKind::File, Status::Deleted))
+        );
+        let nested = model
+            .lookup(Path::new("deep/gone.txt"))
+            .expect("the row below the unlisted directory");
+        assert_eq!(
+            model.get(nested).map(|node| (node.kind, node.status)),
+            Some((NodeKind::File, Status::Deleted))
+        );
+        let deep = model
+            .lookup(Path::new("deep"))
+            .expect("the directory above it");
+        assert_eq!(
+            model.get(deep).map(|node| (node.kind, node.skeleton)),
+            Some((NodeKind::Dir, true)),
+            "an unlisted directory is a placeholder for the rows below it"
+        );
+    }
+
+    #[test]
+    fn a_changed_file_without_a_node_waits_for_its_listing() {
+        let mut model = model();
+        model.sync_baseline(&BTreeMap::from([(
+            PathBuf::from("not_yet.txt"),
+            changed(Status::Modified),
+        )]));
+        // Only a deletion can stand on the baseline alone: every other
+        // status needs a node, and the listing creates it.
+        assert!(model.lookup(Path::new("not_yet.txt")).is_none());
+        let node = model.insert_child(model.root_id(), os("not_yet.txt"), NodeKind::File);
+        model.sync_baseline(&BTreeMap::from([(
+            PathBuf::from("not_yet.txt"),
+            changed(Status::Modified),
+        )]));
+        assert_eq!(
+            model.get(node).map(|node| node.status),
+            Some(Status::Modified)
+        );
     }
 }

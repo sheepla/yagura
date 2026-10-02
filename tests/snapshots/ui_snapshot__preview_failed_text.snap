@@ -1,9 +1,9 @@
 ---
 source: tests/ui_snapshot.rs
-assertion_line: 143
+assertion_line: 149
 expression: render_text(&state)
 ---
-┌root──────────────────────────┐┌README.md─────────────────────────────────────┐
+┌root──────────────────────────┐┌f README.md───────────────────────────────────┐
 │▾d root                       │ cannot read this file                          
 │  ▸d docs                     │                                                
 │  ▸d src                      │                                                

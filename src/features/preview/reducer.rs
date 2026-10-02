@@ -123,7 +123,6 @@ pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
     if state.preview.path.as_ref() == Some(&rel) {
         return Vec::new();
     }
-    state.preview.status = entry.status;
     let generation = state.preview.target(rel.clone());
     vec![load(state, rel, generation)]
 }

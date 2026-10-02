@@ -241,7 +241,9 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
         Ok(entries) => {
             state.tree.model.merge_children(*node, entries);
             sort_children(&mut state.tree.model, *node, state.tree.sort);
-            state.tree.bump();
+            // The listing pruned the rows of deleted files; the baseline
+            // puts them back before the rows are shown again.
+            crate::app::reduce::apply_changed(state);
         }
         Err(err) => {
             tracing::warn!(?node, %err, "directory listing failed");

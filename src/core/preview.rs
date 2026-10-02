@@ -360,26 +360,38 @@ impl DiffNote {
 
 /// Reads a file for the preview pane, as plain content.
 pub fn load_doc(path: &Path, rel: &Path) -> Result<Doc, PreviewError> {
-    load_doc_with(path, rel, None)
+    load_doc_with(path, rel, None, false)
 }
 
 /// Reads a file for the preview pane, diffed against a baseline when the
-/// reader asked for a diff.
+/// reader asked for one.
+///
+/// A file that no longer exists still has its baseline: `want_diff` says
+/// whether that baseline is drawn as a diff of every line it has, or shown
+/// as plain content (§6).
 pub fn load_doc_with(
     path: &Path,
     rel: &Path,
     baseline: Option<Baseline>,
+    want_diff: bool,
 ) -> Result<Doc, PreviewError> {
-    let metadata = std::fs::symlink_metadata(path)?;
+    let name = path
+        .file_name()
+        .map_or_else(|| path.as_os_str().to_owned(), OsString::from);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let doc = deleted_doc(rel, name, baseline, want_diff).ok_or(err)?;
+            return Ok(doc);
+        }
+        Err(err) => return Err(err.into()),
+    };
     let link_target = if metadata.file_type().is_symlink() {
         std::fs::read_link(path).ok()
     } else {
         None
     };
     let stat = std::fs::metadata(path)?;
-    let name = path
-        .file_name()
-        .map_or_else(|| path.as_os_str().to_owned(), OsString::from);
     let size = stat.len();
 
     // One byte past the limit is enough to know that the limit was passed.
@@ -391,10 +403,30 @@ pub fn load_doc_with(
     if truncated {
         bytes.truncate(MAX_BYTES);
     }
+    Ok(assemble(
+        rel,
+        name,
+        size,
+        link_target,
+        bytes,
+        truncated,
+        baseline,
+    ))
+}
 
+/// Builds the document of bytes read from a file that still exists.
+fn assemble(
+    rel: &Path,
+    name: OsString,
+    size: u64,
+    link_target: Option<PathBuf>,
+    bytes: Vec<u8>,
+    truncated: bool,
+    baseline: Option<Baseline>,
+) -> Doc {
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         let kind = binary_kind(&name.to_string_lossy().to_lowercase());
-        return Ok(Doc {
+        return Doc {
             rel: rel.to_path_buf(),
             name,
             size,
@@ -409,7 +441,7 @@ pub fn load_doc_with(
             link_target,
             diff: None,
             diff_note: None,
-        });
+        };
     }
 
     let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
@@ -439,7 +471,81 @@ pub fn load_doc_with(
     if let Some(baseline) = baseline {
         apply_diff(&mut doc, baseline);
     }
-    Ok(doc)
+    doc
+}
+
+/// The document of a file that no longer exists: the baseline stands in for
+/// its content (§6).
+///
+/// `want_diff` folds every baseline line into a removed row, so a diff view
+/// shows what the file lost while the content view reads like the file did.
+fn deleted_doc(
+    rel: &Path,
+    name: OsString,
+    baseline: Option<Baseline>,
+    want_diff: bool,
+) -> Option<Doc> {
+    let Baseline::Bytes(content) = baseline? else {
+        // Without the baseline's bytes there is nothing left to show.
+        return None;
+    };
+    let size = content.len() as u64;
+    let mut bytes = content;
+    let truncated = bytes.len() > MAX_BYTES;
+    if truncated {
+        bytes.truncate(MAX_BYTES);
+    }
+    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        let kind = binary_kind(&name.to_string_lossy().to_lowercase());
+        return Some(Doc {
+            rel: rel.to_path_buf(),
+            name,
+            size,
+            language: Language::default(),
+            lines: Vec::new(),
+            spans: Vec::new(),
+            truncated: false,
+            too_large: false,
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: Some(kind),
+            link_target: None,
+            diff: None,
+            diff_note: None,
+        });
+    }
+    let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
+    let text = String::from_utf8_lossy(&bytes);
+    let language = Language::detect(rel, &text);
+    let (lines, too_large) = split_lines(&sanitize(&text));
+    let mut doc = Doc {
+        rel: rel.to_path_buf(),
+        name,
+        size,
+        language,
+        lines,
+        spans: Vec::new(),
+        truncated,
+        too_large,
+        highlight_truncated: false,
+        invalid_utf8,
+        binary: None,
+        link_target: None,
+        diff: None,
+        diff_note: None,
+    };
+    crate::core::highlight::fill(&mut doc);
+    if want_diff {
+        if truncated || doc.too_large {
+            // A baseline line is never drawn as it is, but past the limits
+            // neither the engine nor the pane follows it (§9.2).
+            doc.diff_note = Some(DiffNote::TooLarge);
+        } else {
+            let base_text = baseline_text(&bytes);
+            fold_into(&mut doc, &base_text, "");
+        }
+    }
+    Some(doc)
 }
 
 /// Computes the line diff and folds its rows into the document.
@@ -462,20 +568,15 @@ fn apply_diff(doc: &mut Doc, baseline: Baseline) {
             return;
         }
         Baseline::Absent => String::new(),
-        Baseline::Bytes(bytes) => {
-            let lossy = String::from_utf8_lossy(&bytes);
-            let sanitized = sanitize(&lossy);
-            // A baseline line is never drawn as it is, but the diff engine
-            // and the pane both refuse to look past the column limit.
-            sanitized
-                .lines()
-                .map(cut_wide)
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        Baseline::Bytes(bytes) => baseline_text(&bytes),
     };
     let current = doc.lines.join("\n");
-    let diff = match Diff::compute(&base_text, &current) {
+    fold_into(doc, &base_text, &current);
+}
+
+/// Folds the diff of `current` against `base` into the document.
+fn fold_into(doc: &mut Doc, base_text: &str, current: &str) {
+    let diff = match Diff::compute(base_text, current) {
         Ok(diff) if diff.rows.len() <= MAX_DIFF_LINES => diff,
         _ => {
             doc.diff_note = Some(DiffNote::TooLarge);
@@ -492,6 +593,17 @@ fn apply_diff(doc: &mut Doc, baseline: Baseline) {
     doc.spans.clear();
     doc.diff_note = diff.approximated.then_some(DiffNote::Approximated);
     doc.diff = Some(diff);
+}
+
+/// The baseline bytes as the diff engine and the pane both read them.
+fn baseline_text(bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(bytes);
+    let sanitized = sanitize(&lossy);
+    sanitized
+        .lines()
+        .map(cut_wide)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The words a row shows; a fold spells out what it hides.
@@ -872,7 +984,8 @@ mod tests {
     fn a_new_file_diffs_as_every_line_added() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"one\ntwo\n");
-        let doc = load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Absent)).expect("doc");
+        let doc =
+            load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Absent), true).expect("doc");
         let diff = doc.diff.expect("a new file must have a diff");
         assert_eq!(diff.stat.added, 2);
         assert_eq!(diff.hunks, vec![0]);
@@ -889,7 +1002,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"one\ntwo\n");
         let baseline = Baseline::Bytes(b"one\ntwo\n".to_vec());
-        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_none());
         assert_eq!(doc.diff_note, Some(DiffNote::NoChanges));
         assert_eq!(doc.lines, vec!["one", "two"]);
@@ -901,7 +1014,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"one\ntwo\nthree\n");
         let baseline = Baseline::Bytes(b"one\nTWO\nthree\n".to_vec());
-        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline), true).expect("doc");
         let diff = doc.diff.expect("diff");
         assert_eq!(diff.hunks, vec![1]);
         assert_eq!(doc.lines, vec!["one", "TWO", "two", "three"]);
@@ -922,8 +1035,8 @@ mod tests {
     fn an_unavailable_baseline_falls_back_to_the_content() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"one\ntwo\n");
-        let doc =
-            load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Unavailable)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(Baseline::Unavailable), true)
+            .expect("doc");
         assert!(doc.diff.is_none());
         assert_eq!(doc.diff_note, Some(DiffNote::NoBaseline));
         assert_eq!(doc.lines, vec!["one", "two"]);
@@ -937,7 +1050,8 @@ mod tests {
             .map(|i| format!("{i}\n"))
             .collect::<String>();
         let path = write(&dir, "long.txt", body.as_bytes());
-        let doc = load_doc_with(&path, Path::new("long.txt"), Some(Baseline::Absent)).expect("doc");
+        let doc =
+            load_doc_with(&path, Path::new("long.txt"), Some(Baseline::Absent), true).expect("doc");
         assert!(doc.diff.is_none());
         assert_eq!(doc.diff_note, Some(DiffNote::TooLarge));
         // The load limit and the skipped diff mean the same thing here, so
@@ -963,6 +1077,7 @@ mod tests {
             &path,
             Path::new("a.txt"),
             Some(Baseline::Bytes(baseline.into_bytes())),
+            true,
         )
         .expect("doc");
         assert!(
@@ -978,7 +1093,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"keep\n");
         let baseline = Baseline::Bytes("line\n".repeat(MAX_DIFF_LINES + 1).into_bytes());
-        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_none());
         assert_eq!(doc.diff_note, Some(DiffNote::TooLarge));
     }
@@ -988,7 +1103,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "a.txt", b"red\n");
         let baseline = Baseline::Bytes(b"\x1b[31mred\x1b[0m\n".to_vec());
-        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("a.txt"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_some());
         for line in &doc.lines {
             assert!(!line.contains('\u{1b}'), "{line:?}");
@@ -1000,8 +1115,58 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "main.rs", b"fn main() {}\n");
         let baseline = Baseline::Bytes(b"fn old() {}\n".to_vec());
-        let doc = load_doc_with(&path, Path::new("main.rs"), Some(baseline)).expect("doc");
+        let doc = load_doc_with(&path, Path::new("main.rs"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_some());
         assert!(doc.spans.is_empty(), "colour comes from the row kind now");
+    }
+
+    #[test]
+    fn a_deleted_file_is_read_from_the_baseline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The file itself was never written: only the baseline has it.
+        let path = dir.path().join("gone.txt");
+        let doc = load_doc_with(
+            &path,
+            Path::new("gone.txt"),
+            Some(Baseline::Bytes(b"one\ntwo\n".to_vec())),
+            false,
+        )
+        .expect("doc");
+        assert_eq!(doc.lines, vec!["one", "two"]);
+        assert_eq!(doc.size, 8);
+        assert!(doc.diff.is_none(), "the content view draws no diff");
+        assert!(doc.diff_note.is_none());
+    }
+
+    #[test]
+    fn a_deleted_file_in_a_diff_mode_shows_every_line_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gone.txt");
+        let doc = load_doc_with(
+            &path,
+            Path::new("gone.txt"),
+            Some(Baseline::Bytes(b"one\ntwo\n".to_vec())),
+            true,
+        )
+        .expect("doc");
+        let diff = doc.diff.expect("every baseline line was removed");
+        assert_eq!(diff.stat.added, 0);
+        assert_eq!(diff.stat.removed, 2);
+        assert!(
+            diff.rows
+                .iter()
+                .all(|row| matches!(row, crate::core::diff::Row::Removed(_))),
+            "{:?}",
+            diff.rows
+        );
+        assert_eq!(doc.lines, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn a_deleted_file_without_a_baseline_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gone.txt");
+        let err = load_doc_with(&path, Path::new("gone.txt"), None, true).expect_err("io");
+        assert!(matches!(err, PreviewError::Io(_)));
     }
 }

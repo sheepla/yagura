@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::state::AppState;
-use crate::core::fsmodel::{Node, NodeKind};
+use crate::core::fsmodel::{Node, NodeKind, Status};
 use crate::core::text::sanitize_os;
 use crate::features::tree::icons::{COLLAPSED, EXPANDED, LEAF};
 use crate::ui::theme::Role;
@@ -66,6 +66,12 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16) -> Option<Line<'a
         spans.push(Span::styled(
             format!(" -> {}", sanitize_os(target)),
             state.theme.style(Role::TreeSymlink),
+        ));
+    }
+    if entry.status != Status::Unchanged {
+        spans.push(Span::styled(
+            format!(" {}", entry.status.letter()),
+            state.theme.style(Role::for_status(entry.status)),
         ));
     }
     if entry.unreadable {
