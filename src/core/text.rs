@@ -100,6 +100,32 @@ pub fn truncate_to_width(text: &str, max: usize) -> String {
     out
 }
 
+/// Truncates `text` to at most `max` columns from the left, keeping its end
+/// and marking the cut with `…` in front of it.
+///
+/// The tail of a name is the part that tells files apart, so a tree row that
+/// has to give up columns gives up the beginning.
+pub fn truncate_tail_to_width(text: &str, max: usize) -> String {
+    if display_width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // The ellipsis is drawn in the first column the kept tail may use.
+    let budget = max - 1;
+    let mut width = 0;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width > budget {
+            break;
+        }
+        start = index;
+    }
+    format!("\u{2026}{}", &text[start..])
+}
+
 /// The part of `text` a pane that does not wrap can show.
 ///
 /// Byte offsets into `text`, so that a line can be cut once and then sliced by

@@ -112,7 +112,8 @@ impl Node {
             rel,
             kind,
             status: Status::Unchanged,
-            stat: NodeStat::NotApplicable,
+            // Nothing is known until the baseline's set is applied.
+            stat: NodeStat::Unknown,
             changed_at: None,
             loaded: false,
             skeleton: false,
@@ -328,24 +329,71 @@ impl FsModel {
         }
     }
 
+    /// The `+N -N ~N` of one changed file against the baseline, or `None`
+    /// when they could not be counted.
+    fn apply_entry(node: &mut Node, entry: &ChangedEntry) {
+        node.status = entry.status;
+        node.changed_at = Some(entry.changed_at);
+        node.stat = match entry.stat {
+            Some(stat) => NodeStat::Known(stat),
+            None => NodeStat::Unknown,
+        };
+    }
+
     /// Applies the baseline's changed set to the tree (design §11.1).
     ///
     /// Every node takes its status back from the set, and a file that exists
     /// only in the baseline keeps a node of its own so the tree can show it
-    /// as `D`. A changed file inside a directory no listing has reached yet
-    /// simply waits for that listing; the next call covers it.
+    /// as `D`. Directories also take the counts of the files below them,
+    /// even where no listing has reached, so a collapsed row shows what it
+    /// hides.
     pub fn sync_baseline(&mut self, changed: &BTreeMap<PathBuf, ChangedEntry>) {
         for (_, node) in self.arena.iter_mut() {
             node.status = Status::Unchanged;
+            node.stat = NodeStat::NotApplicable;
         }
+        // Totals of the directories, path by path: `Some(None)` is a
+        // directory whose files include one that could not be counted, and
+        // its total is drawn as `?` rather than as a wrong number.
+        let mut directories: BTreeMap<PathBuf, Option<Option<DiffStat>>> = BTreeMap::new();
         for (rel, entry) in changed {
-            if let Some(id) = self.lookup(rel) {
-                if let Some(node) = self.arena.get_mut(id) {
-                    node.status = entry.status;
-                    node.changed_at = Some(entry.changed_at);
+            match self.lookup(rel) {
+                Some(id) => {
+                    if let Some(node) = self.arena.get_mut(id) {
+                        Self::apply_entry(node, entry);
+                    }
                 }
-            } else if entry.status == Status::Deleted {
-                self.synthesize_deleted(rel, entry);
+                None if entry.status == Status::Deleted => {
+                    self.synthesize_deleted(rel, entry);
+                }
+                // The other statuses need a node, and the listing that
+                // creates it applies the set again (§11.1).
+                None => {}
+            }
+            for parent in ancestor_dirs(rel) {
+                let slot = directories.entry(parent).or_insert(None);
+                *slot = match (*slot, entry.stat) {
+                    (Some(Some(total)), Some(next)) => {
+                        let mut total = total;
+                        total.merge(&next);
+                        Some(Some(total))
+                    }
+                    (None, Some(next)) => Some(Some(next)),
+                    (_, _) => Some(None),
+                };
+            }
+        }
+        for (rel, slot) in directories {
+            let Some(id) = self.lookup(&rel) else {
+                // A directory no listing has created yet gets its total the
+                // moment the listing arrives and the set is applied again.
+                continue;
+            };
+            if let Some(node) = self.arena.get_mut(id) {
+                node.stat = match slot {
+                    Some(Some(total)) => NodeStat::Known(total),
+                    _ => NodeStat::Unknown,
+                };
             }
         }
     }
@@ -383,10 +431,21 @@ impl FsModel {
             None => self.insert_child(parent, last, NodeKind::File),
         };
         if let Some(node) = self.arena.get_mut(id) {
-            node.status = entry.status;
-            node.changed_at = Some(entry.changed_at);
+            Self::apply_entry(node, entry);
         }
     }
+}
+
+/// The directories above `rel`: the root, then every parent up to its own.
+fn ancestor_dirs(rel: &Path) -> Vec<PathBuf> {
+    let mut prefixes = vec![PathBuf::new()];
+    let mut prefix = PathBuf::new();
+    let components: Vec<_> = rel.components().collect();
+    for component in &components[..components.len().saturating_sub(1)] {
+        prefix.push(component);
+        prefixes.push(prefix.clone());
+    }
+    prefixes
 }
 
 #[cfg(test)]
@@ -485,6 +544,15 @@ mod tests {
         ChangedEntry {
             status,
             changed_at: SystemTime::UNIX_EPOCH,
+            stat: None,
+        }
+    }
+
+    fn counted(status: Status, stat: DiffStat) -> ChangedEntry {
+        ChangedEntry {
+            status,
+            changed_at: SystemTime::UNIX_EPOCH,
+            stat: Some(stat),
         }
     }
 
@@ -562,6 +630,85 @@ mod tests {
         assert_eq!(
             model.get(node).map(|node| node.status),
             Some(Status::Modified)
+        );
+    }
+
+    #[test]
+    fn directories_aggregate_the_files_below_them_even_when_unlisted() {
+        let mut model = model();
+        let root = model.root_id();
+        // `docs` has a row of its own, but no listing has reached its files.
+        let docs = model.insert_child(root, os("docs"), NodeKind::Dir);
+        let direct = model.insert_child(root, os("direct.txt"), NodeKind::File);
+        let plain = model.insert_child(root, os("plain.txt"), NodeKind::File);
+        let untouched = model.insert_child(root, os("untouched"), NodeKind::Dir);
+        model.sync_baseline(&BTreeMap::from([
+            (
+                PathBuf::from("docs/a.txt"),
+                counted(
+                    Status::Added,
+                    DiffStat {
+                        added: 2,
+                        removed: 0,
+                        replaced: 0,
+                    },
+                ),
+            ),
+            (
+                PathBuf::from("docs/b.txt"),
+                counted(
+                    Status::Deleted,
+                    DiffStat {
+                        added: 0,
+                        removed: 1,
+                        replaced: 0,
+                    },
+                ),
+            ),
+            (
+                PathBuf::from("direct.txt"),
+                counted(
+                    Status::Modified,
+                    DiffStat {
+                        added: 1,
+                        removed: 1,
+                        replaced: 1,
+                    },
+                ),
+            ),
+            (PathBuf::from("plain.txt"), changed(Status::Modified)),
+        ]));
+        assert_eq!(
+            model.get(docs).map(|node| node.stat),
+            Some(NodeStat::Known(DiffStat {
+                added: 2,
+                removed: 1,
+                replaced: 0,
+            })),
+            "a collapsed directory shows the sum of the rows it hides"
+        );
+        assert_eq!(
+            model.get(direct).map(|node| node.stat),
+            Some(NodeStat::Known(DiffStat {
+                added: 1,
+                removed: 1,
+                replaced: 1,
+            }))
+        );
+        assert_eq!(
+            model.get(plain).map(|node| node.stat),
+            Some(NodeStat::Unknown),
+            "a file that could not be counted has no number"
+        );
+        assert_eq!(
+            model.get(model.root_id()).map(|node| node.stat),
+            Some(NodeStat::Unknown),
+            "one uncounted file makes every total above it unknown"
+        );
+        assert_eq!(
+            model.get(untouched).map(|node| node.stat),
+            Some(NodeStat::NotApplicable),
+            "a directory with nothing changed under it shows nothing"
         );
     }
 }

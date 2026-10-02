@@ -22,7 +22,7 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 pub const MAX_LINES: usize = 2000;
 
 /// A NUL in this many leading bytes means the file is binary.
-const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 /// Columns a line may occupy. A wider line is cut, because the diff engine
 /// refuses to work on it and because drawing it would be pointless.

@@ -1,12 +1,12 @@
 ---
 source: tests/ui_snapshot.rs
-assertion_line: 32
+assertion_line: 38
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌──────────────────────────────────────────────┐
-│▾d root                       │                no file selected                
-│  ▸d docs                     │                                                
-│  ▸d src                      │                                                
+│▾d root                      …│                no file selected                
+│  ▸d docs                    …│                                                
+│  ▸d src                     …│                                                
 │   f README.md                │                                                
 │                              │                                                
 │                              │                                                

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::core::diff::DiffStat;
 use crate::core::fsmodel::Status;
 
 /// Which content the diff is compared against.
@@ -45,6 +46,9 @@ pub struct ChangedEntry {
     pub status: Status,
     /// First time the app saw the file in this state.
     pub changed_at: SystemTime,
+    /// The `+N -N ~N` against the baseline, `None` when the sides could not
+    /// be counted: not text, not there, or past the budget (§10).
+    pub stat: Option<DiffStat>,
 }
 
 /// The outcome of one baseline build.

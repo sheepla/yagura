@@ -4,9 +4,9 @@ assertion_line: 119
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f long.txt  1.7 KiB───────────────────────────┐
-│▾d root                       │  24 line 24                                    
-│  ▸d docs                     │  25 line 25                                    
-│  ▸d src                      │  26 line 26                                    
+│▾d root                      …│  24 line 24                                    
+│  ▸d docs                    …│  25 line 25                                    
+│  ▸d src                     …│  26 line 26                                    
 │   f long.txt                 │  27 line 27                                    
 │   f README.md                │  28 line 28                                    
 │                              │  29 line 29                                    

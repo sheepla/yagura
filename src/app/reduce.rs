@@ -179,7 +179,13 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
 /// deleted on disk keeps a row of its own, and the rows are rebuilt to show
 /// them (design §11.1).
 pub fn apply_changed(state: &mut AppState) {
-    state.tree.model.sync_baseline(&state.baseline.changed);
+    // No result has landed yet: there is nothing to mark, and the rows keep
+    // the placeholders that say the baseline is still being counted. The
+    // rows are rebuilt all the same, because this is often the call that
+    // follows a new listing.
+    if state.baseline.phase != crate::core::baseline::Phase::Loading {
+        state.tree.model.sync_baseline(&state.baseline.changed);
+    }
     state.tree.bump();
     state.tree.refresh();
 }
@@ -385,6 +391,7 @@ mod tests {
         ChangedEntry {
             status,
             changed_at: at,
+            stat: None,
         }
     }
 

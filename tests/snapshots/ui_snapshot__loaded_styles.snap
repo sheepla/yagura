@@ -1,12 +1,12 @@
 ---
 source: tests/ui_snapshot.rs
-assertion_line: 26
+assertion_line: 31
 expression: render_row_styles(&state)
 ---
 fg:darkgray+dim | bold+dim | fg:darkgray+dim
-fg:darkgray+dim | fg:darkgray+reversed+bold+dim | fg:blue+reversed+bold | default | fg:darkgray+dim | default | fg:darkgray+dim | default
-fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | default | fg:darkgray+dim | default
-fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | default | fg:darkgray+dim | default
+fg:darkgray+dim | fg:darkgray+reversed+bold+dim | fg:blue+reversed+bold | fg:darkgray+reversed+bold+dim | fg:darkgray+dim | default | fg:darkgray+dim | default
+fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | default
+fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default

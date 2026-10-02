@@ -8,7 +8,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::{BaselineSource, Blob, ChangedEntry};
+use crate::core::diff::{Diff, DiffStat};
 use crate::core::fsmodel::Status;
+use crate::core::preview::{BINARY_SNIFF_BYTES, MAX_BYTES};
+use crate::core::text;
 
 /// Why the git baseline could not be built.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
@@ -66,10 +69,59 @@ pub fn build(root: &Path, now: SystemTime) -> Result<Head, GitError> {
     if !output.status.success() {
         return Err(GitError::Failed(stderr_line(&output)));
     }
-    Ok(Head {
-        head_oid: head_oid(root),
-        changed: parse_status(&output.stdout, now),
-    })
+    let head_oid = head_oid(root);
+    let mut changed = parse_status(&output.stdout, now);
+    // The tree column counts every changed file: one reader answers the
+    // HEAD side of all of them (§10). Without a HEAD the sides cannot be
+    // counted, and the entries stay without a number.
+    if head_oid.is_some()
+        && !changed.is_empty()
+        && let Ok(source) = GitSource::open(root)
+    {
+        for (rel, entry) in changed.iter_mut() {
+            entry.stat = stat_of(&source, root, rel, entry.status);
+        }
+    }
+    Ok(Head { head_oid, changed })
+}
+
+/// The `+N -N ~N` of one changed file against `HEAD`, or `None` when the
+/// two sides are not text, not there, or past the budget (§10).
+fn stat_of(source: &GitSource, root: &Path, rel: &Path, status: Status) -> Option<DiffStat> {
+    let base = match source.blob(rel) {
+        Blob::Bytes(bytes) => bytes,
+        // A new file has nothing on the HEAD side.
+        Blob::Absent if status == Status::Added => Vec::new(),
+        Blob::Absent | Blob::Unreadable => return None,
+    };
+    let current = if status == Status::Deleted {
+        Vec::new()
+    } else {
+        read_capped(&root.join(rel))?
+    };
+    // Binary content has no lines to count, and the pane refuses to draw a
+    // diff of it either.
+    if base[..base.len().min(BINARY_SNIFF_BYTES)].contains(&0)
+        || current[..current.len().min(BINARY_SNIFF_BYTES)].contains(&0)
+    {
+        return None;
+    }
+    let base_text = text::sanitize(&String::from_utf8_lossy(&base));
+    let current_text = text::sanitize(&String::from_utf8_lossy(&current));
+    Diff::compute(&base_text, &current_text)
+        .ok()
+        .map(|diff| diff.stat)
+}
+
+/// The bytes of a file on disk, `None` when it is unreadable or past
+/// [`MAX_BYTES`], which is where the pane stops reading as well.
+fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= MAX_BYTES).then_some(bytes)
 }
 
 fn spawn_error(err: std::io::Error) -> GitError {
@@ -306,6 +358,8 @@ fn parse_status(bytes: &[u8], now: SystemTime) -> BTreeMap<PathBuf, ChangedEntry
             ChangedEntry {
                 status,
                 changed_at: now,
+                // Filled in by [`build`] once the two sides are read.
+                stat: None,
             },
         );
     }
@@ -471,6 +525,62 @@ mod tests {
         let head = build(dir.path(), now()).expect("build");
         assert!(head.changed.is_empty());
         assert!(head.head_oid.is_some());
+    }
+
+    #[test]
+    fn statuses_and_diff_stats_match_a_real_working_tree() {
+        let dir = repo();
+        // An ignore rule outside the tree, so that deleting `.gitignore`
+        // below still counts as a change of its own.
+        std::fs::write(dir.path().join(".git/info/exclude"), "*.log\n").expect("exclude");
+        // Modified, unstaged: one line added.
+        std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").expect("write");
+        // Modified, staged: one line added.
+        std::fs::write(dir.path().join("b.txt"), "two\nthree\n").expect("write");
+        git(dir.path(), &["add", "b.txt"]);
+        // Deleted, unstaged.
+        std::fs::remove_file(dir.path().join(".gitignore")).expect("remove");
+        // Untracked.
+        std::fs::write(dir.path().join("loose.txt"), "x\ny\n").expect("write");
+        // Staged and new.
+        std::fs::write(dir.path().join("staged.txt"), "s\n").expect("write");
+        git(dir.path(), &["add", "staged.txt"]);
+        // Ignored: never part of the changed set.
+        std::fs::write(dir.path().join("debug.log"), "noise\n").expect("write");
+
+        let head = build(dir.path(), now()).expect("build");
+        let count = |name: &str| {
+            head.changed
+                .get(Path::new(name))
+                .and_then(|entry| entry.stat)
+                .unwrap_or_else(|| panic!("{name} has no count"))
+                .format()
+        };
+        assert_eq!(head.changed[Path::new("a.txt")].status, Status::Modified);
+        assert_eq!(count("a.txt"), "+1");
+        assert_eq!(head.changed[Path::new("b.txt")].status, Status::Modified);
+        assert_eq!(count("b.txt"), "+1");
+        assert_eq!(
+            head.changed[Path::new(".gitignore")].status,
+            Status::Deleted
+        );
+        assert_eq!(count(".gitignore"), "-1");
+        assert_eq!(head.changed[Path::new("loose.txt")].status, Status::Added);
+        assert_eq!(count("loose.txt"), "+2");
+        assert_eq!(head.changed[Path::new("staged.txt")].status, Status::Added);
+        assert_eq!(count("staged.txt"), "+1");
+        assert!(!head.changed.contains_key(Path::new("debug.log")));
+        assert_eq!(head.changed.len(), 5);
+    }
+
+    #[test]
+    fn a_binary_file_gets_a_status_but_no_count() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), b"\0\0\0binary").expect("write");
+
+        let head = build(dir.path(), now()).expect("build");
+        assert_eq!(head.changed[Path::new("a.txt")].status, Status::Modified);
+        assert!(head.changed[Path::new("a.txt")].stat.is_none());
     }
 
     #[test]

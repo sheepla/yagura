@@ -4,9 +4,9 @@ assertion_line: 163
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f main.rs  39 B───────────────────────────────┐
-│▾d root                       │   1 fn main() {                                
-│  ▸d docs                     │   2     let n = 42; // count                   
-│  ▸d src                      │   3 }                                          
+│▾d root                      …│   1 fn main() {                                
+│  ▸d docs                    …│   2     let n = 42; // count                   
+│  ▸d src                     …│   3 }                                          
 │   f main.rs                  │                                                
 │   f README.md                │                                                
 │                              │                                                
