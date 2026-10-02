@@ -128,6 +128,16 @@ fn toggle_baseline(state: &mut AppState) -> Vec<Effect> {
 fn cycle_preview_mode(state: &mut AppState) -> Vec<Effect> {
     let before = state.preview_mode.is_diff();
     state.preview_mode = state.preview_mode.next();
+    if state.preview_mode == crate::app::state::PreviewMode::SideBySide
+        && state.size.0 < crate::features::preview::view::SPLIT_MIN_COLS
+    {
+        // The view falls back to the inline diff on a terminal this narrow,
+        // so the status bar says which one is actually on screen.
+        state.set_info(format!(
+            "side-by-side needs {} columns, using the inline diff",
+            crate::features::preview::view::SPLIT_MIN_COLS
+        ));
+    }
     if before == state.preview_mode.is_diff() {
         return Vec::new();
     }
@@ -603,5 +613,36 @@ mod tests {
             .is_empty(),
             "the plain body does not depend on the baseline"
         );
+    }
+
+    #[test]
+    fn splitting_on_a_narrow_terminal_says_which_diff_is_shown() {
+        let mut state = state();
+        assert!(state.size.0 < crate::features::preview::view::SPLIT_MIN_COLS);
+        state.preview.path = Some(PathBuf::from("a.rs"));
+
+        reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert!(
+            state.visible_message().is_none(),
+            "the inline diff fits any width"
+        );
+
+        reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::SideBySide);
+        let message = state.visible_message().expect("a message");
+        assert!(message.text.contains("100 columns"), "{:?}", message.text);
+        assert!(message.text.contains("inline"), "{:?}", message.text);
+    }
+
+    #[test]
+    fn splitting_on_a_wide_terminal_says_nothing() {
+        let mut state = state();
+        state.size = (120, 40);
+        state.preview.path = Some(PathBuf::from("a.rs"));
+
+        reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::SideBySide);
+        assert!(state.visible_message().is_none());
     }
 }

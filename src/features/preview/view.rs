@@ -5,9 +5,11 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
-use crate::app::state::AppState;
+use crate::app::state::{AppState, PreviewMode};
+use crate::core::diff::Row;
 use crate::core::highlight::{self, Semantic};
 use crate::core::preview::{Doc, human_size};
+use crate::core::text;
 use crate::core::text::sanitize_os;
 use crate::ui::theme::{Role, Theme};
 use crate::ui::{pane, placeholder};
@@ -16,6 +18,11 @@ use super::state::PreviewStatus;
 
 /// Columns the line numbers take in front of every line.
 pub const GUTTER_COLS: usize = 5;
+
+/// Columns the terminal needs before the split view is drawn. Below it the
+/// two halves are too narrow to read, so the inline diff stands in for it
+/// and the status bar says why (§9.2).
+pub const SPLIT_MIN_COLS: u16 = 100;
 
 /// Draws the file header above the body.
 pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -72,9 +79,25 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 /// The visible lines of the document, cut to the pane.
 ///
-/// Only the rows the pane can show are built, so a 200,000 line document costs
-/// the same as a 20 line one.
+/// A diff mode with a diff draws its rows, in one column or two; anything
+/// else draws the plain content. Only the rows the pane can show are built,
+/// so a 200,000 line document costs the same as a 20 line one.
 fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
+    if state.preview_mode.is_diff()
+        && let Some(diff) = &doc.diff
+    {
+        let split = state.preview_mode == PreviewMode::SideBySide && state.size.0 >= SPLIT_MIN_COLS;
+        return if split {
+            split_body(state, doc, &diff.rows, area)
+        } else {
+            inline_body(state, doc, &diff.rows, area)
+        };
+    }
+    plain_body(state, doc, area)
+}
+
+/// The document as it is on disk, drawn with the meanings of each line.
+fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     let height = state.preview.height();
     // The gutter takes five columns, and the pane keeps one column of margin.
     let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
@@ -102,6 +125,187 @@ fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
         lines.push(Line::default());
     }
     Text::from(lines)
+}
+
+/// The diff as one column: every row keeps its number and gets a `+` or a
+/// `-` in front of it, and the row is drawn in the colour of the side it
+/// came from (§9.2).
+fn inline_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect) -> Text<'a> {
+    let height = state.preview.height();
+    let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    let end = doc
+        .lines
+        .len()
+        .min(state.preview.scroll_line.saturating_add(height));
+    for index in state.preview.scroll_line..end {
+        let (marker, role) = marker_of(rows.get(index));
+        let style = state.theme.style(role);
+        let window = text::window(&doc.lines[index], state.preview.scroll_col, width);
+        let mut spans = vec![
+            Span::styled(
+                format!("{:>4}", index + 1),
+                state.theme.style(Role::PreviewGutter),
+            ),
+            Span::styled(marker.to_string(), style),
+            Span::styled(&doc.lines[index][window.start..window.end], style),
+        ];
+        if window.cut {
+            spans.push(Span::styled("…", style));
+        }
+        lines.push(Line::from(spans));
+    }
+    while lines.len() < height {
+        lines.push(Line::default());
+    }
+    Text::from(lines)
+}
+
+/// The marker and the colour one diff row is drawn with.
+fn marker_of(row: Option<&Row>) -> (char, Role) {
+    match row {
+        Some(Row::Added(_)) => ('+', Role::DiffAdded),
+        Some(Row::Removed(_)) => ('-', Role::DiffRemoved),
+        Some(Row::Fold(_)) => (' ', Role::PreviewPlaceholder),
+        Some(Row::Context(_)) | None => (' ', Role::PreviewText),
+    }
+}
+
+/// What one half of a split row shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cell<'a> {
+    /// The same text on both sides.
+    Shared(&'a str),
+    /// A collapsed run, spelled out on both sides.
+    Fold(&'a str),
+    /// A line only one side has.
+    Changed(&'a str),
+    /// Nothing on this side.
+    Blank,
+}
+
+/// The diff as two columns: the baseline on the left, the file on the right
+/// (§9.2). The rows are paired here rather than stored, so a mode switch
+/// costs nothing.
+fn split_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect) -> Text<'a> {
+    let height = state.preview.height();
+    // One column of the pane's margin becomes the divider between the sides.
+    let left = area.width / 2;
+    let right = area.width.saturating_sub(left + 1);
+    let left_text = left.saturating_sub(GUTTER_COLS as u16) as usize;
+    let right_text = right.saturating_sub(GUTTER_COLS as u16) as usize;
+    let cells = side_cells(rows, &doc.lines);
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    let start = state.preview.scroll_line;
+    let end = cells.len().min(start.saturating_add(height));
+    for (index, pair) in cells.iter().enumerate().take(end).skip(start) {
+        let [baseline, current] = *pair;
+        let mut spans = Vec::with_capacity(7);
+        spans.extend(cell_spans(state, index, baseline, true, left_text));
+        spans.push(Span::styled("│", state.theme.style(Role::PreviewGutter)));
+        spans.extend(cell_spans(state, index, current, false, right_text));
+        lines.push(Line::from(spans));
+    }
+    while lines.len() < height {
+        lines.push(Line::default());
+    }
+    Text::from(lines)
+}
+
+/// One half of a split row: the number, the marker, the window of text, and
+/// the padding that holds the other half in place.
+fn cell_spans<'a>(
+    state: &'a AppState,
+    index: usize,
+    cell: Cell<'a>,
+    baseline_side: bool,
+    width: usize,
+) -> Vec<Span<'a>> {
+    let gutter = Span::styled(
+        format!("{:>4}", index + 1),
+        state.theme.style(Role::PreviewGutter),
+    );
+    let (text, marker, role) = match (cell, baseline_side) {
+        (Cell::Changed(text), true) => (text, '-', Role::DiffRemoved),
+        (Cell::Changed(text), false) => (text, '+', Role::DiffAdded),
+        (Cell::Fold(text), _) => (text, ' ', Role::PreviewPlaceholder),
+        (Cell::Shared(text), _) => (text, ' ', Role::PreviewText),
+        (Cell::Blank, _) => ("", ' ', Role::PreviewText),
+    };
+    let style = state.theme.style(role);
+    if matches!(cell, Cell::Blank) {
+        // The absent side still takes its width, or the other half shifts.
+        return vec![
+            gutter,
+            Span::styled(marker.to_string(), style),
+            Span::styled(" ".repeat(width), style),
+        ];
+    }
+    let window = text::window(text, state.preview.scroll_col, width);
+    let mut spans = vec![
+        gutter,
+        Span::styled(marker.to_string(), style),
+        Span::styled(&text[window.start..window.end], style),
+    ];
+    if window.cut {
+        spans.push(Span::styled("…", style));
+    }
+    let shown = text::display_width(&text[window.start..window.end]) + usize::from(window.cut);
+    let padding = width.saturating_sub(shown);
+    if padding > 0 {
+        spans.push(Span::styled(
+            " ".repeat(padding),
+            state.theme.style(Role::PreviewText),
+        ));
+    }
+    spans
+}
+
+/// Pairs the rows into the two columns: within a change block the two runs
+/// are matched from the top, and whatever one side has too much of keeps its
+/// own side, exactly as `Diff::side_rows` draws it.
+fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
+    let mut cells = Vec::with_capacity(rows.len());
+    let mut index = 0;
+    while index < rows.len() {
+        match &rows[index] {
+            Row::Context(line) => {
+                cells.push([Cell::Shared(line), Cell::Shared(line)]);
+                index += 1;
+            }
+            Row::Fold(_) => {
+                let text = lines.get(index).map_or("", String::as_str);
+                cells.push([Cell::Fold(text), Cell::Fold(text)]);
+                index += 1;
+            }
+            Row::Removed(_) | Row::Added(_) => {
+                let start = index;
+                while index < rows.len() && matches!(rows[index], Row::Removed(_) | Row::Added(_)) {
+                    index += 1;
+                }
+                let mut removed: Vec<&str> = Vec::new();
+                let mut added: Vec<&str> = Vec::new();
+                for row in &rows[start..index] {
+                    match row {
+                        Row::Removed(line) => removed.push(line),
+                        Row::Added(line) => added.push(line),
+                        _ => {}
+                    }
+                }
+                let paired = removed.len().min(added.len());
+                for pair in 0..paired {
+                    cells.push([Cell::Changed(removed[pair]), Cell::Changed(added[pair])]);
+                }
+                for line in &removed[paired..] {
+                    cells.push([Cell::Changed(line), Cell::Blank]);
+                }
+                for line in &added[paired..] {
+                    cells.push([Cell::Blank, Cell::Changed(line)]);
+                }
+            }
+        }
+    }
+    cells
 }
 
 /// One line, cut to the pane and split by what each run of it means.
@@ -501,5 +705,140 @@ mod tests {
             comment.modifier.contains(Modifier::DIM),
             "a comment without color has nothing left to say"
         );
+    }
+
+    /// A state whose preview shows `baseline` and `current` as a diff.
+    fn diffed(baseline: &str, current: &str, mode: PreviewMode) -> AppState {
+        let mut state = state();
+        state.preview.viewport = 6;
+        state.preview_mode = mode;
+        let diff = crate::core::diff::Diff::compute(baseline, current).expect("diff");
+        let doc = Doc {
+            rel: PathBuf::from("a.txt"),
+            name: "a.txt".into(),
+            size: current.len() as u64,
+            language: Language::Text,
+            lines: diff
+                .rows
+                .iter()
+                .map(|row| match row {
+                    Row::Context(line) | Row::Added(line) | Row::Removed(line) => line.clone(),
+                    Row::Fold(count) => format!("\u{22ef} {count} lines"),
+                })
+                .collect(),
+            truncated: false,
+            too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+            diff: Some(diff),
+            diff_note: None,
+        };
+        state.preview.path = Some(doc.rel.clone());
+        state.preview.set_doc(doc);
+        state
+    }
+
+    #[test]
+    fn a_diff_row_is_drawn_with_its_marker_and_colour() {
+        let state = diffed("one\ntwo\n", "one\nTWO\n", PreviewMode::InlineDiff);
+        let buffer = draw(&state);
+        // Row one is context: a blank marker and the pane's own text colour.
+        assert_eq!(buffer[(4, 1)].fg, Color::Reset, "the context marker");
+        // Row two is a removal, row three an addition: marker and text take
+        // the colour of the side the row came from.
+        assert_eq!(buffer[(4, 2)].fg, Color::Red, "the removal marker");
+        assert_eq!(buffer[(5, 2)].symbol(), "t", "the removal text");
+        assert_eq!(buffer[(5, 2)].fg, Color::Red, "the removal text");
+        assert_eq!(buffer[(4, 3)].fg, Color::Green, "the addition marker");
+        assert_eq!(buffer[(5, 3)].symbol(), "T", "the addition text");
+        assert_eq!(buffer[(5, 3)].fg, Color::Green, "the addition text");
+        // The number in front stays in the gutter's colour.
+        assert_eq!(buffer[(3, 2)].symbol(), "2");
+        assert_eq!(buffer[(3, 2)].fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_fold_is_drawn_as_a_marker_row() {
+        let baseline = (1..=13)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = baseline.replace("line5", "changed");
+        let mut state = diffed(&baseline, &current, PreviewMode::InlineDiff);
+        // The fold sits in the trailing context, so scroll to it.
+        state.preview.scroll_line = 6;
+        let text = buffer(&state);
+        assert!(text.contains("\u{22ef} 2 lines"), "{text}");
+    }
+
+    #[test]
+    fn the_split_view_holds_the_two_sides_in_place() {
+        let mut state = diffed(
+            "keep\nold value\n",
+            "keep\na longer new value\n",
+            PreviewMode::SideBySide,
+        );
+        // The pane's own border is made of the same box drawing character, so
+        // the divider is looked for where it stands: the middle of the body.
+        let divider = |state: &AppState| draw(state)[(20, 1)].symbol().to_owned();
+
+        // Below the split width the inline diff stands in for it.
+        assert_ne!(divider(&state), "│", "the sides were split");
+        let text = buffer(&state);
+        assert!(text.contains("old value"), "{text}");
+
+        // Wide enough, and the baseline moves to its own column.
+        state.size.0 = 120;
+        assert_eq!(divider(&state), "│", "no divider between the sides");
+        let text = buffer(&state);
+        assert!(text.contains("old value"), "{text}");
+        assert!(text.contains("a longer"), "{text}");
+    }
+
+    #[test]
+    fn the_split_columns_agree_with_the_side_rows_of_the_diff() {
+        use crate::core::diff::{Diff, SideRow};
+
+        let long = (1..=13)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let changed = long.replace("line5", "changed");
+        for (baseline, current) in [
+            ("x1\nx2\nkeep\n", "y1\ny2\ny3\nkeep\n"),
+            ("x1\nx2\nx3\nkeep\n", "y1\nkeep\n"),
+            (long.as_str(), changed.as_str()),
+        ] {
+            let diff = Diff::compute(baseline, current).expect("diff");
+            // The fold texts live in the lines; nothing here compares them.
+            let lines: Vec<String> = diff.rows.iter().map(|_| String::new()).collect();
+            let mine: Vec<(Option<String>, Option<String>)> = side_cells(&diff.rows, &lines)
+                .iter()
+                .map(|[left, right]| (mark(left), mark(right)))
+                .collect();
+            let theirs: Vec<(Option<String>, Option<String>)> = diff
+                .side_rows()
+                .into_iter()
+                .map(|row| match row {
+                    SideRow::Context(text) => (Some(text.clone()), Some(text)),
+                    SideRow::Replace { baseline, current } => (Some(baseline), Some(current)),
+                    SideRow::Removed(text) => (Some(text), None),
+                    SideRow::Added(text) => (None, Some(text)),
+                    SideRow::Fold(_) => (Some("\u{22ef}".to_owned()), Some("\u{22ef}".to_owned())),
+                })
+                .collect();
+            assert_eq!(mine, theirs, "for {baseline:?} against {current:?}");
+        }
+
+        fn mark(cell: &Cell<'_>) -> Option<String> {
+            match cell {
+                Cell::Shared(text) | Cell::Changed(text) => Some((*text).to_owned()),
+                Cell::Fold(_) => Some("\u{22ef}".to_owned()),
+                Cell::Blank => None,
+            }
+        }
     }
 }

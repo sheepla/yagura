@@ -5,11 +5,13 @@
 
 mod support;
 
+use std::path::Path;
+
 use insta::assert_snapshot;
 use ratatui::style::Color;
 
 use support::{
-    colors_in_frame, fixture, loaded_state, plain_state, preview_state, render_row_styles,
+    Fixture, colors_in_frame, fixture, loaded_state, plain_state, preview_state, render_row_styles,
     render_text,
 };
 
@@ -177,4 +179,141 @@ fn a_program_without_colors_paints_no_colors() {
             "unexpected color {color:?} in a NO_COLOR frame"
         );
     }
+}
+
+/// The fixture inside a real repository with one commit, so the baseline has
+/// something to compare the working tree against.
+fn git_fixture() -> Fixture {
+    let dir = fixture();
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+    git(dir.path(), &["config", "user.name", "Test"]);
+    // Keeps the tests independent from a signing setup on the machine.
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+    dir
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_changed_file_shows_a_diff_against_head() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    use yagura::app::state::{AppState, PreviewMode};
+    use yagura::app::{Action, Command, Effect, reduce::reduce};
+    use yagura::features::preview::reducer::sync_target;
+
+    /// Runs the effects and reduces everything they send until `done`.
+    async fn run_until(
+        runner: &yagura::app::runner::EffectRunner,
+        rx: &mut tokio::sync::mpsc::Receiver<Action>,
+        state: &mut AppState,
+        effects: Vec<Effect>,
+        done: impl Fn(&Action) -> bool,
+    ) {
+        for effect in effects {
+            runner.run(effect);
+        }
+        loop {
+            let action = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the effects finished in time")
+                .expect("the store side of the channel stays open");
+            let matched = done(&action);
+            reduce(state, action);
+            if matched {
+                return;
+            }
+        }
+    }
+
+    let dir = git_fixture();
+    // The committed line and the file on disk now differ.
+    std::fs::write(dir.path().join("README.md"), "# yagura!\n").expect("write");
+    let mut state = plain_state(dir.path(), false);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Action>(16);
+    runtime.block_on(async {
+        let runner = yagura::app::runner::EffectRunner::new(dir.path().to_path_buf(), true, tx);
+
+        // The listing and the baseline build both report in before the
+        // preview can ask either of them anything.
+        let listed = Cell::new(false);
+        let built = Cell::new(false);
+        let startup = state.startup_effects();
+        run_until(&runner, &mut rx, &mut state, startup, |action| {
+            listed.set(listed.get() || matches!(action, Action::DirLoaded { .. }));
+            built.set(built.get() || matches!(action, Action::BaselineReady { .. }));
+            listed.get() && built.get()
+        })
+        .await;
+
+        let file = state
+            .tree
+            .model
+            .lookup(Path::new("README.md"))
+            .expect("the fixture has a README");
+        state.tree.select(file);
+        let load = sync_target(&mut state);
+        run_until(&runner, &mut rx, &mut state, load, |action| {
+            matches!(action, Action::PreviewLoaded { .. })
+        })
+        .await;
+
+        // One step of the cycle brings up the inline diff, which re-reads the
+        // file against the baseline the build just handed over.
+        let cycle = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        run_until(&runner, &mut rx, &mut state, cycle, |action| {
+            matches!(action, Action::PreviewLoaded { .. })
+        })
+        .await;
+    });
+
+    assert_eq!(state.preview_mode, PreviewMode::InlineDiff);
+    let doc = state.preview.doc.as_deref().expect("the preview arrived");
+    assert!(doc.diff.is_some(), "the changed file has no diff");
+
+    assert_snapshot!("preview_diff_rows_text", render_text(&state));
+    assert_snapshot!("preview_diff_rows_styles", render_row_styles(&state));
+
+    // Wide enough for the two columns, and the rows pair up again.
+    assert!(
+        reduce(
+            &mut state,
+            Action::Resize {
+                width: 120,
+                height: 30,
+            }
+        )
+        .is_empty()
+    );
+    assert!(
+        reduce(&mut state, Action::Command(Command::CyclePreviewMode)).is_empty(),
+        "the split draws the rows already loaded"
+    );
+    assert_eq!(state.preview_mode, PreviewMode::SideBySide);
+    assert!(
+        state.visible_message().is_none(),
+        "the terminal is wide enough for the split"
+    );
+    assert_snapshot!("preview_split_text", render_text(&state));
 }

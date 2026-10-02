@@ -21,6 +21,10 @@ pub enum Role {
     PreviewHeader,
     PreviewPlaceholder,
     PreviewGutter,
+    /// A line only the current file has, in a diff.
+    DiffAdded,
+    /// A line only the baseline has, in a diff.
+    DiffRemoved,
     StatusMode,
     StatusMessage,
     StatusError,
@@ -83,6 +87,8 @@ fn color(role: Role) -> Color {
         Role::TreeSelected => Color::Reset,
         Role::PreviewHeader | Role::StatusInfo => Color::Yellow,
         Role::PreviewPlaceholder | Role::PreviewGutter => Color::DarkGray,
+        Role::DiffAdded => Color::Green,
+        Role::DiffRemoved => Color::Red,
         Role::StatusMode => Color::Black,
         Role::StatusPosition => Color::Reset,
         Role::SyntaxKeyword => Color::Magenta,
@@ -117,6 +123,8 @@ fn modifiers(role: Role) -> Modifier {
         | Role::TreeUnreadable
         | Role::PreviewText
         | Role::PreviewHeader
+        | Role::DiffAdded
+        | Role::DiffRemoved
         | Role::SyntaxKeyword
         | Role::SyntaxString
         | Role::SyntaxNumber
