@@ -37,7 +37,9 @@ pub fn load_dir(dir: &Path, ignore_enabled: bool) -> Result<Vec<DirEntry>, DirEr
             .follow_links(false)
             .standard_filters(false)
             .hidden(false)
-            .parents(false)
+            // An ancestor's `.gitignore` applies to the whole subtree, so a
+            // directory is listed with the ignore files above it read too.
+            .parents(true)
             .ignore(true)
             .git_ignore(true)
             .git_global(true)
@@ -186,6 +188,33 @@ mod tests {
         assert_eq!(
             names(tmp.path()),
             vec![".gitignore".to_string(), "keep.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ancestors_gitignore_applies_below_it_too() {
+        let tmp = temp_dir();
+        fs::write(tmp.path().join(".gitignore"), "*.log\n").expect("write");
+        fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("sub/x.log"), "").expect("write");
+        fs::write(tmp.path().join("sub/keep.rs"), "").expect("write");
+        assert_eq!(names(&tmp.path().join("sub")), vec!["keep.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_subdirectorys_gitignore_stops_at_its_own_subtree() {
+        let tmp = temp_dir();
+        fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("sub/.gitignore"), "*.log\n").expect("write");
+        fs::write(tmp.path().join("sub/x.log"), "").expect("write");
+        fs::write(tmp.path().join("y.log"), "").expect("write");
+        assert_eq!(
+            names(&tmp.path().join("sub")),
+            vec![".gitignore".to_string()]
+        );
+        assert_eq!(
+            names(tmp.path()),
+            vec!["sub".to_string(), "y.log".to_string()]
         );
     }
 
