@@ -40,4 +40,11 @@ pub enum Effect {
         /// Incremented for every rebuild; older results are dropped.
         ver: u64,
     },
+    /// Watch, or stop watching, the directories that hold a listing (§7.1).
+    WatchDirs {
+        /// Directories relative to the root; the empty path is the root
+        /// itself. Watching a directory twice changes nothing.
+        add: Vec<PathBuf>,
+        remove: Vec<PathBuf>,
+    },
 }

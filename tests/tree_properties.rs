@@ -258,7 +258,10 @@ fn a_listing_from_an_unknown_generation_is_dropped() {
 
     let asked = reduce(&mut state, Action::Command(Command::Expand));
     assert!(
-        matches!(asked.as_slice(), [Effect::LoadDir { .. }]),
+        matches!(
+            asked.as_slice(),
+            [Effect::WatchDirs { .. }, Effect::LoadDir { .. }]
+        ),
         "{asked:?}"
     );
     let generation = state.tree.load_gen[&docs];
@@ -303,7 +306,10 @@ fn asking_while_a_load_is_in_flight_asks_once() {
 
     let first = reduce(&mut state, Action::Command(Command::Expand));
     assert!(
-        matches!(first.as_slice(), [Effect::LoadDir { .. }]),
+        matches!(
+            first.as_slice(),
+            [Effect::WatchDirs { .. }, Effect::LoadDir { .. }]
+        ),
         "{first:?}"
     );
     let generation = state.tree.load_gen[&docs];

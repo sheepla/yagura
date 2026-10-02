@@ -1,7 +1,7 @@
 //! Running effects outside the UI loop.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc::Sender;
@@ -9,6 +9,7 @@ use tokio::sync::mpsc::Sender;
 use crate::app::action::Action;
 use crate::app::effect::Effect;
 use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
+use crate::core::fswatch::watcher::FsWatcher;
 use crate::core::preview::Baseline;
 use crate::core::{dirload, preview};
 
@@ -24,6 +25,9 @@ pub struct EffectRunner {
     ignore_enabled: bool,
     action_tx: Sender<Action>,
     baseline: BaselineSlot,
+    /// The watch on the root, started by the first [`Effect::WatchDirs`] and
+    /// kept alive for as long as the application runs.
+    watcher: Mutex<Option<FsWatcher>>,
 }
 
 impl EffectRunner {
@@ -33,6 +37,7 @@ impl EffectRunner {
             ignore_enabled,
             action_tx,
             baseline: Arc::new(Mutex::new(None)),
+            watcher: Mutex::new(None),
         }
     }
 
@@ -116,6 +121,37 @@ impl EffectRunner {
                 });
             }
             Effect::ScheduleTick => self.spawn_clock(),
+            Effect::WatchDirs { add, remove } => self.watch(&add, &remove),
+        }
+    }
+
+    /// Applies the watch changes a listing asked for.
+    ///
+    /// The watch is started the first time it is needed rather than at
+    /// startup, so an application that never asks for one pays nothing for
+    /// it. A watch that cannot be started leaves the tree to the listings
+    /// alone: it is a loss of freshness, not a reason to stop.
+    fn watch(&self, add: &[PathBuf], remove: &[PathBuf]) {
+        let mut slot = self.watcher.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            match FsWatcher::start(self.root.clone(), self.action_tx.clone()) {
+                Ok(watcher) => *slot = Some(watcher),
+                Err(err) => {
+                    tracing::warn!(%err, root = %self.root.display(), "cannot watch the tree");
+                    return;
+                }
+            }
+        }
+        let Some(watcher) = slot.as_mut() else {
+            return;
+        };
+        for rel in remove {
+            watcher.unwatch(rel);
+        }
+        for rel in add {
+            if let Err(err) = watcher.watch(rel) {
+                tracing::debug!(%err, rel = %rel.display(), "cannot watch a directory");
+            }
         }
     }
 

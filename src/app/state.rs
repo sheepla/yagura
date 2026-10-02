@@ -236,6 +236,12 @@ impl AppState {
         // here, so the two cannot drift apart.
         let generation = self.tree.load_gen.get(&root).copied().unwrap_or(1);
         vec![
+            // The watch goes up before the first read, so that a change
+            // during it cannot slip through (§7.1).
+            Effect::WatchDirs {
+                add: vec![PathBuf::new()],
+                remove: Vec::new(),
+            },
             Effect::LoadDir {
                 node: root,
                 generation,
@@ -402,18 +408,25 @@ mod tests {
     fn startup_loads_the_root_and_builds_the_baseline() {
         let state = state();
         let effects = state.startup_effects();
-        assert_eq!(effects.len(), 3);
+        assert_eq!(effects.len(), 4);
         assert_eq!(
             effects[0],
+            Effect::WatchDirs {
+                add: vec![PathBuf::new()],
+                remove: Vec::new()
+            }
+        );
+        assert_eq!(
+            effects[1],
             Effect::LoadDir {
                 node: state.tree.model.root_id(),
                 generation: 1,
                 rel: PathBuf::new()
             }
         );
-        assert_eq!(effects[1], Effect::ScheduleTick);
+        assert_eq!(effects[2], Effect::ScheduleTick);
         assert_eq!(
-            effects[2],
+            effects[3],
             Effect::BuildBaseline {
                 kind: Kind::Head,
                 ver: 1
@@ -429,7 +442,7 @@ mod tests {
         assert!(state.tree.is_expanded(root));
         // The generation the effect carries is the one the reducer expects,
         // otherwise the listing is dropped as stale when it arrives.
-        let Effect::LoadDir { generation, .. } = state.startup_effects()[0] else {
+        let Effect::LoadDir { generation, .. } = state.startup_effects()[1] else {
             panic!("startup loads the root");
         };
         assert_eq!(generation, state.tree.load_gen[&root]);

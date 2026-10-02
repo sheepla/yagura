@@ -49,4 +49,15 @@ pub enum Action {
         ver: u64,
         built: crate::core::baseline::Built,
     },
+    /// A batch of filesystem changes, folded out of the watch (§7.2).
+    FsBatch {
+        /// The paths that changed, one entry per path however often it did.
+        changes: Vec<crate::core::fswatch::FsChange>,
+        /// When the batch was taken, so the reducer can stamp the rows
+        /// without reading the clock (invariant I1).
+        at: SystemTime,
+    },
+    /// So much happened at once that nothing was remembered: the tree has to
+    /// be read again (§7.2).
+    FsRescanNeeded,
 }

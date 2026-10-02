@@ -81,6 +81,11 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             effects.extend(preview::reducer::sync_target(state));
             effects
         }
+        // Changes on disk belong to the tree alone. The preview is reloaded
+        // only for a path it is showing: what happens elsewhere in the tree
+        // must not move the view (§7.3).
+        Action::FsBatch { changes, at } => tree::reducer::on_fs_batch(state, changes, *at),
+        Action::FsRescanNeeded => tree::reducer::on_rescan(state),
     }
 }
 

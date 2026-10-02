@@ -1,7 +1,10 @@
 //! The tree reducer: pure functions from state and messages to new state and
 //! the work that has to happen next.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::app::action::Action;
 use crate::app::command::Command;
@@ -9,6 +12,7 @@ use crate::app::effect::Effect;
 use crate::app::state::{AppState, Focus, Overlay, SortMode};
 use crate::core::dirload::DirError;
 use crate::core::fsmodel::{NodeId, NodeKind};
+use crate::core::fswatch::{ChangeKind, FsChange};
 use crate::core::text;
 
 use super::sort::{sort_all, sort_children};
@@ -203,7 +207,28 @@ fn request_children(state: &mut AppState, node: NodeId, effects: &mut Vec<Effect
         .model
         .get(node)
         .is_some_and(|entry| entry.loaded || entry.unreadable);
-    if already_loaded || !state.tree.loading.insert(node) {
+    if already_loaded {
+        return;
+    }
+    issue_load(state, node, effects);
+}
+
+/// Registers a listing request and asks for it (invariant I3).
+///
+/// A directory is watched before it is read, not after: a file created
+/// between the two would be invisible until something else happened in the
+/// directory (§7.1). One listing per directory is in flight at a time, so a
+/// request that is already out changes nothing.
+fn issue_load(state: &mut AppState, node: NodeId, effects: &mut Vec<Effect>) {
+    if !state
+        .tree
+        .model
+        .get(node)
+        .is_some_and(|entry| entry.is_expandable())
+    {
+        return;
+    }
+    if !state.tree.loading.insert(node) {
         return;
     }
     let generation = state.tree.load_gen.entry(node).or_insert(0);
@@ -213,6 +238,10 @@ fn request_children(state: &mut AppState, node: NodeId, effects: &mut Vec<Effect
         state.tree.loading.remove(&node);
         return;
     };
+    effects.push(Effect::WatchDirs {
+        add: vec![rel.clone()],
+        remove: Vec::new(),
+    });
     effects.push(Effect::LoadDir {
         node,
         generation,
@@ -239,6 +268,9 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
         tracing::debug!(?node, generation, "dropping stale directory listing");
         return Vec::new();
     }
+    // Where the selection sits now, in case this listing takes the row away.
+    state.tree.refresh();
+    let selected_row = state.tree.selected_index();
     match result {
         Ok(entries) => {
             state.tree.model.merge_children(*node, entries);
@@ -258,8 +290,35 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.tree.bump();
         }
     }
+    restore_selection(state, selected_row);
     state.tree.refresh();
     Vec::new()
+}
+
+/// Puts the selection back after a listing took the row it was on.
+///
+/// A file or a whole directory disappearing must not leave the cursor on a
+/// node that no longer exists: the row at the same place is as close to "the
+/// same spot" a list of siblings can offer (design §11.4).
+fn restore_selection(state: &mut AppState, row: Option<usize>) {
+    let Some(selected) = state.tree.selected else {
+        return;
+    };
+    // The rows have to be rebuilt after the listing: reading them here would
+    // read the ones the listing has just replaced.
+    state.tree.refresh();
+    if state.tree.model.contains(selected) {
+        return;
+    }
+    let Some(row) = row else {
+        return;
+    };
+    let index = row.min(state.tree.visible.len().saturating_sub(1));
+    let Some(target) = state.tree.visible.get(index) else {
+        return;
+    };
+    let target = target.node;
+    state.tree.select(target);
 }
 
 /// An error in the words of the user, not of the operating system.
@@ -285,6 +344,132 @@ fn display_rel(state: &AppState, node: NodeId) -> String {
         .unwrap_or_else(|| "?".to_owned())
 }
 
+/// Applies one batch of filesystem changes (design §7.3).
+///
+/// A batch is a hint, not a truth: nothing here reads the disk. What the
+/// reducer already holds is stamped with the time of the change, and the
+/// listings that would show a difference are asked for; the difference
+/// itself arrives later as a `DirLoaded`, like any other listing.
+pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut relists = BTreeSet::new();
+    let mut ignore_changed = false;
+    let mut preview_changed = false;
+
+    for change in changes {
+        let rel = change.rel.as_path();
+        if rel.starts_with(".git") {
+            // The repository metadata is not part of the tree: a new commit
+            // reaches the baseline through a head check instead (§8.2).
+            continue;
+        }
+        if is_ignore_file(rel) {
+            // Every listing in hand was made with the rules that just
+            // changed, so every one of them has to be made again (§7.3).
+            ignore_changed = true;
+        }
+        stamp(state, rel, at);
+        // A change to the contents keeps the row it has; anything that adds
+        // or takes a row away, or names a path the tree has never seen, has
+        // to be looked up in the listing again.
+        let unknown = state.tree.model.lookup(rel).is_none();
+        if (change.kind != ChangeKind::Modify || unknown)
+            && let Some(parent) = rel.parent()
+        {
+            relists.insert(parent.to_path_buf());
+        }
+        if change.kind == ChangeKind::Remove
+            && state
+                .tree
+                .model
+                .lookup(rel)
+                .and_then(|node| state.tree.model.get(node))
+                .is_some_and(|node| node.is_expandable())
+        {
+            // The directory is gone, and with it the watches below it; they
+            // are dropped together so that the same path can be watched
+            // again once something recreates it (§7.1).
+            effects.push(Effect::WatchDirs {
+                add: Vec::new(),
+                remove: vec![change.rel.clone()],
+            });
+        }
+        if state.preview.path.as_ref() == Some(&change.rel) {
+            // The body on screen was read from a file that has just changed,
+            // so it is read again without moving the view (§11.3).
+            preview_changed = true;
+        }
+    }
+
+    if ignore_changed {
+        for node in loaded_dirs(state) {
+            issue_load(state, node, &mut effects);
+        }
+    }
+    for parent in relists {
+        if let Some(node) = state.tree.model.lookup(&parent) {
+            issue_load(state, node, &mut effects);
+        }
+    }
+    if preview_changed {
+        effects.extend(crate::features::preview::reducer::reload(state));
+    }
+    effects
+}
+
+/// Reads every listing in hand again, after events were lost (§7.2, §7.4).
+pub fn on_rescan(state: &mut AppState) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for node in loaded_dirs(state) {
+        issue_load(state, node, &mut effects);
+    }
+    if state.preview.path.is_some() {
+        effects.extend(crate::features::preview::reducer::reload(state));
+    }
+    effects
+}
+
+/// The directories whose listing is in hand: only those can have gone stale.
+fn loaded_dirs(state: &AppState) -> Vec<NodeId> {
+    state
+        .tree
+        .model
+        .iter()
+        .filter(|(_, node)| node.is_expandable() && node.loaded)
+        .map(|(node, _)| node)
+        .collect()
+}
+
+/// True for the files that decide what a listing shows (§7.3).
+fn is_ignore_file(rel: &Path) -> bool {
+    matches!(
+        rel.file_name().and_then(OsStr::to_str),
+        Some(".gitignore" | ".ignore")
+    )
+}
+
+/// Records when a path was last seen to change (spec, `LastChanged`).
+///
+/// The directories above it are stamped as well, so a collapsed row knows
+/// how fresh it is without the view walking the subtree below it.
+fn stamp(state: &mut AppState, rel: &Path, at: SystemTime) {
+    if let Some(entry) = state.baseline.changed.get_mut(rel) {
+        entry.changed_at = at;
+    }
+    let mut dir = rel;
+    loop {
+        if let Some(node) = state.tree.model.lookup(dir)
+            && let Some(node) = state.tree.model.get_mut(node)
+        {
+            node.changed_at = Some(at);
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+}
+
 /// Reapplies the sibling order after new children arrived.
 pub fn sort_node(state: &mut AppState, node: NodeId) {
     sort_children(&mut state.tree.model, node, state.tree.sort);
@@ -301,4 +486,275 @@ pub fn resort_all(state: &mut AppState, mode: SortMode) {
 /// Keeps the tree's row count in step with the terminal size.
 pub fn sync_viewport(state: &mut AppState) {
     state.tree.set_viewport(state.tree_viewport_height());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+    use crate::app::state::Config;
+    use crate::cli::{BaselineKind, IconStyle};
+    use crate::core::fsmodel::{DirEntry, NodeKind};
+
+    fn state() -> AppState {
+        AppState::new(
+            Config {
+                root: PathBuf::from("/root"),
+                icons: IconStyle::Text,
+                baseline: BaselineKind::Auto,
+                ignore_enabled: true,
+                no_color: false,
+                log: None,
+                selftest_panic: false,
+            },
+            (80, 24),
+        )
+    }
+
+    fn entry(name: &str, kind: NodeKind) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            kind,
+            link_target: None,
+            unreadable: false,
+        }
+    }
+
+    fn root_entries() -> Vec<DirEntry> {
+        vec![
+            entry("README.md", NodeKind::File),
+            entry("docs", NodeKind::Dir),
+            entry("src", NodeKind::Dir),
+        ]
+    }
+
+    /// A state whose root listing is in hand, with `docs` open as well.
+    fn populated() -> AppState {
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let generation = state.tree.load_gen[&root];
+        crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: root,
+                generation,
+                result: Ok(root_entries()),
+            },
+        );
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        state.tree.select(docs);
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::Expand));
+        let generation = state.tree.load_gen[&docs];
+        crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: docs,
+                generation,
+                result: Ok(vec![entry("guide.md", NodeKind::File)]),
+            },
+        );
+        state
+    }
+
+    fn change(rel: &str, kind: ChangeKind) -> FsChange {
+        FsChange {
+            rel: PathBuf::from(rel),
+            kind,
+        }
+    }
+
+    fn load_dirs(effects: &[Effect]) -> Vec<NodeId> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::LoadDir { node, .. } => Some(*node),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn at() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn a_content_change_stamps_the_row_and_rereads_nothing() {
+        let mut state = populated();
+        let readme = state
+            .tree
+            .model
+            .lookup(Path::new("README.md"))
+            .expect("README");
+        let effects = on_fs_batch(&mut state, &[change("README.md", ChangeKind::Modify)], at());
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            state.tree.model.get(readme).map(|node| node.changed_at),
+            Some(Some(at()))
+        );
+        let root = state.tree.model.root_id();
+        assert_eq!(
+            state.tree.model.get(root).map(|node| node.changed_at),
+            Some(Some(at())),
+            "the directory above it is just as fresh"
+        );
+    }
+
+    #[test]
+    fn a_change_the_tree_has_never_seen_rereads_its_directory() {
+        let mut state = populated();
+        let root = state.tree.model.root_id();
+        let effects = on_fs_batch(&mut state, &[change("new.txt", ChangeKind::Create)], at());
+        assert_eq!(load_dirs(&effects), vec![root]);
+        assert!(state.tree.loading.contains(&root));
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WatchDirs { add, .. } if add == &vec![PathBuf::new()]
+            )),
+            "the directory is watched before it is read: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_below_an_open_directory_rereads_that_directory() {
+        let mut state = populated();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/page.md", ChangeKind::Create)],
+            at(),
+        );
+        assert_eq!(load_dirs(&effects), vec![docs]);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WatchDirs { add, .. } if add == &vec![PathBuf::from("docs")]
+            )),
+            "the directory is watched before it is read: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_shown_file_is_reread_when_it_changes() {
+        let mut state = populated();
+        state.preview.path = Some(PathBuf::from("README.md"));
+        let effects = on_fs_batch(&mut state, &[change("README.md", ChangeKind::Modify)], at());
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LoadPreview { rel, .. } if rel == &PathBuf::from("README.md")
+            )),
+            "the body on screen was not reread: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_elsewhere_leaves_the_shown_file_alone() {
+        let mut state = populated();
+        state.preview.path = Some(PathBuf::from("README.md"));
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/page.md", ChangeKind::Create)],
+            at(),
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadPreview { .. })),
+            "a change elsewhere reloaded the preview: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn an_ignore_file_rereads_every_listing_in_hand() {
+        let mut state = populated();
+        let root = state.tree.model.root_id();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        let effects = on_fs_batch(
+            &mut state,
+            &[change(".gitignore", ChangeKind::Modify)],
+            at(),
+        );
+        let mut loaded = load_dirs(&effects);
+        loaded.sort();
+        let mut expected = vec![root, docs];
+        expected.sort();
+        assert_eq!(loaded, expected, "{effects:?}");
+    }
+
+    #[test]
+    fn the_repository_metadata_reaches_nothing_in_the_tree() {
+        let mut state = populated();
+        let effects = on_fs_batch(&mut state, &[change(".git/HEAD", ChangeKind::Modify)], at());
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn a_removed_directory_gives_up_its_watch() {
+        let mut state = populated();
+        let root = state.tree.model.root_id();
+        let effects = on_fs_batch(&mut state, &[change("docs", ChangeKind::Remove)], at());
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WatchDirs { remove, .. } if remove == &vec![PathBuf::from("docs")]
+            )),
+            "the watch of a directory that is gone was kept: {effects:?}"
+        );
+        assert_eq!(load_dirs(&effects), vec![root]);
+    }
+
+    #[test]
+    fn a_rescan_reads_every_listing_in_hand_again() {
+        let mut state = populated();
+        let root = state.tree.model.root_id();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        state.preview.path = Some(PathBuf::from("README.md"));
+
+        let effects = on_rescan(&mut state);
+        assert_eq!(load_dirs(&effects), vec![root, docs]);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadPreview { .. })),
+            "a file may have changed while the events were lost"
+        );
+    }
+
+    #[test]
+    fn a_selection_whose_row_is_gone_lands_on_the_row_in_its_place() {
+        let mut state = populated();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        state.tree.select(docs);
+        state.tree.refresh();
+        assert_eq!(state.tree.selected_index(), Some(1));
+
+        // The listing comes back without `docs`: the row it held is gone.
+        let root = state.tree.model.root_id();
+        let generation = state.tree.load_gen[&root];
+        crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: root,
+                generation,
+                result: Ok(vec![
+                    entry("README.md", NodeKind::File),
+                    entry("src", NodeKind::Dir),
+                ]),
+            },
+        );
+        let selected = state.tree.selected.expect("a selection");
+        assert!(state.tree.model.contains(selected), "the selection is gone");
+        assert_eq!(
+            state
+                .tree
+                .model
+                .get(selected)
+                .map(|node| node.name.to_string_lossy().into_owned()),
+            Some("src".to_owned())
+        );
+        assert_eq!(state.tree.selected_index(), Some(1), "the same row");
+    }
 }

@@ -11,6 +11,7 @@ anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ignore = "0.4"
+notify = "8"
 ratatui = "0.30"
 similar = "3"
 slotmap = "1.1"
