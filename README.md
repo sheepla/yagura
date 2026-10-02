@@ -6,9 +6,9 @@ preview on the right, and puts the mode, the position in the tree and anything
 that needs saying on the status bar.
 
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
-M1 (the static file tree) and M2 (the preview content, with syntax
-highlighting). The git baseline and the diff, filesystem watching and the
-finders are not implemented yet.
+M1 (the static file tree), M2 (the preview content, with syntax highlighting)
+and M3 (the git baseline and the diff). Filesystem watching, the finders and
+the help overlay are not implemented yet.
 
 ## Status
 
@@ -17,7 +17,8 @@ finders are not implemented yet.
 | M0 | CLI, terminal lifecycle, Flux loop, theme, layout, store loop | done |
 | M1 | `core/fsmodel`, lazy tree, sorting, scrolling, icons, status bar, keymap | done |
 | M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting | done |
-| M2+ | baseline and diff, watching, finders, markdown, help, editor | not started |
+| M3 | git baseline, diff engine, InlineDiff / SideBySide, `M/A/D` in the tree, `+N -N ~N` counts, hunk keys | done |
+| M2+ | watching, finders, markdown, help, editor | not started |
 
 ## Build
 
@@ -39,7 +40,7 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|none] [--no-ignore] [--log LE
 | `[PATH]` | The directory to show. Defaults to the working directory. |
 | `--icons text` | ASCII icons: `d` for a directory, `f` for a file, `l` for a symlink. |
 | `--icons nerd` | Nerd Font glyphs. |
-| `--baseline auto\|none` | Which baseline to compare against. Validated for now; nothing is compared yet. |
+| `--baseline auto\|none` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and nothing outside of one. |
 | `--no-ignore` | Ignore `.gitignore`, the global excludes and the user ignores. |
 | `--log LEVEL` | Write a `tracing` log to a file. Also read from `YAGURA_LOG`. Nothing is logged without it. |
 
@@ -48,8 +49,9 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|none] [--no-ignore] [--log LE
 ## Keys
 
 Everywhere: `q` and `Ctrl+c` quit, `Tab` moves the focus, `Esc` steps back,
-`t` shows or hides the tree, `s` cycles the preview mode, `r` reads the shown
-file again.
+`t` shows or hides the tree, `s` cycles the preview mode, `B` switches the
+baseline (the snapshot side of it lands with M5), `r` reads the shown file
+again, `n` / `N` jump to the next or the previous hunk of the diff.
 
 In the tree:
 
@@ -113,6 +115,15 @@ apart without the program ever choosing a color itself. The syntax definitions
 load the first time something is highlighted rather than at startup, and the
 run stops at 10,000 lines or 150 ms, with `highlight truncated` in the header
 when it does.
+
+Inside a git repository the baseline is the `HEAD` commit. `git status` names
+the files that differ, `git cat-file` reads the versions to compare against,
+and each of them gets a status letter in the tree (`M`, `A`, `D`) and a count
+of changed lines on the right end of the row. A directory sums up the rows
+below it even before it has been opened. The preview shows the two versions
+side by side or interleaved, folded to a few lines around each hunk, and `n` /
+`N` jump from hunk to hunk. A file that is too large to count says `?` rather
+than a wrong number.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 
