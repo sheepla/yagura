@@ -24,6 +24,12 @@ const FINDER_LIST_DENOMINATOR: u16 = 5;
 /// How much of what is left of the status bar a finder overlay covers.
 const FINDER_WIDTH_PERCENT: u16 = 90;
 const FINDER_HEIGHT_PERCENT: u16 = 85;
+/// The same for the watch list, which has one column of rows to show.
+const WATCH_WIDTH_PERCENT: u16 = 86;
+const WATCH_HEIGHT_PERCENT: u16 = 85;
+/// And for the help overlay, which is a list of keys and their meanings.
+const HELP_WIDTH_PERCENT: u16 = 86;
+const HELP_HEIGHT_PERCENT: u16 = 88;
 
 /// The rectangles one frame is drawn into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,13 +138,7 @@ pub struct FinderAreas {
 /// The status bar is a row the overlay never covers: it says `FILES`, and it
 /// is where a message goes while the overlay is open.
 pub fn finder(area: Rect) -> FinderAreas {
-    let body = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(STATUS_BAR_HEIGHT),
-    );
-    let popup = centered(body, FINDER_WIDTH_PERCENT, FINDER_HEIGHT_PERCENT);
+    let popup = popup(area, FINDER_WIDTH_PERCENT, FINDER_HEIGHT_PERCENT);
     let inner = popup.inner(Margin::new(1, 1));
     if inner.width == 0 || inner.height == 0 {
         return FinderAreas {
@@ -179,6 +179,39 @@ pub fn finder(area: Rect) -> FinderAreas {
 /// Rows a finder list has for entries, which is what a page of it is.
 pub fn list_rows(area: Rect) -> u16 {
     finder(area).list.inner(Margin::new(1, 1)).height
+}
+
+/// The rectangle an overlay popup is drawn into: centered on what the status
+/// bar leaves above it, so that the mode of the moment stays readable while
+/// the overlay is up (§10).
+pub fn popup(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let body = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height.saturating_sub(STATUS_BAR_HEIGHT),
+    );
+    centered(body, percent_x, percent_y)
+}
+
+/// The rectangle the watch list overlay is drawn into (§9).
+pub fn watch(area: Rect) -> Rect {
+    popup(area, WATCH_WIDTH_PERCENT, WATCH_HEIGHT_PERCENT)
+}
+
+/// Rows the watch list shows at once, which is what a page of it is.
+pub fn watch_rows(area: Rect) -> u16 {
+    watch(area).inner(Margin::new(1, 1)).height
+}
+
+/// The rectangle the help overlay is drawn into (§5).
+pub fn help(area: Rect) -> Rect {
+    popup(area, HELP_WIDTH_PERCENT, HELP_HEIGHT_PERCENT)
+}
+
+/// Rows the help overlay shows at once.
+pub fn help_rows(area: Rect) -> u16 {
+    help(area).inner(Margin::new(1, 1)).height
 }
 
 /// A rectangle of a percentage of `area`, centered in it.

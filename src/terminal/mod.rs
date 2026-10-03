@@ -74,6 +74,22 @@ pub fn restore_stdout() {
     let _ = disable_raw_mode();
 }
 
+/// Hands the terminal over to a child process for as long as it runs (§8,
+/// design §14.2): raw mode comes off, the alternate screen goes away, and the
+/// cursor comes back so the child draws where the reader can see it.
+pub fn pause<W: Write>(writer: &mut W) -> io::Result<()> {
+    let _ = disable_raw_mode();
+    write_all(writer, RESTORE_SEQUENCE)
+}
+
+/// Takes the terminal back after the child has gone. The screen behind the
+/// sequence holds whatever the child left there, so the caller has to redraw
+/// the whole frame rather than only what changed.
+pub fn resume<W: Write>(writer: &mut W) -> io::Result<()> {
+    enable_raw_mode()?;
+    write_all(writer, INIT_SEQUENCE)
+}
+
 /// Installs a panic hook that restores the terminal before the default hook
 /// prints the panic message.
 pub fn install_panic_hook() {

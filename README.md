@@ -9,10 +9,10 @@ This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
 M1 (the static file tree), M2 (the preview content, with syntax highlighting),
 M3 (the git baseline and the diff), M4 (real-time updates: watching, batches,
 refreshed statistics, the head check, ages and the `F`/`c`/`o` keys), M5 (the
-snapshot baseline, for watching a directory that is not a repository) and M6
-(the file finder overlay, `Ctrl+P`), M7 (the grep finder, `Ctrl+G`).
-The help overlay, the editor launch and the markdown rendering are not
-implemented yet.
+snapshot baseline, for watching a directory that is not a repository), M6
+(the file finder overlay, `Ctrl+P`), M7 (the grep finder, `Ctrl+G`) and M8 (the
+watch log, `w`, the help overlay, `?`, and the editor launch, `e`). The markdown
+rendering is not implemented yet.
 
 ## Status
 
@@ -26,7 +26,8 @@ implemented yet.
 | M5 | snapshot baseline, startup scan with its budgets, `auto` fallback outside a repository, the `B` swap | done |
 | M6 | file finder overlay: query box, parallel walk, fuzzy match, preview beside the list, the jump into the tree | done |
 | M7 | grep finder overlay: `rg --json`, debounce and generations, hits as `path:line: text`, the lit line in the preview | done |
-| M8+ | watch overlay, help overlay, editor launch, markdown, edge cases and benchmarks | not started |
+| M8 | watch log overlay (`w`), help overlay (`?`), editor launch (`e`) | done |
+| M9 | edge cases, performance and benchmarks, README, CI, release | not started |
 
 ## Build
 
@@ -60,7 +61,8 @@ Everywhere: `q` and `Ctrl+c` quit, `Tab` moves the focus, `Esc` steps back,
 `t` shows or hides the tree, `s` cycles the preview mode, `B` switches the
 baseline between `HEAD` and the start of the session (inside a repository),
 `r` reads the shown file again, `n` / `N` jump to the next or the previous
-hunk of the diff.
+hunk of the diff, `w` opens the watch log, `?` the help overlay and `e` hands
+the file to an editor.
 
 In the tree:
 
@@ -89,7 +91,7 @@ In the preview:
 | `0` / `$` | The left / the right edge |
 
 The full table lives in `src/input/keymap.rs`, which is also what the help
-overlay will be built from.
+overlay is built from.
 
 In the finder overlay, opened with `Ctrl+p` (the file finder) or `Ctrl+g`
 (the grep finder; the two switch between each other):
@@ -108,6 +110,27 @@ Editing a query is the usual line editing: `←` / `→` or `Ctrl+b` / `Ctrl+f`,
 `Ctrl+h`, `Delete` / `Ctrl+d`, `Ctrl+w` by word, `Ctrl+u` to the head of the
 line and `Ctrl+k` to the end. A pasted passage arrives as a single line, capped
 at 1024 characters.
+
+The watch log, opened with `w` and closed with the same key or `Esc`, lists what
+has changed under the root since the program started, even while the log is
+closed:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | The row below / above |
+| `g` / `G` | The first / the last row |
+| `Enter` | Take the row: the tree walks to it, whether the file is still there or not |
+| `w` / `Esc` | Close the log |
+
+The help overlay, opened with `?` and closed the same way, is the keymap table
+itself: `j` / `k` move a row, `f` / `b` a page, `g` / `G` the ends.
+
+`e` opens the file the cursor is on in the tree, or the one the preview is
+showing when the focus is there, in `$VISUAL`, then `$EDITOR`, then `vi`, with
+the line the preview is showing where the editor can be told one (`+N file` for
+vi, nano and emacs, `file:N` for helix, nothing for an editor that is not in
+the table). The terminal is handed over for as long as the editor runs and
+taken back afterwards.
 
 ## How it is put together
 
@@ -183,6 +206,18 @@ A thousand hits stop the run. `Enter` on a hit does what it does for a path,
 and lights the line it landed on in the preview, centred in the pane. If `rg`
 is not installed the overlay says so and will not open again until the program
 is restarted.
+
+The watch log keeps the last ten thousand changes under the root, whether or
+not the overlay is up: a change of the same kind to the same path within a
+second is one row with a count rather than ten of them. The log follows the
+newest row until the reader moves up; from then on it counts what arrived while
+the reader was elsewhere until `G` takes it back to the end.
+
+`e` gives the terminal back to an editor. The input pump stops reading, the
+alternate screen and raw mode go away, and the child runs while the store keeps
+taking in what the filesystem is doing, without drawing a frame. The screen is
+drawn again from scratch once the editor is gone, and the keys it was given are
+not answered a second time.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 

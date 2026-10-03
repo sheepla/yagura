@@ -1,8 +1,8 @@
 //! Key to command resolution.
 //!
 //! The keymap is data, not code: state logic never sees a key code, so a
-//! rebinding is a change to one table and the help overlay can be generated
-//! from the very same table later on.
+//! rebinding is a change to one table, and the help overlay is generated
+//! from the very same table.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -39,6 +39,8 @@ const BOTH: &[Context] = &[Context::Tree, Context::Preview];
 const TREE: &[Context] = &[Context::Tree];
 const PREVIEW: &[Context] = &[Context::Preview];
 const FINDER: &[Context] = &[Context::Finder];
+const WATCH: &[Context] = &[Context::Watch];
+const HELP: &[Context] = &[Context::Help];
 
 macro_rules! binding {
     ($contexts:ident, $code:expr, $mods:expr, $command:ident) => {
@@ -66,6 +68,10 @@ pub const BINDINGS: &[Binding] = &[
     binding!(BOTH, KeyCode::Char('c'), NONE, ToggleChangedOnly),
     binding!(BOTH, KeyCode::Char('o'), NONE, CycleSort),
     binding!(BOTH, KeyCode::Char('r'), NONE, Reload),
+    // The other overlays and the editor (§5).
+    binding!(BOTH, KeyCode::Char('w'), NONE, OpenWatch),
+    binding!(BOTH, KeyCode::Char('?'), NONE, OpenHelp),
+    binding!(BOTH, KeyCode::Char('e'), NONE, OpenEditor),
     // Hunk navigation: only a diff has hunks, so the reducer ignores these
     // outside the diff modes.
     binding!(BOTH, KeyCode::Char('n'), NONE, NextHunk),
@@ -137,6 +143,28 @@ pub const BINDINGS: &[Binding] = &[
     binding!(FINDER, KeyCode::Enter, NONE, FinderAccept),
     binding!(FINDER, KeyCode::Esc, NONE, Back),
     binding!(FINDER, KeyCode::Char('c'), CONTROL, Back),
+    // The watch list (§9). `w` is also the way out, so the overlay opens and
+    // closes with one key the way the tree does with `t`.
+    binding!(WATCH, KeyCode::Char('j'), NONE, WatchDown),
+    binding!(WATCH, KeyCode::Char('k'), NONE, WatchUp),
+    binding!(WATCH, KeyCode::Char('g'), NONE, WatchTop),
+    binding!(WATCH, KeyCode::Char('G'), NONE, WatchBottom),
+    binding!(WATCH, KeyCode::Enter, NONE, WatchAccept),
+    binding!(WATCH, KeyCode::Char('w'), NONE, Back),
+    binding!(WATCH, KeyCode::Esc, NONE, Back),
+    binding!(WATCH, KeyCode::Char('q'), NONE, Quit),
+    binding!(WATCH, KeyCode::Char('c'), CONTROL, Quit),
+    // The help overlay (§5).
+    binding!(HELP, KeyCode::Char('j'), NONE, HelpDown),
+    binding!(HELP, KeyCode::Char('k'), NONE, HelpUp),
+    binding!(HELP, KeyCode::Char('f'), NONE, HelpPageDown),
+    binding!(HELP, KeyCode::Char('b'), NONE, HelpPageUp),
+    binding!(HELP, KeyCode::Char('g'), NONE, HelpTop),
+    binding!(HELP, KeyCode::Char('G'), NONE, HelpBottom),
+    binding!(HELP, KeyCode::Char('?'), NONE, Back),
+    binding!(HELP, KeyCode::Esc, NONE, Back),
+    binding!(HELP, KeyCode::Char('q'), NONE, Quit),
+    binding!(HELP, KeyCode::Char('c'), CONTROL, Quit),
 ];
 
 /// Resolves a key press in a context.
@@ -173,6 +201,65 @@ pub fn describe(binding: &Binding) -> String {
     };
     key.push_str(&name);
     key
+}
+
+/// One line of the help overlay: the key, and what it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpRow {
+    pub key: String,
+    pub does: &'static str,
+}
+
+/// A heading of the help overlay with the rows under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: &'static str,
+    pub rows: Vec<HelpRow>,
+}
+
+/// The whole help overlay, built from [`BINDINGS`] (§5).
+///
+/// A binding of both panes is shown once under `Everywhere` and the rest
+/// under the context they belong to, so a key added to the table is a row
+/// here without anything else being done.
+pub fn help_sections() -> Vec<HelpSection> {
+    let mut sections = vec![HelpSection {
+        title: "Everywhere",
+        rows: rows_in(BOTH),
+    }];
+    for (title, context) in [
+        ("Tree", Context::Tree),
+        ("Preview", Context::Preview),
+        ("Finder", Context::Finder),
+        ("Watch", Context::Watch),
+        ("Help", Context::Help),
+    ] {
+        let rows: Vec<HelpRow> = BINDINGS
+            .iter()
+            .filter(|binding| binding.contexts != BOTH && binding.contexts.contains(&context))
+            .map(row)
+            .collect();
+        if !rows.is_empty() {
+            sections.push(HelpSection { title, rows });
+        }
+    }
+    sections
+}
+
+/// The rows of the bindings that belong to exactly these contexts.
+fn rows_in(contexts: &'static [Context]) -> Vec<HelpRow> {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.contexts == contexts)
+        .map(row)
+        .collect()
+}
+
+fn row(binding: &Binding) -> HelpRow {
+    HelpRow {
+        key: describe(binding),
+        does: binding.command.description(),
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +641,22 @@ mod tests {
         // none of them at all.
         for code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('h')] {
             assert_eq!(command_for(Context::Finder, press(code)), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_added_to_the_table_is_a_row_of_the_help_overlay() {
+        let listed: Vec<(String, &'static str)> = help_sections()
+            .iter()
+            .flat_map(|section| section.rows.iter().map(|row| (row.key.clone(), row.does)))
+            .collect();
+        for binding in BINDINGS {
+            let wanted = row(binding);
+            assert!(
+                listed.contains(&(wanted.key, wanted.does)),
+                "the help overlay has no row for {:?}",
+                describe(binding)
+            );
         }
     }
 

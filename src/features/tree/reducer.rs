@@ -118,6 +118,23 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         | Command::FinderDeleteWord
         | Command::FinderDeleteToStart
         | Command::FinderDeleteToEnd => {}
+        // The watch list, the help list and the editor have reducers of their
+        // own, and the root reducer routes them there before they can reach
+        // this match (§5, §8, §9).
+        Command::OpenWatch
+        | Command::WatchDown
+        | Command::WatchUp
+        | Command::WatchTop
+        | Command::WatchBottom
+        | Command::WatchAccept
+        | Command::OpenHelp
+        | Command::HelpDown
+        | Command::HelpUp
+        | Command::HelpPageDown
+        | Command::HelpPageUp
+        | Command::HelpTop
+        | Command::HelpBottom
+        | Command::OpenEditor => {}
     }
     state.tree.refresh();
     effects

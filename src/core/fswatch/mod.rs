@@ -20,6 +20,17 @@ pub enum ChangeKind {
     Remove,
 }
 
+impl ChangeKind {
+    /// What the watch list calls it (§9).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Modify => "modify",
+            Self::Remove => "remove",
+        }
+    }
+}
+
 /// One path that changed inside one batch.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FsChange {

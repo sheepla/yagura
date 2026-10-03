@@ -1,6 +1,7 @@
 //! The store loop: actions in, state changed, frame out.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -12,6 +13,7 @@ use super::effect::Effect;
 use super::reduce::reduce;
 use super::runner::EffectRunner;
 use super::state::AppState;
+use crate::core::text;
 use crate::ui::FrameSync;
 
 /// Shortest time between two frames. Ratatui only writes the cells that
@@ -107,9 +109,28 @@ impl<B: Backend> Store<B> {
         self.terminal.backend()
     }
 
+    /// Forgets the screen it has drawn.
+    ///
+    /// An editor has the terminal for a while and gives it back with whatever
+    /// it left on it, so no cell the store remembers can be assumed to still
+    /// be there (§8): the next frame is drawn over the whole screen.
+    pub fn invalidate(&mut self) {
+        let _ = self.terminal.clear();
+        self.dirty = true;
+        self.last_draw = None;
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+}
+
+/// Why the loop woke up, held in one value so that the channels can be
+/// borrowed again as soon as an action is in hand.
+enum Wake {
+    Input(Option<Action>),
+    Action(Option<Action>),
+    Frame,
 }
 
 /// Runs the loop until a quit action arrives.
@@ -126,17 +147,18 @@ pub async fn run<B: Backend>(
     frame_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires immediately, which draws the first frame.
     loop {
-        tokio::select! {
+        let wake = tokio::select! {
             biased;
-            action = input_rx.recv() => {
-                let Some(action) = action else { break };
-                dispatch(store, action, runner);
+            action = input_rx.recv() => Wake::Input(action),
+            action = action_rx.recv() => Wake::Action(action),
+            _ = frame_timer.tick() => Wake::Frame,
+        };
+        match wake {
+            Wake::Frame => {}
+            Wake::Input(None) | Wake::Action(None) => break,
+            Wake::Input(Some(action)) | Wake::Action(Some(action)) => {
+                apply(store, action, runner, &mut input_rx, &mut action_rx).await?;
             }
-            action = action_rx.recv() => {
-                let Some(action) = action else { break };
-                dispatch(store, action, runner);
-            }
-            _ = frame_timer.tick() => {}
         }
         store.draw_if_due()?;
         if store.state.quitting {
@@ -147,9 +169,118 @@ pub async fn run<B: Backend>(
     Ok(())
 }
 
-fn dispatch<B: Backend>(store: &mut Store<B>, action: Action, runner: &EffectRunner) {
+/// Applies one action and runs what it asks for.
+///
+/// An editor is the one effect the runner cannot take: the terminal has to be
+/// given back for the child and taken back after it, and that happens here,
+/// where both channels are within reach (design §14.2).
+async fn apply<B: Backend>(
+    store: &mut Store<B>,
+    action: Action,
+    runner: &EffectRunner,
+    input_rx: &mut Receiver<Action>,
+    action_rx: &mut Receiver<Action>,
+) -> Result<(), StoreError> {
     for effect in store.handle(action) {
-        runner.run(effect);
+        match effect {
+            Effect::RunEditor { path, line } => {
+                edit(store, path, line, input_rx, action_rx, runner).await?;
+            }
+            effect => runner.run(effect),
+        }
+    }
+    Ok(())
+}
+
+/// Opens an editor with the terminal given back to it first (§8, design
+/// §14.2):
+///
+/// 1. the input pump stops reading, so the child has the keys to itself;
+/// 2. the alternate screen and raw mode go away, the child runs, and the
+///    filesystem work carries on while no frame is drawn;
+/// 3. the terminal comes back and the screen is redrawn from scratch;
+/// 4. the pump reads again.
+async fn edit<B: Backend>(
+    store: &mut Store<B>,
+    path: PathBuf,
+    line: Option<usize>,
+    input_rx: &mut Receiver<Action>,
+    action_rx: &mut Receiver<Action>,
+    runner: &EffectRunner,
+) -> Result<(), StoreError> {
+    let invocation = crate::core::editor::resolve(&path, line);
+    crate::input::task::suspend();
+    if let Err(err) = crate::terminal::pause(&mut io::stdout()) {
+        crate::input::task::resume();
+        return Err(err.into());
+    }
+    let outcome = match tokio::process::Command::new(invocation.program())
+        .args(invocation.args())
+        .spawn()
+    {
+        Ok(mut child) => wait_while_working(&mut child, store, runner, action_rx).await,
+        Err(err) => Err(err),
+    };
+    let terminal_back = crate::terminal::resume(&mut io::stdout());
+    store.invalidate();
+    drain_keys(store, runner, input_rx);
+    crate::input::task::resume();
+    terminal_back?;
+    if let Err(err) = outcome {
+        store.state.set_error(format!(
+            "cannot open {}: {}",
+            text::sanitize_os(path.as_os_str()),
+            text::os_error(&err)
+        ));
+    }
+    Ok(())
+}
+
+/// Waits for the child while the state keeps up with the filesystem; no frame
+/// is drawn until the editor is gone (design §14.2).
+async fn wait_while_working<B: Backend>(
+    child: &mut tokio::process::Child,
+    store: &mut Store<B>,
+    runner: &EffectRunner,
+    action_rx: &mut Receiver<Action>,
+) -> io::Result<()> {
+    loop {
+        tokio::select! {
+            status = child.wait() => return status.map(|_| ()),
+            action = action_rx.recv() => match action {
+                Some(action) => {
+                    for effect in store.handle(action) {
+                        // An editor cannot be opened while another one has
+                        // the terminal, and nothing else asks for one; the
+                        // runner leaves the effect alone (design §14.2).
+                        runner.run(effect);
+                    }
+                }
+                // Nothing will be sent again, so only the child can end the
+                // wait now.
+                None => return child.wait().await.map(|_| ()),
+            }
+        }
+    }
+}
+
+/// Drops the keys that were already on their way to the panes when the editor
+/// took the terminal: they were meant for it, and answering them here would
+/// make one press mean two things (§8).
+fn drain_keys<B: Backend>(
+    store: &mut Store<B>,
+    runner: &EffectRunner,
+    input_rx: &mut Receiver<Action>,
+) {
+    while let Ok(action) = input_rx.try_recv() {
+        match action {
+            Action::Key(_) | Action::Paste(_) => {}
+            action => {
+                for effect in store.handle(action) {
+                    runner.run(effect);
+                }
+            }
+        }
     }
 }
 

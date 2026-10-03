@@ -4,8 +4,14 @@
 //! are read with the blocking API on a dedicated OS thread instead. That keeps
 //! the dependency set as small as the design asks for and keeps the UI task free
 //! of any read: the thread only owns stdin.
+//!
+//! The pump polls rather than blocks outright, because an editor started on
+//! the same terminal has to have the events to itself for as long as it runs
+//! (§8, design §14.2).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::Sender;
@@ -16,6 +22,31 @@ use crate::app::Action;
 /// with back pressure is enough and keeps the channel bounded (invariant I6).
 pub const INPUT_CHANNEL_CAPACITY: usize = 64;
 
+/// How long the pump waits for an event before looking at the flag again.
+const EVENT_POLL: Duration = Duration::from_millis(100);
+
+/// How often the pump looks at the flag while an editor has the terminal.
+const SUSPENDED_POLL: Duration = Duration::from_millis(20);
+
+/// Whether an editor owns the terminal input right now.
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// Stops reading terminal events for the UI, so that an editor started on the
+/// same terminal has them to itself (§8).
+pub fn suspend() {
+    SUSPENDED.store(true, Ordering::Release);
+}
+
+/// Reads terminal events for the UI again.
+pub fn resume() {
+    SUSPENDED.store(false, Ordering::Release);
+}
+
+/// Whether [`suspend`] is in effect.
+pub fn suspended() -> bool {
+    SUSPENDED.load(Ordering::Acquire)
+}
+
 /// Reads terminal events until reading fails.
 ///
 /// The thread is detached on purpose: it blocks on stdin and cannot be asked to
@@ -23,20 +54,41 @@ pub const INPUT_CHANNEL_CAPACITY: usize = 64;
 pub fn spawn(tx: Sender<Action>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
-            let event = match event::read() {
-                Ok(event) => event,
+            if suspended() {
+                // Nothing is read while the editor is up, so a key it is
+                // about to read cannot be taken by mistake.
+                thread::sleep(SUSPENDED_POLL);
+                continue;
+            }
+            match event::poll(EVENT_POLL) {
+                Ok(false) => {}
+                Ok(true) => {
+                    if suspended() {
+                        // The flag went up while waiting for this event: it
+                        // belongs to the editor that has just taken over, so
+                        // it is left where it is rather than read.
+                        continue;
+                    }
+                    let event = match event::read() {
+                        Ok(event) => event,
+                        Err(err) => {
+                            tracing::warn!(%err, "terminal event read failed");
+                            break;
+                        }
+                    };
+                    let Some(action) = translate(event) else {
+                        continue;
+                    };
+                    // Waiting for room instead of dropping is deliberate: a lost key is
+                    // a lost command, and the store drains this channel first.
+                    if tx.blocking_send(action).is_err() {
+                        break;
+                    }
+                }
                 Err(err) => {
-                    tracing::warn!(%err, "terminal event read failed");
+                    tracing::warn!(%err, "terminal event poll failed");
                     break;
                 }
-            };
-            let Some(action) = translate(event) else {
-                continue;
-            };
-            // Waiting for room instead of dropping is deliberate: a lost key is
-            // a lost command, and the store drains this channel first.
-            if tx.blocking_send(action).is_err() {
-                break;
             }
         }
         tracing::debug!("terminal event pump ended");
@@ -107,6 +159,15 @@ mod tests {
         });
         assert!(translate(mouse).is_none());
         assert!(translate(Event::FocusGained).is_none());
+    }
+
+    #[test]
+    fn the_pump_reads_again_only_once_the_editor_has_gone() {
+        assert!(!suspended(), "the pump starts out reading");
+        suspend();
+        assert!(suspended());
+        resume();
+        assert!(!suspended());
     }
 
     #[tokio::test]

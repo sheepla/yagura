@@ -77,4 +77,16 @@ pub enum Effect {
         /// What to search for, at least two characters (§7).
         pattern: String,
     },
+    /// Hand a file to an editor outside the terminal (§8). The store runs
+    /// this one itself: the terminal has to be given back for as long as the
+    /// child lives (design §14.2).
+    RunEditor {
+        /// File to open, absolute so that the child does not depend on where
+        /// yagura was started from.
+        path: PathBuf,
+        /// Line to take the cursor to, one based, when the reader is looking
+        /// at one. Whether it is passed on at all is the editor's business
+        /// (§8).
+        line: Option<usize>,
+    },
 }

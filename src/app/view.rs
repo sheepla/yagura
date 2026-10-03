@@ -3,7 +3,7 @@
 use ratatui::Frame;
 
 use crate::app::state::{AppState, Overlay};
-use crate::features::{finder, preview, statusbar, tree};
+use crate::features::{finder, help, preview, statusbar, tree, watch};
 use crate::ui::layout;
 
 /// Draws one frame. Reads the state only, never writes it (invariant I7).
@@ -20,8 +20,13 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     preview::view::render_header(frame, areas.header, state);
     preview::view::render_body(frame, areas.preview, state);
     statusbar::view::render(frame, areas.status, state);
-    if matches!(state.overlay, Overlay::Files | Overlay::Grep) {
-        finder::view::render(frame, area, state);
+    // Every overlay draws over the panes, which stay readable around the
+    // status bar (§10).
+    match state.overlay {
+        Overlay::None => {}
+        Overlay::Files | Overlay::Grep => finder::view::render(frame, area, state),
+        Overlay::Help => help::view::render(frame, area, state),
+        Overlay::Watch => watch::view::render(frame, area, state),
     }
 }
 
@@ -88,5 +93,50 @@ mod tests {
         let without_tree = text(&state);
         assert!(with_tree.contains("│"), "{with_tree}");
         assert!(!without_tree.contains('│'), "{without_tree}");
+    }
+
+    #[test]
+    fn the_help_overlay_draws_over_the_panes_and_keeps_the_status_bar() {
+        let mut state = state(80, 24, false);
+        crate::app::reduce::reduce(
+            &mut state,
+            crate::app::Action::Command(crate::app::command::Command::OpenHelp),
+        );
+        let text = text(&state);
+        assert!(text.contains("HELP"), "{text}");
+        assert!(text.contains("Everywhere"), "{text}");
+        assert!(text.contains("Quit"), "{text}");
+        let status = text.lines().last().unwrap_or_default();
+        assert!(
+            status.contains("HELP"),
+            "the status bar is still there: {status}"
+        );
+    }
+
+    #[test]
+    fn the_watch_overlay_draws_the_log_it_has_kept() {
+        let mut state = state(80, 24, false);
+        crate::app::reduce::reduce(
+            &mut state,
+            crate::app::Action::FsBatch {
+                changes: vec![crate::core::fswatch::FsChange {
+                    rel: PathBuf::from("a.txt"),
+                    kind: crate::core::fswatch::ChangeKind::Modify,
+                }],
+                at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        );
+        crate::app::reduce::reduce(
+            &mut state,
+            crate::app::Action::Command(crate::app::command::Command::OpenWatch),
+        );
+        let text = text(&state);
+        assert!(text.contains("WATCH"), "{text}");
+        assert!(text.contains("a.txt"), "{text}");
+        let status = text.lines().last().unwrap_or_default();
+        assert!(
+            status.contains("WATCH"),
+            "the status bar is still there: {status}"
+        );
     }
 }

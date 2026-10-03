@@ -479,6 +479,11 @@ impl EffectRunner {
                 generation,
                 pattern,
             } => self.start_grep(generation, pattern),
+            Effect::RunEditor { .. } => {
+                // Only the store loop can run one: the terminal has to be
+                // given back for the child and taken back after it, which
+                // happens there rather than on a worker (design §14.2).
+            }
         }
     }
 

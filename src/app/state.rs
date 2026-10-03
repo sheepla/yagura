@@ -8,9 +8,11 @@ pub use crate::cli::Config;
 use crate::core::baseline::{ChangedEntry, Kind, Phase};
 use crate::core::fsmodel::NodeId;
 use crate::features::finder::FinderState;
+use crate::features::help::HelpState;
 use crate::features::preview::PreviewState;
 use crate::features::tree::TreeState;
 use crate::features::tree::icons::Icons;
+use crate::features::watch::WatchState;
 use crate::ui::theme::Theme;
 
 use super::effect::Effect;
@@ -177,6 +179,11 @@ pub struct AppState {
     pub preview: PreviewState,
     /// The query box, list and matcher of the finder overlays (§13).
     pub finder: FinderState,
+    /// Where the reader has scrolled to in the help list (§5).
+    pub help: HelpState,
+    /// The log of changes under the root, kept whether or not it is shown
+    /// (§9, §12).
+    pub watch: WatchState,
     pub baseline: BaselineState,
     /// Generation of the newest stats request per path; an answer carrying
     /// another one belongs to a request that has been superseded (I3).
@@ -203,6 +210,8 @@ impl AppState {
             tree: TreeState::new(model),
             preview: PreviewState::default(),
             finder: FinderState::default(),
+            help: HelpState::default(),
+            watch: WatchState::default(),
             baseline: BaselineState::new(kind),
             stats_gen: BTreeMap::new(),
             theme,

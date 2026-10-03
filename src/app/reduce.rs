@@ -12,9 +12,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::action::{Action, StatAnswer};
 use crate::app::command::Command;
 use crate::app::effect::Effect;
-use crate::app::state::AppState;
+use crate::app::state::{AppState, Focus};
 use crate::core::baseline::{Built, ChangedEntry, Kind, Phase};
-use crate::features::{finder, preview, tree};
+use crate::features::{finder, help, preview, tree, watch};
 use crate::input::keymap;
 
 /// Applies one action and reports the effects it caused.
@@ -48,6 +48,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if let Action::Command(Command::CyclePreviewMode) = action {
         return cycle_preview_mode(state);
     }
+    if let Action::Command(Command::OpenEditor) = action {
+        return open_editor(state);
+    }
     match &action {
         Action::Resize { width, height } => {
             state.size = (*width, *height);
@@ -73,6 +76,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             Vec::new()
         }
+        // The two lists drawn over the panes take their own commands, and the
+        // watch log needs to know where the reader has left the selection.
+        Action::Command(command) if help::reducer::owns(*command) => {
+            help::reducer::reduce(state, &action)
+        }
+        Action::Command(command) if watch::reducer::owns(*command) => watch_effects(state, &action),
         // The finder overlays take the keys that are theirs and every paste
         // aimed at their query box; the panes behind them keep the scrolling
         // and `Esc`, because one key means one thing (§4).
@@ -107,10 +116,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             effects.extend(preview::reducer::sync_target(state));
             effects
         }
-        // Changes on disk belong to the tree alone. The preview is reloaded
-        // only for a path it is showing: what happens elsewhere in the tree
-        // must not move the view (§7.3).
-        Action::FsBatch { changes, at } => tree::reducer::on_fs_batch(state, changes, *at),
+        // Changes on disk belong to the tree, and the watch log keeps them as
+        // well: it records whether or not its overlay is up (§12). The preview
+        // is reloaded only for a path it is showing: what happens elsewhere in
+        // the tree must not move the view (§7.3).
+        Action::FsBatch { changes, at } => {
+            watch::reducer::record(state, changes, *at);
+            tree::reducer::on_fs_batch(state, changes, *at)
+        }
         Action::FsRescanNeeded => tree::reducer::on_rescan(state),
         // A `HEAD` that moved is a new baseline to diff against, and only a
         // rebuild can say what differs below it (§8.2). Before the first
@@ -141,6 +154,53 @@ fn finder_effects(state: &mut AppState, action: &Action) -> Vec<Effect> {
     let mut effects = finder::reducer::reduce(state, action);
     effects.extend(preview::reducer::sync_target(state));
     effects
+}
+
+/// An action for the watch list: leaving it means the panes show again, so
+/// the preview is asked what it should be showing now (§9).
+fn watch_effects(state: &mut AppState, action: &Action) -> Vec<Effect> {
+    let mut effects = watch::reducer::reduce(state, action);
+    effects.extend(preview::reducer::sync_target(state));
+    effects
+}
+
+/// `e`: the file the reader is looking at, handed over to an editor outside
+/// the terminal (§8).
+///
+/// The line the pane has scrolled to goes with it, and only from the pane:
+/// the tree points at a row, not at a line inside one.
+fn open_editor(state: &mut AppState) -> Vec<Effect> {
+    let (rel, line) = match state.focus {
+        Focus::Preview => match state.preview.path.clone() {
+            Some(rel) => (rel, Some(state.preview.scroll_line + 1)),
+            None => {
+                state.set_info("there is no file to open");
+                return Vec::new();
+            }
+        },
+        Focus::Tree => {
+            let Some(rel) = selected_file(state) else {
+                state.set_info("there is no file to open");
+                return Vec::new();
+            };
+            (rel, None)
+        }
+    };
+    vec![Effect::RunEditor {
+        path: state.root().join(rel),
+        line,
+    }]
+}
+
+/// The file under the cursor in the tree, and nothing when the cursor sits
+/// on a directory.
+fn selected_file(state: &AppState) -> Option<PathBuf> {
+    let node = state.tree.selected?;
+    let entry = state.tree.model.get(node)?;
+    if entry.is_expandable() {
+        return None;
+    }
+    Some(PathBuf::from(state.tree.model.rel_of(node)?))
 }
 
 /// Commands the preview pane handles itself.
@@ -417,6 +477,56 @@ mod tests {
         let before = fingerprint(&state);
         reduce(&mut state, key(KeyCode::F(12)));
         assert_eq!(fingerprint(&state), before);
+    }
+
+    #[test]
+    fn the_editor_is_asked_for_the_file_the_tree_has_selected() {
+        use std::ffi::OsStr;
+
+        use crate::core::fsmodel::NodeKind;
+
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let file = state
+            .tree
+            .model
+            .insert_child(root, OsStr::new("a.txt"), NodeKind::File);
+        state.tree.selected = Some(file);
+
+        let effects = reduce(&mut state, Action::Command(Command::OpenEditor));
+        let [Effect::RunEditor { path, line }] = effects.as_slice() else {
+            panic!("the editor was not asked for: {effects:?}");
+        };
+        assert_eq!(path, &PathBuf::from("/root").join("a.txt"));
+        assert_eq!(*line, None, "the tree points at a row, not at a line");
+    }
+
+    #[test]
+    fn the_editor_is_told_the_line_the_pane_is_showing() {
+        let mut state = state();
+        state.focus = Focus::Preview;
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        state.preview.scroll_line = 41;
+
+        let effects = reduce(&mut state, Action::Command(Command::OpenEditor));
+        let [Effect::RunEditor { path, line }] = effects.as_slice() else {
+            panic!("the editor was not asked for: {effects:?}");
+        };
+        assert_eq!(path, &PathBuf::from("/root").join("a.rs"));
+        assert_eq!(*line, Some(42), "the first line on screen is one based");
+    }
+
+    #[test]
+    fn a_directory_under_the_cursor_is_nothing_to_open() {
+        let mut state = state();
+        state.focus = Focus::Tree;
+
+        let effects = reduce(&mut state, Action::Command(Command::OpenEditor));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(
+            state.visible_message().is_some(),
+            "the status bar says why nothing happened"
+        );
     }
 
     /// A key press carrying modifiers, which the plain `key` helper never does.
