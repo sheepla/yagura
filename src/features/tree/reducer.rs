@@ -32,10 +32,14 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
     match command {
         Command::Quit => state.quitting = true,
         Command::ToggleFocus => {
-            state.focus = match state.focus {
-                Focus::Tree => Focus::Preview,
-                Focus::Preview => Focus::Tree,
-            };
+            // A hidden tree is not a pane on the screen, so while it is
+            // hidden there is nothing for the focus to move between (§4).
+            if state.tree_visible {
+                state.focus = match state.focus {
+                    Focus::Tree => Focus::Preview,
+                    Focus::Preview => Focus::Tree,
+                };
+            }
         }
         Command::Back => {
             // One step back: close an overlay, otherwise move the focus from
@@ -48,12 +52,21 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
                 if was_finder {
                     crate::app::reduce::sync_preview_viewport(state);
                 }
-            } else if state.focus == Focus::Preview {
+            } else if state.focus == Focus::Preview && state.tree_visible {
                 state.focus = Focus::Tree;
             }
         }
         Command::ToggleTree => {
             state.tree_visible = !state.tree_visible;
+            // The keys belong to the panes that are drawn: a hidden tree
+            // cannot hold the focus, so the reader lands on the preview and
+            // comes back to the same pane when the tree returns (§4).
+            if state.tree_visible {
+                state.focus = state.focus_before_hide.take().unwrap_or(state.focus);
+            } else {
+                state.focus_before_hide = Some(state.focus);
+                state.focus = Focus::Preview;
+            }
             sync_viewport(state);
             crate::app::reduce::sync_preview_viewport(state);
         }

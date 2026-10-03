@@ -519,8 +519,9 @@ mod tests {
     /// reducing the same actions twice produces the same state.
     fn fingerprint(state: &AppState) -> String {
         format!(
-            "focus={:?} mode={:?} overlay={:?} tree_visible={} follow={} quit={} sel={:?} scroll={} rows={:?} msg={:?}",
+            "focus={:?} parked={:?} mode={:?} overlay={:?} tree_visible={} follow={} quit={} sel={:?} scroll={} rows={:?} msg={:?}",
             state.focus,
+            state.focus_before_hide,
             state.preview_mode,
             state.overlay,
             state.tree_visible,
@@ -540,6 +541,8 @@ mod tests {
         assert!(!state.tree_visible, "`t` did not hide the tree");
         reduce(&mut state, key(KeyCode::Char('s')));
         assert_eq!(state.preview_mode, PreviewMode::InlineDiff);
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert!(state.tree_visible, "`t` did not show the tree again");
         reduce(&mut state, key(KeyCode::Tab));
         assert_eq!(state.focus, Focus::Preview);
     }
@@ -885,6 +888,77 @@ mod tests {
             state.focus,
             Focus::Tree,
             "the overlay keeps the screen to itself"
+        );
+    }
+
+    #[test]
+    fn with_the_tree_hidden_the_keys_scroll_the_reader() {
+        let mut state = tree_with_rows();
+        // The pane is showing the file the tree has selected, so hiding the
+        // tree does not ask for another one.
+        state.preview.path = Some(PathBuf::from("f0.txt"));
+        state.preview.set_doc(scrollable());
+
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert!(!state.tree_visible);
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "a pane nobody can see cannot hold the keys"
+        );
+
+        reduce(&mut state, key(KeyCode::Char('j')));
+        assert_eq!(state.preview.scroll_line, 1, "`j` scrolled the reader");
+        reduce(&mut state, key(KeyCode::Char('k')));
+        assert_eq!(state.preview.scroll_line, 0, "`k` scrolled it back");
+        let selected = state
+            .tree
+            .selected
+            .and_then(|node| state.tree.model.get(node));
+        assert_eq!(
+            selected.map(|entry| entry.name.to_string_lossy().into_owned()),
+            Some("f0.txt".to_owned()),
+            "the keys left the tree alone"
+        );
+    }
+
+    #[test]
+    fn showing_the_tree_takes_the_focus_back_where_it_was() {
+        let mut state = tree_with_rows();
+
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert_eq!(state.focus, Focus::Preview, "the reader got the keys");
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert!(state.tree_visible);
+        assert_eq!(state.focus, Focus::Tree, "the tree got its keys back");
+
+        state.focus = Focus::Preview;
+        reduce(&mut state, key(KeyCode::Char('t')));
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "showing the tree does not steal the keys"
+        );
+    }
+
+    #[test]
+    fn the_keys_do_not_focus_a_hidden_tree() {
+        let mut state = tree_with_rows();
+        reduce(&mut state, key(KeyCode::Char('t')));
+        assert_eq!(state.focus, Focus::Preview);
+
+        reduce(&mut state, key(KeyCode::Tab));
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "there is one pane on the screen to focus"
+        );
+        reduce(&mut state, key(KeyCode::Esc));
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "`Esc` does not step into a hidden tree"
         );
     }
 

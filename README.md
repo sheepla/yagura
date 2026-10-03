@@ -59,11 +59,14 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|head|snapshot] [--no-ignore] 
 ## Keys
 
 Everywhere: `q` and `Ctrl+c` quit, `Tab` moves the focus, `Esc` steps back,
-`t` shows or hides the tree, `s` cycles the preview mode, `B` switches the
-baseline between `HEAD` and the start of the session (inside a repository),
-`r` reads the shown file again, `n` / `N` jump to the next or the previous
-hunk of the diff, `w` opens the watch log, `?` the help overlay and `e` hands
-the file to an editor.
+`t` shows or hides the tree (while it is hidden the keys scroll the preview),
+`s` cycles the preview mode, `B` switches the baseline between `HEAD` and the
+start of the session (inside a repository), `r` reads the shown file again,
+`n` / `N` jump to the next or the previous hunk of the diff, `w` opens the
+watch log, `?` the help overlay and `e` hands the file to an editor.
+
+The mouse wheel scrolls the pane that has the focus, five lines a notch, and
+a left click picks the pane it lands on.
 
 In the tree:
 

@@ -172,6 +172,9 @@ pub struct AppState {
     pub preview_mode: PreviewMode,
     pub overlay: Overlay,
     pub tree_visible: bool,
+    /// The pane the focus was on when the tree was hidden, so that showing
+    /// the tree again takes the focus back to where the reader left it (§4).
+    pub focus_before_hide: Option<Focus>,
     pub follow: bool,
     /// Time of the most recent tick, so that views never read the clock.
     pub now: SystemTime,
@@ -223,6 +226,7 @@ impl AppState {
             preview_mode: PreviewMode::Content,
             overlay: Overlay::None,
             tree_visible: true,
+            focus_before_hide: None,
             follow: false,
             now: SystemTime::UNIX_EPOCH,
             message: None,
