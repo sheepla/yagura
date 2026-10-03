@@ -45,10 +45,14 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let node = shown_node(state);
     let mut spans = vec![Span::styled(" ", state.theme.style(Role::PaneTitle))];
     if let Some(node) = node {
-        spans.push(Span::styled(
-            format!("{} ", state.icons.for_kind(node.kind)),
-            state.theme.style(Role::PaneTitle),
-        ));
+        // A text header draws no letter: the pane says what it is showing.
+        let icon = state.icons.for_kind(node.kind);
+        if !icon.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", icon),
+                state.theme.style(Role::PaneTitle),
+            ));
+        }
     }
     spans.push(Span::styled(title, state.theme.style(Role::PaneTitle)));
     if let Some(node) = node
@@ -640,8 +644,13 @@ mod tests {
     #[test]
     fn the_header_shows_the_icon_and_the_status_of_the_shown_file() {
         use crate::core::fsmodel::NodeKind;
+        use crate::features::tree::icons::Icons;
 
+        // The letters of the text style say nothing about a file: the
+        // header wears a glyph where it draws one at all.
+        let file_icon = Icons::new(IconStyle::Nerd).for_kind(NodeKind::File);
         let mut state = state();
+        state.icons = Icons::new(IconStyle::Nerd);
         let root = state.tree.model.root_id();
         let node =
             state
@@ -651,7 +660,7 @@ mod tests {
         state.preview.path = Some(PathBuf::from("a.rs"));
         let unchanged = buffer(&state);
         assert!(
-            unchanged.contains("f a.rs"),
+            unchanged.contains(&format!("{file_icon} a.rs")),
             "the icon of the shown file is missing: {unchanged:?}"
         );
         assert!(
@@ -661,7 +670,10 @@ mod tests {
 
         state.tree.model.get_mut(node).expect("node").status = Status::Modified;
         let modified = buffer(&state);
-        assert!(modified.contains("f a.rs  Modified"), "{modified:?}");
+        assert!(
+            modified.contains(&format!("{file_icon} a.rs  Modified")),
+            "{modified:?}"
+        );
     }
 
     #[test]

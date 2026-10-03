@@ -29,8 +29,9 @@ impl Icons {
 
     pub fn for_kind(&self, kind: NodeKind) -> &'static str {
         match (self.style, kind) {
-            (IconStyle::Text, NodeKind::Dir) => "d",
-            (IconStyle::Text, NodeKind::File) => "f",
+            // A text row carries no letter for a file or a directory: the
+            // marker already tells the two apart (§11.1).
+            (IconStyle::Text, NodeKind::Dir | NodeKind::File) => "",
             (IconStyle::Text, NodeKind::Symlink) => "l",
             (IconStyle::Text, NodeKind::Other) => "o",
             (IconStyle::Nerd, NodeKind::Dir) => "\u{f07b}",
@@ -48,14 +49,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_icons_are_ascii_and_one_column_wide() {
+    fn text_rows_carry_no_letter_for_a_file_or_a_directory() {
         let icons = Icons::new(IconStyle::Text);
-        for kind in [
-            NodeKind::File,
-            NodeKind::Dir,
-            NodeKind::Symlink,
-            NodeKind::Other,
-        ] {
+        assert_eq!(icons.for_kind(NodeKind::Dir), "");
+        assert_eq!(icons.for_kind(NodeKind::File), "");
+        // The letters that still say something stay one column wide.
+        for kind in [NodeKind::Symlink, NodeKind::Other] {
             let icon = icons.for_kind(kind);
             assert!(icon.is_ascii(), "{kind:?} icon {icon:?} is not ASCII");
             assert_eq!(UnicodeWidthStr::width(icon), 1);
@@ -82,17 +81,15 @@ mod tests {
     }
 
     #[test]
-    fn directories_are_told_apart_from_files_in_both_styles() {
-        for style in [IconStyle::Text, IconStyle::Nerd] {
-            let icons = Icons::new(style);
-            assert_ne!(
-                icons.for_kind(NodeKind::Dir),
-                icons.for_kind(NodeKind::File)
-            );
-            assert_ne!(
-                icons.for_kind(NodeKind::Symlink),
-                icons.for_kind(NodeKind::File)
-            );
-        }
+    fn nerd_icons_tell_a_directory_from_a_file() {
+        let icons = Icons::new(IconStyle::Nerd);
+        assert_ne!(
+            icons.for_kind(NodeKind::Dir),
+            icons.for_kind(NodeKind::File)
+        );
+        assert_ne!(
+            icons.for_kind(NodeKind::Symlink),
+            icons.for_kind(NodeKind::File)
+        );
     }
 }

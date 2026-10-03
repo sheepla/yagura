@@ -77,9 +77,15 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
         // The marker keeps a cell to its right, so the icon never sits
         // against it.
         Span::styled(format!("{} ", marker), marker_style),
-        Span::styled(format!("{} ", state.icons.for_kind(entry.kind)), base),
-        Span::styled(name.clone(), base),
     ];
+    // A text row draws no letter for a file or a directory: the marker
+    // already tells the two apart (§11.1).
+    let icon = state.icons.for_kind(entry.kind);
+    if !icon.is_empty() {
+        spans.push(Span::styled(format!("{} ", icon), base));
+    }
+    spans.push(Span::styled(name.clone(), base));
+    let name_index = spans.len() - 1;
     if let Some(target) = &entry.link_target {
         spans.push(Span::styled(
             format!(" -> {}", sanitize_os(target)),
@@ -129,17 +135,17 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
         - name_width;
     if others_width + right_width + gap > width {
         // Even the ellipsis has no room left; the pane clips what remains.
-        spans[3].content = String::new().into();
+        spans[name_index].content = String::new().into();
     } else {
         // One column of the room goes to the ellipsis of a shortened name.
         let room = width.saturating_sub(others_width + right_width + gap + 1);
         if name_width > room {
-            spans[3].content = text::truncate_tail_to_width(&name, room).into();
+            spans[name_index].content = text::truncate_tail_to_width(&name, room).into();
         }
     }
     // Every row is filled out to the pane's width, whether or not it has
-    // anything to say at its right end, so that the selection's background
-    // reaches the border.
+    // anything to say at its right end, so that the selection reads as a
+    // bar across the pane, stopping at the cell of air before the border.
     let filled: usize = spans
         .iter()
         .map(|span| text::display_width(span.content.as_ref()))
@@ -314,13 +320,14 @@ mod tests {
     }
 
     #[test]
-    fn rows_show_indent_marker_icon_and_name() {
+    fn rows_show_indent_marker_and_name() {
         let text = draw(&state_with_tree());
         assert!(text.contains("root"), "{text}");
         assert!(text.contains('\u{25be}'), "{text}");
-        assert!(text.contains("d src"), "{text}");
-        assert!(text.contains("f main.rs"), "{text}");
-        assert!(text.contains("f readme.md"), "{text}");
+        // A text row carries no letter: the marker tells the kinds apart.
+        assert!(text.contains("\u{25be} src"), "{text}");
+        assert!(text.contains("main.rs"), "{text}");
+        assert!(text.contains("readme.md"), "{text}");
     }
 
     #[test]
@@ -364,7 +371,7 @@ mod tests {
         state.tree.bump();
         state.tree.refresh();
         let text = draw(&state);
-        assert!(text.contains("f gone.txt D"), "{text}");
+        assert!(text.contains("gone.txt D"), "{text}");
     }
 
     #[test]
@@ -384,7 +391,7 @@ mod tests {
         state.tree.bump();
         state.tree.refresh();
         let text = draw(&state);
-        assert!(text.contains("d locked !"), "{text}");
+        assert!(text.contains("locked !"), "{text}");
     }
 
     #[test]
@@ -486,13 +493,13 @@ mod tests {
         state.tree.collapse(src);
         state.tree.refresh();
         assert!(
-            row_of(&state, "d src").trim_end().ends_with('\u{2026}'),
+            row_of(&state, "src").trim_end().ends_with('\u{2026}'),
             "a directory counts while the baseline builds"
         );
         state.tree.expand(src);
         state.tree.refresh();
         assert!(
-            row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
+            row_of(&state, "main.rs").trim_end().ends_with("main.rs"),
             "a file has no number before the count"
         );
 
@@ -517,11 +524,11 @@ mod tests {
 
         let text = draw(&state);
         assert!(
-            row_of(&state, "f readme.md").trim_end().ends_with('?'),
+            row_of(&state, "readme.md").trim_end().ends_with('?'),
             "a file with no number says so: {text}"
         );
         assert!(
-            row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
+            row_of(&state, "main.rs").trim_end().ends_with("main.rs"),
             "a file that cannot differ shows no cell: {text}"
         );
         // The rows below an open directory say it themselves, so the
@@ -530,12 +537,12 @@ mod tests {
         state.tree.refresh();
         let hidden = draw(&state);
         assert!(
-            row_of(&state, "d src").trim_end().ends_with("+2 -1"),
+            row_of(&state, "src").trim_end().ends_with("+2 -1"),
             "the collapsed rows were not summed up: {hidden}"
         );
         state.tree.expand(src);
         state.tree.refresh();
-        let open = row_of(&state, "d src");
+        let open = row_of(&state, "src");
         assert!(
             open.trim_end().ends_with("src"),
             "an open directory kept a cell of its own: {open:?}"
@@ -613,10 +620,10 @@ mod tests {
         set_clock(&mut state);
         changed_at(&mut state, "readme.md", Duration::from_secs(12));
 
-        let row = row_of(&state, "f readme.md");
+        let row = row_of(&state, "readme.md");
         assert!(row.trim_end().ends_with("12s"), "{row:?}");
         assert!(
-            row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
+            row_of(&state, "main.rs").trim_end().ends_with("main.rs"),
             "a row nothing happened to said an age"
         );
     }
@@ -652,14 +659,14 @@ mod tests {
             .tree
             .collapse(state.tree.model.lookup(Path::new("src")).expect("src"));
         state.tree.refresh();
-        let hidden = row_of(&state, "d src");
+        let hidden = row_of(&state, "src");
         assert!(hidden.trim_end().ends_with("42s"), "{hidden:?}");
 
         state
             .tree
             .expand(state.tree.model.lookup(Path::new("src")).expect("src"));
         state.tree.refresh();
-        let open = row_of(&state, "d src");
+        let open = row_of(&state, "src");
         assert!(
             open.trim_end().ends_with("src"),
             "an open directory kept the age of what it hides: {open:?}"
