@@ -7,10 +7,11 @@ that needs saying on the status bar.
 
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
 M1 (the static file tree), M2 (the preview content, with syntax highlighting),
-M3 (the git baseline and the diff) and M4 (real-time updates: watching,
-batches, refreshed statistics, the head check, ages and the `F`/`c`/`o` keys).
-The snapshot baseline, the finders, the help overlay, the editor launch and
-the markdown rendering are not implemented yet.
+M3 (the git baseline and the diff), M4 (real-time updates: watching, batches,
+refreshed statistics, the head check, ages and the `F`/`c`/`o` keys) and M5 (the
+snapshot baseline, for watching a directory that is not a repository).
+The finders, the help overlay, the editor launch and the markdown rendering are
+not implemented yet.
 
 ## Status
 
@@ -21,7 +22,8 @@ the markdown rendering are not implemented yet.
 | M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting | done |
 | M3 | git baseline, diff engine, InlineDiff / SideBySide, `M/A/D` in the tree, `+N -N ~N` counts, hunk keys | done |
 | M4 | filesystem watching, batched updates, statistics refresh, `.git` head check, ages and freshness, follow / filter / order | done |
-| M5+ | snapshot baseline, finders, help, editor, markdown | not started |
+| M5 | snapshot baseline, startup scan with its budgets, `auto` fallback outside a repository, the `B` swap | done |
+| M6+ | Files / Grep finders, help overlay, editor launch, markdown | not started |
 
 ## Build
 
@@ -35,7 +37,7 @@ Rust 1.88 or newer, edition 2024.
 ## Usage
 
 ```sh
-yagura [PATH] [--icons text|nerd] [--baseline auto|none] [--no-ignore] [--log LEVEL]
+yagura [PATH] [--icons text|nerd] [--baseline auto|head|snapshot] [--no-ignore] [--log PATH]
 ```
 
 | Option | Meaning |
@@ -43,9 +45,9 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|none] [--no-ignore] [--log LE
 | `[PATH]` | The directory to show. Defaults to the working directory. |
 | `--icons text` | ASCII icons: `d` for a directory, `f` for a file, `l` for a symlink. |
 | `--icons nerd` | Nerd Font glyphs. |
-| `--baseline auto\|none` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and nothing outside of one. |
+| `--baseline auto\|head\|snapshot` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and the start of the session outside of one, and `head` outside a repository is an argument error. |
 | `--no-ignore` | Ignore `.gitignore`, the global excludes and the user ignores. |
-| `--log LEVEL` | Write a `tracing` log to a file. Also read from `YAGURA_LOG`. Nothing is logged without it. |
+| `--log PATH` | Write a `tracing` log to a file. Also read from `YAGURA_LOG`. Nothing is logged without it. |
 
 `NO_COLOR` in the environment turns the theme off.
 
@@ -53,8 +55,9 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|none] [--no-ignore] [--log LE
 
 Everywhere: `q` and `Ctrl+c` quit, `Tab` moves the focus, `Esc` steps back,
 `t` shows or hides the tree, `s` cycles the preview mode, `B` switches the
-baseline (the snapshot side of it lands with M5), `r` reads the shown file
-again, `n` / `N` jump to the next or the previous hunk of the diff.
+baseline between `HEAD` and the start of the session (inside a repository),
+`r` reads the shown file again, `n` / `N` jump to the next or the previous
+hunk of the diff.
 
 In the tree:
 
@@ -130,6 +133,17 @@ below it even before it has been opened. The preview shows the two versions
 side by side or interleaved, folded to a few lines around each hunk, and `n` /
 `N` jump from hunk to hunk. A file that is too large to count says `?` rather
 than a wrong number.
+
+Outside a repository there is no commit to compare against, so the first build
+also scans the tree in the background and keeps what it read as the contents at
+the start of the session. Edits, new files and deletions after that point get
+the same letters and counts, `auto` falls back to that snapshot with a message
+in the status bar, and `B` swaps between the two without blanking the tree. The
+scan keeps at most 1 MiB per file and 64 MiB in total, favouring source files
+and small ones: a file past that budget answers with no baseline, so its row
+says `?` and the preview says `no baseline`. A change made before the program
+started cannot be noticed at all, because there is no earlier state to compare
+with.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 
