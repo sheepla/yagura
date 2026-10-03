@@ -59,6 +59,23 @@ pub enum Language {
     Sql,
     Ini,
     Xml,
+    Makefile,
+    Php,
+    Lua,
+    Perl,
+    Scala,
+    Haskell,
+    Erlang,
+    Groovy,
+    Clojure,
+    Ocaml,
+    R,
+    Matlab,
+    ObjectiveC,
+    Latex,
+    Diff,
+    ReStructuredText,
+    Batch,
     Text,
 }
 
@@ -87,6 +104,23 @@ impl Language {
             Self::Sql => "sql",
             Self::Ini => "ini",
             Self::Xml => "xml",
+            Self::Makefile => "makefile",
+            Self::Php => "php",
+            Self::Lua => "lua",
+            Self::Perl => "perl",
+            Self::Scala => "scala",
+            Self::Haskell => "haskell",
+            Self::Erlang => "erlang",
+            Self::Groovy => "groovy",
+            Self::Clojure => "clojure",
+            Self::Ocaml => "ocaml",
+            Self::R => "r",
+            Self::Matlab => "matlab",
+            Self::ObjectiveC => "objective-c",
+            Self::Latex => "latex",
+            Self::Diff => "diff",
+            Self::ReStructuredText => "restructuredtext",
+            Self::Batch => "batch",
             Self::Text => "text",
         }
     }
@@ -124,7 +158,7 @@ fn from_extension(rel: &Path) -> Option<Language> {
             "ts" | "tsx" | "mts" => Language::TypeScript,
             "py" | "pyi" => Language::Python,
             "rb" | "rake" | "gemspec" => Language::Ruby,
-            "sh" | "bash" | "zsh" | "fish" => Language::Shell,
+            "sh" | "bash" | "zsh" | "fish" | "bashrc" | "zshrc" | "profile" => Language::Shell,
             "json" => Language::Json,
             "toml" => Language::Toml,
             "yaml" | "yml" => Language::Yaml,
@@ -134,14 +168,32 @@ fn from_extension(rel: &Path) -> Option<Language> {
             "sql" => Language::Sql,
             "ini" | "cfg" | "conf" => Language::Ini,
             "xml" => Language::Xml,
+            "lua" => Language::Lua,
+            "php" | "php3" | "php4" | "php5" | "php7" | "phps" | "phtml" => Language::Php,
+            "pl" | "pm" | "pod" => Language::Perl,
+            "scala" | "sbt" => Language::Scala,
+            "hs" | "lhs" => Language::Haskell,
+            "erl" | "hrl" => Language::Erlang,
+            "groovy" | "gradle" => Language::Groovy,
+            "clj" | "cljs" | "edn" => Language::Clojure,
+            "ml" | "mli" => Language::Ocaml,
+            "r" => Language::R,
+            "matlab" => Language::Matlab,
+            "m" | "mm" => Language::ObjectiveC,
+            "tex" | "ltx" | "sty" | "cls" => Language::Latex,
+            "diff" | "patch" => Language::Diff,
+            "rst" | "rest" => Language::ReStructuredText,
+            "bat" | "cmd" => Language::Batch,
             "txt" | "log" => Language::Text,
             _ => return None,
         };
         return Some(language);
     }
     match name.as_str() {
-        "makefile" | "gnumakefile" | "justfile" => Some(Language::Text),
-        "dockerfile" | "containerfile" => Some(Language::Text),
+        "makefile" | "gnumakefile" => Some(Language::Makefile),
+        "rakefile" | "gemfile" | "vagrantfile" => Some(Language::Ruby),
+        // No grammar ships for a dockerfile or a justfile, so they stay text.
+        "dockerfile" | "containerfile" | "justfile" => Some(Language::Text),
         _ => None,
     }
 }
@@ -157,6 +209,9 @@ fn from_shebang(head: &str) -> Option<Language> {
         "python" | "python3" | "pypy" => Language::Python,
         "ruby" | "jruby" | "rbx" => Language::Ruby,
         "node" | "bun" | "deno" => Language::JavaScript,
+        "perl" => Language::Perl,
+        "lua" => Language::Lua,
+        "Rscript" => Language::R,
         _ => return None,
     };
     Some(language)
@@ -942,6 +997,21 @@ mod tests {
             Language::detect(Path::new("a.md"), "#!/bin/sh\n"),
             Language::Markdown
         );
+        assert_eq!(Language::detect(Path::new("a.lua"), ""), Language::Lua);
+        assert_eq!(Language::detect(Path::new("a.php"), ""), Language::Php);
+        assert_eq!(Language::detect(Path::new("a.patch"), ""), Language::Diff);
+        assert_eq!(Language::detect(Path::new("a.bat"), ""), Language::Batch);
+        assert_eq!(Language::detect(Path::new("a.tex"), ""), Language::Latex);
+        assert_eq!(
+            Language::detect(Path::new("a.gradle"), ""),
+            Language::Groovy
+        );
+        assert_eq!(
+            Language::detect(Path::new("Makefile"), ""),
+            Language::Makefile
+        );
+        assert_eq!(Language::detect(Path::new("Gemfile"), ""), Language::Ruby);
+        assert_eq!(Language::detect(Path::new(".bashrc"), ""), Language::Shell);
     }
 
     #[test]
@@ -957,6 +1027,14 @@ mod tests {
         assert_eq!(
             Language::detect(Path::new("run"), "#!/usr/bin/env node\n"),
             Language::JavaScript
+        );
+        assert_eq!(
+            Language::detect(Path::new("run"), "#!/usr/bin/env perl\n"),
+            Language::Perl
+        );
+        assert_eq!(
+            Language::detect(Path::new("run"), "#!/usr/bin/env Rscript\n"),
+            Language::R
         );
     }
 
@@ -993,6 +1071,23 @@ mod tests {
             Language::Sql,
             Language::Ini,
             Language::Xml,
+            Language::Makefile,
+            Language::Php,
+            Language::Lua,
+            Language::Perl,
+            Language::Scala,
+            Language::Haskell,
+            Language::Erlang,
+            Language::Groovy,
+            Language::Clojure,
+            Language::Ocaml,
+            Language::R,
+            Language::Matlab,
+            Language::ObjectiveC,
+            Language::Latex,
+            Language::Diff,
+            Language::ReStructuredText,
+            Language::Batch,
             Language::Text,
         ];
         let mut labels: Vec<_> = languages.iter().map(|l| l.label()).collect();
@@ -1008,8 +1103,17 @@ mod tests {
     }
 
     #[test]
-    fn a_makefile_is_text() {
-        assert_eq!(Language::detect(Path::new("Makefile"), ""), Language::Text);
+    fn a_build_file_is_what_it_says() {
+        assert_eq!(
+            Language::detect(Path::new("Makefile"), ""),
+            Language::Makefile
+        );
+        // No grammar ships for these two, so they stay text.
+        assert_eq!(
+            Language::detect(Path::new("Dockerfile"), ""),
+            Language::Text
+        );
+        assert_eq!(Language::detect(Path::new("justfile"), ""), Language::Text);
     }
 
     #[test]

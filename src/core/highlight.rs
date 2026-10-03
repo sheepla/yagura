@@ -271,18 +271,42 @@ fn syntax_token(language: Language) -> Option<&'static str> {
         Language::Go => Some("go"),
         Language::Java => Some("java"),
         Language::JavaScript => Some("js"),
-        Language::TypeScript => Some("ts"),
+        // syntect ships no TypeScript grammar; the JavaScript one takes a
+        // TypeScript file quite far, which is better than leaving it plain.
+        Language::TypeScript => Some("js"),
         Language::Python => Some("py"),
         Language::Ruby => Some("rb"),
         Language::Shell => Some("sh"),
         Language::Json => Some("json"),
-        Language::Toml => Some("toml"),
+        // syntect ships no TOML grammar: the status bar still says `toml`,
+        // and the body stays plain rather than asking for a token that does
+        // not exist.
+        Language::Toml => None,
         Language::Yaml => Some("yaml"),
         Language::Html => Some("html"),
         Language::Css => Some("css"),
         Language::Sql => Some("sql"),
-        Language::Ini => Some("ini"),
+        // No INI grammar either; the properties one reads the same
+        // `key = value` lines an ini file is made of.
+        Language::Ini => Some("properties"),
         Language::Xml => Some("xml"),
+        Language::Makefile => Some("make"),
+        Language::Php => Some("php"),
+        Language::Lua => Some("lua"),
+        Language::Perl => Some("perl"),
+        Language::Scala => Some("scala"),
+        Language::Haskell => Some("hs"),
+        Language::Erlang => Some("erl"),
+        Language::Groovy => Some("groovy"),
+        Language::Clojure => Some("clj"),
+        Language::Ocaml => Some("ml"),
+        Language::R => Some("r"),
+        Language::Matlab => Some("matlab"),
+        Language::ObjectiveC => Some("m"),
+        Language::Latex => Some("tex"),
+        Language::Diff => Some("diff"),
+        Language::ReStructuredText => Some("rst"),
+        Language::Batch => Some("bat"),
     }
 }
 
@@ -416,6 +440,102 @@ mod tests {
             assert!(doc.spans.is_empty(), "{language:?} was coloured");
             assert!(!doc.highlight_truncated);
         }
+    }
+
+    /// A token with no grammar behind it silently drops every file of that
+    /// language back to plain, so each one is checked against what syntect
+    /// actually ships.
+    #[test]
+    fn every_language_finds_a_grammar_that_ships_with_syntect() {
+        let all = [
+            Language::Plain,
+            Language::Rust,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Go,
+            Language::Java,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Python,
+            Language::Ruby,
+            Language::Shell,
+            Language::Json,
+            Language::Toml,
+            Language::Yaml,
+            Language::Markdown,
+            Language::Html,
+            Language::Css,
+            Language::Sql,
+            Language::Ini,
+            Language::Xml,
+            Language::Makefile,
+            Language::Php,
+            Language::Lua,
+            Language::Perl,
+            Language::Scala,
+            Language::Haskell,
+            Language::Erlang,
+            Language::Groovy,
+            Language::Clojure,
+            Language::Ocaml,
+            Language::R,
+            Language::Matlab,
+            Language::ObjectiveC,
+            Language::Latex,
+            Language::Diff,
+            Language::ReStructuredText,
+            Language::Batch,
+            Language::Text,
+        ];
+        for language in all {
+            match language {
+                // Drawn structurally, not token by token.
+                Language::Plain | Language::Text | Language::Markdown => {
+                    assert!(
+                        syntax_token(language).is_none(),
+                        "{language:?} draws structurally but asked for a grammar"
+                    );
+                }
+                // No grammar ships for it; the label still tells what it is.
+                Language::Toml => assert!(
+                    syntax_token(language).is_none(),
+                    "{language:?} has no grammar but asked for one"
+                ),
+                _ => {
+                    let token = syntax_token(language)
+                        .unwrap_or_else(|| panic!("{language:?} forgot its grammar"));
+                    assert!(
+                        SYNTAXES.find_syntax_by_token(token).is_some(),
+                        "{language:?} asks for {token:?}, which syntect does not ship"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lua_file_gets_a_colour_per_meaning() {
+        let mut doc = doc(
+            Language::Lua,
+            &["-- greet", "local n = 42"].map(str::to_owned),
+        );
+        fill_all(&mut doc);
+        assert_eq!(
+            meaning(&doc.lines[0], &doc.spans[0]),
+            vec![("-- greet".to_owned(), Semantic::Comment)]
+        );
+        let local = meaning(&doc.lines[1], &doc.spans[1]);
+        assert!(
+            local.contains(&("42".to_owned(), Semantic::Number)),
+            "{local:?}"
+        );
+        assert!(
+            local
+                .iter()
+                .any(|(_, semantic)| *semantic == Semantic::Keyword || *semantic == Semantic::Type),
+            "{local:?}"
+        );
     }
 
     #[test]
