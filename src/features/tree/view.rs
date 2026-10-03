@@ -62,14 +62,21 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
     let entry = state.tree.model.get(node)?;
     let selected = state.tree.selected == Some(node);
     let base = state.theme.style(base_role(entry));
-    let marker_style = state.theme.style(Role::PaneBorder);
+    let marker = expander(state, node, entry);
+    // An open directory carries the bright marker, a closed one the dim
+    // frame colour: the shape says which is which, the colour how far.
+    let marker_style = state.theme.style(if marker == EXPANDED {
+        Role::TreeExpanded
+    } else {
+        Role::PaneBorder
+    });
     let name = sanitize_os(&entry.name);
 
     let mut spans = vec![
         Span::styled("  ".repeat(depth as usize), base),
         // The marker keeps a cell to its right, so the icon never sits
         // against it.
-        Span::styled(format!("{} ", expander(state, node, entry)), marker_style),
+        Span::styled(format!("{} ", marker), marker_style),
         Span::styled(format!("{} ", state.icons.for_kind(entry.kind)), base),
         Span::styled(name.clone(), base),
     ];
@@ -323,6 +330,20 @@ mod tests {
         state.tree.collapse(state.tree.model.root_id());
         state.tree.refresh();
         assert!(draw(&state).contains('\u{25b8}'));
+    }
+
+    #[test]
+    fn the_marker_of_an_open_directory_is_the_bright_one() {
+        let mut state = state_with_tree();
+        let (open_color, open_mods) = word_style(&state, "\u{25be}");
+        assert_eq!(open_color, Color::White, "the open marker was dim");
+        assert!(!open_mods.contains(Modifier::DIM), "{open_mods:?}");
+
+        state.tree.collapse(state.tree.model.root_id());
+        state.tree.refresh();
+        let (closed_color, closed_mods) = word_style(&state, "\u{25b8}");
+        assert_eq!(closed_color, Color::DarkGray);
+        assert!(closed_mods.contains(Modifier::DIM), "{closed_mods:?}");
     }
 
     #[test]

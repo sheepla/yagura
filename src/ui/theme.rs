@@ -20,6 +20,9 @@ pub enum Role {
     TreeText,
     TreeDirectory,
     TreeSymlink,
+    /// The marker of a directory that is open, which must stay findable
+    /// next to the dim frame around it.
+    TreeExpanded,
     TreeUnreadable,
     TreeSelected,
     /// The age of a change that is seconds old, at the right end of a row.
@@ -123,6 +126,7 @@ fn color(role: Role) -> Color {
     match role {
         Role::PaneBorder | Role::StatusMuted | Role::TooSmall => Color::DarkGray,
         Role::PaneBorderFocused => Color::White,
+        Role::TreeExpanded => Color::White,
         Role::PaneTitle | Role::TreeText | Role::PreviewText | Role::StatusMessage => Color::Reset,
         Role::TreeDirectory => Color::Blue,
         Role::TreeSymlink => Color::Cyan,
@@ -192,7 +196,8 @@ fn modifiers(role: Role) -> Modifier {
         | Role::SyntaxType
         | Role::SyntaxFunction
         | Role::PreviewInlineCode
-        | Role::PaneBorderFocused => Modifier::empty(),
+        | Role::PaneBorderFocused
+        | Role::TreeExpanded => Modifier::empty(),
     }
 }
 
@@ -206,6 +211,7 @@ mod tests {
         for role in [
             Role::PaneBorder,
             Role::PaneBorderFocused,
+            Role::TreeExpanded,
             Role::TreeDirectory,
             Role::StatusError,
             Role::StatusInfo,
