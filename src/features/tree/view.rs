@@ -22,7 +22,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     }
     frame.render_widget(pane(&tree_title(state), &state.theme), area);
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    // Two cells: the border, then a cell of air, so no row touches the
+    // frame and the selection stops short of it on both sides.
+    let inner = area.inner(ratatui::layout::Margin::new(2, 1));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -62,7 +64,9 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
 
     let mut spans = vec![
         Span::styled("  ".repeat(depth as usize), base),
-        Span::styled(expander(state, node, entry), marker_style),
+        // The marker keeps a cell to its right, so the icon never sits
+        // against it.
+        Span::styled(format!("{} ", expander(state, node, entry)), marker_style),
         Span::styled(format!("{} ", state.icons.for_kind(entry.kind)), base),
         Span::styled(name.clone(), base),
     ];
@@ -384,7 +388,8 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let row = state.tree.selected_index().expect("selected") + 1;
-        let cell = &buffer[(1, row as u16)];
+        // The first content column: one cell of air, then the border.
+        let cell = &buffer[(2, row as u16)];
         assert!(
             cell.modifier.contains(ratatui::style::Modifier::REVERSED),
             "selected row was not reversed"
@@ -409,9 +414,10 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         // The root has nothing to draw at its right end while it is open,
-        // and the bar must still run to the border.
+        // and the bar must still run to the cell the air leaves before the
+        // border.
         let row = state.tree.selected_index().expect("selected") + 1;
-        let right = area.left() + area.width - 2;
+        let right = area.left() + area.width - 3;
         let cell = &buffer[(right, row as u16)];
         assert!(
             cell.modifier.contains(Modifier::REVERSED),
@@ -431,7 +437,7 @@ mod tests {
     /// The tree pane's inner row mentioning `needle`, without borders.
     fn row_of(state: &AppState, needle: &str) -> String {
         let area = layout::compute(state.area(), state.tree_visible).tree;
-        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        let inner = area.inner(ratatui::layout::Margin::new(2, 1));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, area, state))
@@ -556,7 +562,7 @@ mod tests {
     /// The style the word `word` is drawn in, somewhere in the tree pane.
     fn word_style(state: &AppState, word: &str) -> (Color, Modifier) {
         let area = layout::compute(state.area(), state.tree_visible).tree;
-        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        let inner = area.inner(ratatui::layout::Margin::new(2, 1));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, area, state))

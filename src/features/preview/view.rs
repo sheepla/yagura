@@ -40,9 +40,10 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         },
     };
     // The icon and the status come from the tree's node, which is the one
-    // place both of them are known (§6).
+    // place both of them are known (§6). The title starts a cell in from
+    // the corner so nothing touches the frame.
     let node = shown_node(state);
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::styled(" ", state.theme.style(Role::PaneTitle))];
     if let Some(node) = node {
         spans.push(Span::styled(
             format!("{} ", state.icons.for_kind(node.kind)),
@@ -82,6 +83,11 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 /// the list is the file a row points at, in full rather than as a diff
 /// (§13.3).
 pub fn render_body_in(frame: &mut Frame<'_>, area: Rect, state: &AppState, mode: PreviewMode) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // A cell of air beside the divider, so no line touches the frame.
+    let area = area.inner(ratatui::layout::Margin::new(1, 0));
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -585,12 +591,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("terminal");
         terminal
             .draw(|frame| {
-                render_header(frame, frame.area(), state);
-                render_body(
-                    frame,
-                    frame.area().inner(ratatui::layout::Margin::new(0, 1)),
-                    state,
-                );
+                let area = frame.area();
+                // The header is one row, as the app lays it out: drawn over
+                // the whole frame it would leave its side borders where the
+                // body has to breathe.
+                let header = ratatui::layout::Rect::new(area.x, area.y, area.width, 1);
+                render_header(frame, header, state);
+                render_body(frame, area.inner(ratatui::layout::Margin::new(0, 1)), state);
             })
             .expect("draw");
         terminal.backend().buffer().clone()
@@ -764,13 +771,15 @@ mod tests {
         let long = "word ".repeat(20);
         let text = buffer(&laid_out(long.trim_end()));
         let rows: Vec<&str> = text.lines().collect();
-        assert!(rows[1].starts_with("   1 word"), "{:?}", rows[1]);
+        // The body draws a cell in from the divider, so the gutter sits one
+        // column further right than it does on the terminal.
+        assert!(rows[1].starts_with("    1 word"), "{:?}", rows[1]);
         assert!(
-            rows[2].starts_with("     word"),
+            rows[2].starts_with("      word"),
             "the continuation took a number of its own: {:?}",
             rows[2]
         );
-        assert!(rows[3].starts_with("     word"), "{:?}", rows[3]);
+        assert!(rows[3].starts_with("      word"), "{:?}", rows[3]);
         // The pane wraps it; it never cuts a laid out line short.
         assert!(!text.contains('…'), "{text}");
     }
@@ -801,7 +810,7 @@ mod tests {
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
         let buffer = draw(&state);
-        let title = &buffer[(5, 1)];
+        let title = &buffer[(6, 1)];
         assert_eq!(title.symbol(), "T");
         assert_eq!(title.fg, Color::Blue);
         assert!(title.modifier.contains(Modifier::BOLD), "not a heading");
@@ -986,13 +995,14 @@ mod tests {
     #[test]
     fn a_highlighted_line_is_drawn_in_its_meanings() {
         let buffer = draw(&highlighted());
-        // The gutter takes five columns, so the line starts at column five.
-        assert_eq!(buffer[(5, 1)].fg, Color::Yellow, "let");
-        assert_eq!(buffer[(8, 1)].fg, Color::Reset, "the gap after it");
-        assert_eq!(buffer[(11, 1)].fg, Color::Magenta, "=");
-        assert_eq!(buffer[(13, 1)].fg, Color::Cyan, "42");
-        assert_eq!(buffer[(17, 1)].fg, Color::DarkGray, "// note");
-        assert!(buffer[(17, 1)].modifier.contains(Modifier::DIM));
+        // The body starts a cell in from the divider, and the gutter takes
+        // five columns on top of that, so the line starts at column six.
+        assert_eq!(buffer[(6, 1)].fg, Color::Yellow, "let");
+        assert_eq!(buffer[(9, 1)].fg, Color::Reset, "the gap after it");
+        assert_eq!(buffer[(12, 1)].fg, Color::Magenta, "=");
+        assert_eq!(buffer[(14, 1)].fg, Color::Cyan, "42");
+        assert_eq!(buffer[(18, 1)].fg, Color::DarkGray, "// note");
+        assert!(buffer[(18, 1)].modifier.contains(Modifier::DIM));
     }
 
     /// One hit on the line `highlighted()` shows.
@@ -1010,16 +1020,17 @@ mod tests {
         let mut state = highlighted();
         state.preview.aim_at(Some(&hit("a.rs", 1)));
         let buffer = draw(&state);
-        // The gutter takes five columns, so the number at offset eight sits
-        // at column thirteen.
-        let at = &buffer[(13, 1)];
+        // The body starts a cell in from the divider; the gutter then takes
+        // five columns, so the number at offset eight sits at column
+        // fourteen.
+        let at = &buffer[(14, 1)];
         assert_eq!(at.symbol(), "4");
         assert_eq!(at.fg, Color::Reset, "the palette gives way to the mark");
         assert!(at.modifier.contains(Modifier::REVERSED), "not lit up");
-        assert!(buffer[(14, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(15, 1)].modifier.contains(Modifier::REVERSED));
         // What is around the hit keeps the meaning the language gave it.
-        assert_eq!(buffer[(5, 1)].fg, Color::Yellow, "let");
-        assert_eq!(buffer[(17, 1)].fg, Color::DarkGray, "// note");
+        assert_eq!(buffer[(6, 1)].fg, Color::Yellow, "let");
+        assert_eq!(buffer[(18, 1)].fg, Color::DarkGray, "// note");
     }
 
     #[test]
@@ -1027,8 +1038,8 @@ mod tests {
         let mut state = highlighted();
         state.preview.aim_at(Some(&hit("other.rs", 1)));
         let buffer = draw(&state);
-        assert_eq!(buffer[(13, 1)].fg, Color::Cyan, "the mark was drawn anyway");
-        assert!(!buffer[(13, 1)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(14, 1)].fg, Color::Cyan, "the mark was drawn anyway");
+        assert!(!buffer[(14, 1)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -1036,14 +1047,14 @@ mod tests {
         let mut state = highlighted();
         state.theme = Theme::new(true);
         let buffer = draw(&state);
-        for column in 5..=16 {
+        for column in 6..=17 {
             assert_eq!(
                 buffer[(column, 1)].fg,
                 Color::Reset,
                 "column {column} still had a color"
             );
         }
-        let comment = &buffer[(17, 1)];
+        let comment = &buffer[(18, 1)];
         assert_eq!(comment.fg, Color::Reset);
         assert!(
             comment.modifier.contains(Modifier::DIM),
@@ -1091,18 +1102,18 @@ mod tests {
         let state = diffed("one\ntwo\n", "one\nTWO\n", PreviewMode::InlineDiff);
         let buffer = draw(&state);
         // Row one is context: a blank marker and the pane's own text colour.
-        assert_eq!(buffer[(4, 1)].fg, Color::Reset, "the context marker");
+        assert_eq!(buffer[(5, 1)].fg, Color::Reset, "the context marker");
         // Row two is a removal, row three an addition: marker and text take
         // the colour of the side the row came from.
-        assert_eq!(buffer[(4, 2)].fg, Color::Red, "the removal marker");
-        assert_eq!(buffer[(5, 2)].symbol(), "t", "the removal text");
-        assert_eq!(buffer[(5, 2)].fg, Color::Red, "the removal text");
-        assert_eq!(buffer[(4, 3)].fg, Color::Green, "the addition marker");
-        assert_eq!(buffer[(5, 3)].symbol(), "T", "the addition text");
-        assert_eq!(buffer[(5, 3)].fg, Color::Green, "the addition text");
+        assert_eq!(buffer[(5, 2)].fg, Color::Red, "the removal marker");
+        assert_eq!(buffer[(6, 2)].symbol(), "t", "the removal text");
+        assert_eq!(buffer[(6, 2)].fg, Color::Red, "the removal text");
+        assert_eq!(buffer[(5, 3)].fg, Color::Green, "the addition marker");
+        assert_eq!(buffer[(6, 3)].symbol(), "T", "the addition text");
+        assert_eq!(buffer[(6, 3)].fg, Color::Green, "the addition text");
         // The number in front stays in the gutter's colour.
-        assert_eq!(buffer[(3, 2)].symbol(), "2");
-        assert_eq!(buffer[(3, 2)].fg, Color::DarkGray);
+        assert_eq!(buffer[(4, 2)].symbol(), "2");
+        assert_eq!(buffer[(4, 2)].fg, Color::DarkGray);
     }
 
     #[test]
@@ -1122,12 +1133,12 @@ mod tests {
 
         let buffer = draw(&state);
         // Row one is the removal, row two the addition.
-        assert_eq!(buffer[(5, 1)].symbol(), "f", "the removal text");
-        assert_eq!(buffer[(5, 1)].fg, Color::Magenta, "the keyword in it");
-        assert_eq!(buffer[(8, 1)].symbol(), "o", "past the keyword");
-        assert_eq!(buffer[(8, 1)].fg, Color::Red, "the colour of the side");
-        assert_eq!(buffer[(5, 2)].fg, Color::Magenta, "the keyword again");
-        assert_eq!(buffer[(8, 2)].fg, Color::Green, "the side of the addition");
+        assert_eq!(buffer[(6, 1)].symbol(), "f", "the removal text");
+        assert_eq!(buffer[(6, 1)].fg, Color::Magenta, "the keyword in it");
+        assert_eq!(buffer[(9, 1)].symbol(), "o", "past the keyword");
+        assert_eq!(buffer[(9, 1)].fg, Color::Red, "the colour of the side");
+        assert_eq!(buffer[(6, 2)].fg, Color::Magenta, "the keyword again");
+        assert_eq!(buffer[(9, 2)].fg, Color::Green, "the side of the addition");
     }
 
     #[test]
