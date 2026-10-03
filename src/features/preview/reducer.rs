@@ -32,9 +32,10 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
     if matches!(command, Command::NextHunk | Command::PrevHunk) {
         return jump_hunk(state, command);
     }
-    // Scrolling is the preview's own business and only when it has focus; the
-    // same key means something else in the tree.
-    if state.focus != Focus::Preview {
+    // Scrolling is the preview's own business and only when it has focus or
+    // when an overlay is borrowing the pane; the same key means something
+    // else in the tree.
+    if state.focus != Focus::Preview && !state.overlay.is_finder() {
         return Vec::new();
     }
     let page = state.preview.height() as isize;
@@ -91,7 +92,11 @@ fn jump_hunk(state: &mut AppState, command: Command) -> Vec<Effect> {
 /// The gutter is part of the pane but stays put, so it comes back out of the
 /// count before a scroll is measured.
 pub fn body_width(state: &AppState) -> usize {
-    let area = crate::ui::layout::compute(state.area(), state.tree_visible).preview;
+    let area = if state.overlay.is_finder() {
+        crate::ui::layout::finder(state.area()).preview
+    } else {
+        crate::ui::layout::compute(state.area(), state.tree_visible).preview
+    };
     let text = area.width.saturating_sub(PANE_MARGIN) as usize;
     text.saturating_sub(super::view::GUTTER_COLS)
 }
@@ -130,11 +135,30 @@ pub fn on_loaded(
     }
 }
 
-/// Points the preview at whatever the tree has selected, if that is a file.
+/// Points the preview at whatever should be showing, and returns the load to
+/// run, or nothing when the target did not change, which is the common case:
+/// every tree event comes through here.
 ///
-/// Returns the load to run, or nothing when the target did not change, which
-/// is the common case: every tree event comes through here.
+/// While a finder is open the row it has selected is what the reader is
+/// looking at, and a jump that has not landed yet is where the preview is
+/// headed; the tree has its turn again once neither is true (§13.2).
 pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
+    if state.overlay.is_finder() || state.tree.jump.is_some() {
+        let rel = state
+            .tree
+            .jump
+            .clone()
+            .or_else(|| state.finder.selected_path());
+        return match rel {
+            Some(rel) => aim(state, rel),
+            None => {
+                if state.preview.preview != PreviewStatus::Empty {
+                    state.preview.clear();
+                }
+                Vec::new()
+            }
+        };
+    }
     let Some(node) = state.tree.selected else {
         if state.preview.preview != PreviewStatus::Empty {
             state.preview.clear();
@@ -153,6 +177,11 @@ pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
     let Some(rel) = state.tree.model.rel_of(node).map(Path::to_path_buf) else {
         return Vec::new();
     };
+    aim(state, rel)
+}
+
+/// Points the preview at `rel` unless it is already there.
+fn aim(state: &mut AppState, rel: PathBuf) -> Vec<Effect> {
     if state.preview.path.as_ref() == Some(&rel) {
         return Vec::new();
     }

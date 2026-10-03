@@ -7,12 +7,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use crate::app::action::{Action, StatAnswer};
 use crate::app::command::Command;
 use crate::app::effect::Effect;
 use crate::app::state::AppState;
 use crate::core::baseline::{Built, ChangedEntry, Kind, Phase};
-use crate::features::{preview, tree};
+use crate::features::{finder, preview, tree};
 use crate::input::keymap;
 
 /// Applies one action and reports the effects it caused.
@@ -56,6 +58,13 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Tick { now } => {
             state.now = *now;
+            // The matcher only advances while it is ticked, so the clock is
+            // what a match still running waits for (§13.2). A rank that
+            // settles on a different first row is a new preview target, so
+            // the effects the overlay asks for are kept rather than dropped.
+            if state.overlay.is_finder() {
+                return finder_effects(state, &action);
+            }
             Vec::new()
         }
         Action::Key(_) | Action::Quit => {
@@ -64,6 +73,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             Vec::new()
         }
+        // The finder overlays take the keys that are theirs and every paste
+        // aimed at their query box; the panes behind them keep the scrolling
+        // and `Esc`, because one key means one thing (§4).
+        Action::Command(command) if finder::reducer::owns(*command) => {
+            finder_effects(state, &action)
+        }
+        Action::Paste(_) if state.overlay.is_finder() => finder_effects(state, &action),
+        Action::FilesFound { .. } | Action::FilesScanDone { .. } => finder_effects(state, &action),
         Action::Paste(_)
         | Action::Command(_)
         | Action::DirLoaded { .. }
@@ -110,6 +127,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         // has a case.
         Action::StatsComputed { .. } => Vec::new(),
     }
+}
+
+/// An action for a finder overlay, followed by whatever the panes behind it
+/// should know about the row the overlay has selected (§13.2).
+fn finder_effects(state: &mut AppState, action: &Action) -> Vec<Effect> {
+    let mut effects = finder::reducer::reduce(state, action);
+    effects.extend(preview::reducer::sync_target(state));
+    effects
 }
 
 /// Commands the preview pane handles itself.
@@ -288,11 +313,36 @@ pub fn sync_preview_viewport(state: &mut AppState) {
 
 /// Turns raw input into a command using the keymap for the current context.
 /// `None` means the key is not bound and the action is dropped.
+///
+/// A finder overlay is the one place where a key press is not looked up: a
+/// character the key meant literally belongs to the query box, whatever the
+/// table says (§13.1). The named keys - `Enter`, `Esc`, every control key -
+/// are still the keymap's to decide.
 fn resolve(state: &AppState, action: Action) -> Option<Action> {
     match action {
-        Action::Key(key) => keymap::command_for(state.context(), key).map(Action::Command),
+        Action::Key(key) => {
+            if state.overlay.is_finder()
+                && let Some(c) = plain_char(key)
+            {
+                return Some(Action::Command(Command::FinderInsert(c)));
+            }
+            keymap::command_for(state.context(), key).map(Action::Command)
+        }
         other => Some(other),
     }
+}
+
+/// The character a key press meant, when it meant that and nothing else.
+fn plain_char(key: KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    // An uppercase letter arrives as itself plus `SHIFT`, which is a literal
+    // character and not a modifier of it.
+    key.modifiers
+        .difference(KeyModifiers::SHIFT)
+        .is_empty()
+        .then_some(c)
 }
 
 #[cfg(test)]
@@ -304,7 +354,7 @@ mod tests {
 
     use super::*;
     use crate::app::command::Command;
-    use crate::app::state::{Config, Focus, PreviewMode};
+    use crate::app::state::{Config, Focus, Overlay, PreviewMode};
     use crate::cli::{BaselineKind, IconStyle};
 
     fn state() -> AppState {
@@ -361,6 +411,49 @@ mod tests {
         let before = fingerprint(&state);
         reduce(&mut state, key(KeyCode::F(12)));
         assert_eq!(fingerprint(&state), before);
+    }
+
+    /// A key press carrying modifiers, which the plain `key` helper never does.
+    fn key_with(code: KeyCode, mods: KeyModifiers) -> Action {
+        Action::Key(KeyEvent::new(code, mods))
+    }
+
+    #[test]
+    fn an_open_finder_takes_the_plain_keys_and_leaves_the_text_box_library_out() {
+        let mut state = state();
+        reduce(
+            &mut state,
+            key_with(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.overlay, Overlay::Files);
+        // A plain letter would scroll a pane or move a row; in here it types.
+        reduce(&mut state, key(KeyCode::Char('j')));
+        assert_eq!(state.finder.query_text(), "j");
+        assert_eq!(
+            state.focus,
+            Focus::Tree,
+            "the panes behind the overlay keep their focus"
+        );
+        // What the query box library would undo, redo or break a line with is
+        // bound nowhere, so it arrives as no command at all (§13.1).
+        reduce(
+            &mut state,
+            key_with(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        reduce(
+            &mut state,
+            key_with(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.finder.query_text(), "j");
+        // `Ctrl+P` in here moves the selection rather than opening anything.
+        reduce(
+            &mut state,
+            key_with(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.overlay, Overlay::Files);
+        // And `Esc` closes the overlay in one step (§4).
+        reduce(&mut state, key(KeyCode::Esc));
+        assert_eq!(state.overlay, Overlay::None);
     }
 
     #[test]

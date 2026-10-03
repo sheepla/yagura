@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 pub use crate::cli::Config;
 use crate::core::baseline::{ChangedEntry, Kind, Phase};
 use crate::core::fsmodel::NodeId;
+use crate::features::finder::FinderState;
 use crate::features::preview::PreviewState;
 use crate::features::tree::TreeState;
 use crate::features::tree::icons::Icons;
@@ -73,6 +74,12 @@ impl Overlay {
             Self::Grep => Some("GREP"),
             Self::Watch => Some("WATCH"),
         }
+    }
+
+    /// Whether the overlay is one of the two that are a text box with a list
+    /// below it, which share their keys and their state (§13).
+    pub fn is_finder(self) -> bool {
+        matches!(self, Self::Files | Self::Grep)
     }
 }
 
@@ -168,6 +175,8 @@ pub struct AppState {
     pub message: Option<Message>,
     pub tree: TreeState,
     pub preview: PreviewState,
+    /// The query box, list and matcher of the finder overlays (§13).
+    pub finder: FinderState,
     pub baseline: BaselineState,
     /// Generation of the newest stats request per path; an answer carrying
     /// another one belongs to a request that has been superseded (I3).
@@ -193,6 +202,7 @@ impl AppState {
         let mut state = Self {
             tree: TreeState::new(model),
             preview: PreviewState::default(),
+            finder: FinderState::default(),
             baseline: BaselineState::new(kind),
             stats_gen: BTreeMap::new(),
             theme,
@@ -225,8 +235,16 @@ impl AppState {
     }
 
     /// Rows the preview body has, which is what a page of scrolling is.
+    ///
+    /// An open finder draws a preview pane of its own, and a page of the pane
+    /// on screen is what a page of scrolling means (§13.2).
     pub fn preview_viewport_height(&self) -> usize {
-        crate::ui::layout::preview_height(self.area()).max(1) as usize
+        let pane = if self.overlay.is_finder() {
+            crate::ui::layout::finder(self.area()).preview.height
+        } else {
+            crate::ui::layout::preview_height(self.area())
+        };
+        pane.max(1) as usize
     }
 
     /// The effects the store has to run once at startup.
@@ -337,14 +355,18 @@ impl AppState {
     /// A clock tick only repaints when something on screen would read
     /// differently: the elapsed times are what a tick changes, and a frame
     /// nobody can tell from the last one is both wasted work and visible as
-    /// flicker (design §14.1). `Paste` changes nothing the user can see
-    /// before the text box of an overlay exists.
+    /// flicker (design §14.1). Two things are exempt. A `Paste` lands in the
+    /// query box of an open finder, which is something to see; and a match
+    /// still running keeps asking for the frame its workers are fed from
+    /// (§13.2).
     pub fn wants_repaint(&self, action: &crate::app::Action) -> bool {
         match action {
             crate::app::Action::Tick { now } => {
-                self.elapsed_tick_changes(*now) || self.message_tick_changes(*now)
+                self.elapsed_tick_changes(*now)
+                    || self.message_tick_changes(*now)
+                    || (self.overlay.is_finder() && self.finder.matcher_running())
             }
-            crate::app::Action::Paste(_) => false,
+            crate::app::Action::Paste(_) => self.overlay.is_finder(),
             _ => true,
         }
     }
@@ -567,5 +589,14 @@ mod tests {
             height: 24
         }));
         assert!(!state.wants_repaint(&Action::Paste("text".to_owned())));
+    }
+
+    #[test]
+    fn a_paste_that_lands_in_a_query_box_asks_for_a_frame() {
+        use crate::app::Action;
+
+        let mut state = state();
+        state.overlay = Overlay::Files;
+        assert!(state.wants_repaint(&Action::Paste("text".to_owned())));
     }
 }

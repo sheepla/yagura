@@ -11,6 +11,11 @@ use crate::core::dirload::DirError;
 use crate::core::fsmodel::{DirEntry, NodeId};
 use crate::core::preview::{Doc, PreviewError};
 
+/// Paths one [`Action::FilesFound`] carries: a walk of a hundred thousand
+/// files arrives as a few hundred small actions rather than one that fills
+/// the channel (§13.2).
+pub const SCAN_CHUNK: usize = 128;
+
 /// A message for the store loop.
 #[derive(Debug)]
 pub enum Action {
@@ -65,6 +70,18 @@ pub enum Action {
     StatsComputed { results: Vec<StatAnswer> },
     /// What `git rev-parse HEAD` answered (§8.2).
     HeadChecked { oid: Option<String> },
+    /// One chunk of paths the finder's walk has found (§13.2).
+    FilesFound {
+        /// Walk the chunk belongs to; a mismatch means it is stale (I3).
+        generation: u64,
+        /// Paths relative to the root, in the order the walk found them.
+        rels: Vec<PathBuf>,
+    },
+    /// The finder's walk has finished (§13.2).
+    FilesScanDone {
+        /// Walk that finished; a mismatch means it was superseded (I3).
+        generation: u64,
+    },
 }
 
 /// The status of one path an [`crate::app::effect::Effect::ComputeStats`]

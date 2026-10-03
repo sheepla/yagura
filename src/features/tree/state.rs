@@ -1,6 +1,7 @@
 //! Tree state: expansion, selection, scrolling and the visible row cache.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::app::state::SortMode;
 use crate::core::fsmodel::{FsModel, NodeId, Status};
@@ -41,6 +42,9 @@ pub struct TreeState {
     pub changed_only: bool,
     /// Rows that fit on screen, kept in step with the layout by the reducer.
     pub viewport: usize,
+    /// A path a finder has asked to be shown, until the listings on the way
+    /// to it have arrived and the row exists to select (§4).
+    pub jump: Option<PathBuf>,
 }
 
 impl TreeState {
@@ -59,6 +63,7 @@ impl TreeState {
             sort: SortMode::Name,
             changed_only: false,
             viewport: 0,
+            jump: None,
         }
     }
 
@@ -227,7 +232,7 @@ impl TreeState {
     }
 
     /// Scrolls the least amount that keeps row `index` on screen.
-    fn scroll_into_view(&mut self, index: usize) {
+    pub fn scroll_into_view(&mut self, index: usize) {
         let height = self.viewport.max(1);
         if index < self.scroll {
             self.scroll = index;

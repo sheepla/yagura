@@ -61,4 +61,30 @@ pub enum Command {
     /// A watch picks up a change on its own; this is for the case where it
     /// did not, and for a look at a file nothing has watched yet.
     Reload,
+
+    // The finder overlay (§13).
+    /// `Ctrl+P`: open the file finder.
+    OpenFiles,
+    /// `Enter`: take the selected row and close the overlay (§4).
+    FinderAccept,
+    /// `↑` / `Ctrl+P`: the row above in the list.
+    FinderSelectUp,
+    /// `↓` / `Ctrl+N`: the row below in the list.
+    FinderSelectDown,
+    FinderPageUp,
+    FinderPageDown,
+    /// A character for the query box; the keymap never produces one for a
+    /// plain key press, the reducer does (§13.1).
+    FinderInsert(char),
+    FinderCursorLeft,
+    FinderCursorRight,
+    FinderCursorWordLeft,
+    FinderCursorWordRight,
+    FinderCursorHome,
+    FinderCursorEnd,
+    FinderDeleteBack,
+    FinderDeleteForward,
+    FinderDeleteWord,
+    FinderDeleteToStart,
+    FinderDeleteToEnd,
 }

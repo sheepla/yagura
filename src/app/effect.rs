@@ -62,4 +62,10 @@ pub enum Effect {
     },
     /// Read `HEAD` once the repository has gone quiet (§8.2).
     CheckHead,
+    /// Walk the whole tree for the file finder, answering in chunks (§13.2).
+    ScanFiles {
+        /// Generation the walk answers with; one the state does not hold is
+        /// from a walk that has been superseded.
+        generation: u64,
+    },
 }

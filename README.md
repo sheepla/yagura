@@ -8,10 +8,11 @@ that needs saying on the status bar.
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
 M1 (the static file tree), M2 (the preview content, with syntax highlighting),
 M3 (the git baseline and the diff), M4 (real-time updates: watching, batches,
-refreshed statistics, the head check, ages and the `F`/`c`/`o` keys) and M5 (the
-snapshot baseline, for watching a directory that is not a repository).
-The finders, the help overlay, the editor launch and the markdown rendering are
-not implemented yet.
+refreshed statistics, the head check, ages and the `F`/`c`/`o` keys), M5 (the
+snapshot baseline, for watching a directory that is not a repository) and M6
+(the file finder overlay, `Ctrl+P`).
+The grep finder, the help overlay, the editor launch and the markdown rendering
+are not implemented yet.
 
 ## Status
 
@@ -23,7 +24,8 @@ not implemented yet.
 | M3 | git baseline, diff engine, InlineDiff / SideBySide, `M/A/D` in the tree, `+N -N ~N` counts, hunk keys | done |
 | M4 | filesystem watching, batched updates, statistics refresh, `.git` head check, ages and freshness, follow / filter / order | done |
 | M5 | snapshot baseline, startup scan with its budgets, `auto` fallback outside a repository, the `B` swap | done |
-| M6+ | Files / Grep finders, help overlay, editor launch, markdown | not started |
+| M6 | file finder overlay: query box, parallel walk, fuzzy match, preview beside the list, the jump into the tree | done |
+| M6+ | grep finder, help overlay, editor launch, markdown | not started |
 
 ## Build
 
@@ -88,6 +90,23 @@ In the preview:
 The full table lives in `src/input/keymap.rs`, which is also what the help
 overlay will be built from.
 
+In the finder overlay, opened with `Ctrl+p`:
+
+| Key | Action |
+| --- | --- |
+| type | Filter the paths by what you type |
+| `↑` / `↓`, `Ctrl+p` / `Ctrl+n` | The row above / below |
+| `PgUp` / `PgDn` | A page of rows |
+| `Alt+j` / `Alt+k` | Scroll the preview beside the list |
+| `Enter` | Take the row: the tree walks to it and the preview shows it |
+| `Esc` / `Ctrl+c` | Close the overlay and go back to the panes |
+
+Editing a query is the usual line editing: `←` / `→` or `Ctrl+b` / `Ctrl+f`,
+`Alt+b` / `Alt+f` by word, `Home` / `End` or `Ctrl+a` / `Ctrl+e`, `Backspace` /
+`Ctrl+h`, `Delete` / `Ctrl+d`, `Ctrl+w` by word, `Ctrl+u` to the head of the
+line and `Ctrl+k` to the end. A pasted passage arrives as a single line, capped
+at 1024 characters.
+
 ## How it is put together
 
 The program is one Flux loop. Input and background work produce `Action`
@@ -144,6 +163,14 @@ and small ones: a file past that budget answers with no baseline, so its row
 says `?` and the preview says `no baseline`. A change made before the program
 started cannot be noticed at all, because there is no earlier state to compare
 with.
+
+The finder overlay keeps one list of every path below the root. Opening it
+starts a walk that runs beside the interface and answers in chunks, so the list
+is worth reading before the walk is over; each chunk goes into a fuzzy matcher
+and only the rows that fit are ever drawn. With nothing typed the changed paths
+come first, newest first. The row under the selection is previewed while the
+overlay is up, and `Enter` walks the tree down to the file, expanding the
+directories on the way, and hands the preview over.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 

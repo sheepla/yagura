@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc::Sender;
 
-use crate::app::action::{Action, StatAnswer};
+use crate::app::action::{Action, SCAN_CHUNK, StatAnswer};
 use crate::app::effect::Effect;
 use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
 use crate::core::fswatch::watcher::FsWatcher;
@@ -70,6 +70,61 @@ fn wait_for_snapshot(
             return None;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Walks the whole tree for the file finder, answering in chunks (§13.2).
+///
+/// The walk is parallel because a repository is a tree and the list wants its
+/// first rows long before the last ones are read, and it answers in chunks
+/// because one action per file would fill the channel instead of the list.
+/// What a walk sees is what it sees: the paths come out relative to the root,
+/// the way every other path in the application is held.
+fn scan_files(root: &Path, ignore_enabled: bool, generation: u64, tx: &Sender<Action>) {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .standard_filters(false)
+        .hidden(false)
+        .parents(ignore_enabled)
+        .ignore(ignore_enabled)
+        .git_ignore(ignore_enabled)
+        .git_global(ignore_enabled)
+        .git_exclude(ignore_enabled)
+        // Honour ignore files outside a repository too, the way the tree
+        // lists directories (§7.4).
+        .require_git(false)
+        .filter_entry(|entry| !dirload::is_skipped(entry.file_name()));
+    builder.build_parallel().run(|| {
+        let root = root.to_path_buf();
+        let tx = tx.clone();
+        let mut chunk: Vec<PathBuf> = Vec::with_capacity(SCAN_CHUNK);
+        Box::new(move |result| {
+            let Ok(entry) = result else {
+                return ignore::WalkState::Continue;
+            };
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && let Ok(rel) = entry.path().strip_prefix(&root)
+            {
+                chunk.push(rel.to_path_buf());
+                if chunk.len() >= SCAN_CHUNK {
+                    let rels = std::mem::take(&mut chunk);
+                    let action = Action::FilesFound { generation, rels };
+                    if tx.blocking_send(action).is_err() {
+                        // The store is gone: nobody is reading the tree.
+                        return ignore::WalkState::Quit;
+                    }
+                    chunk = Vec::with_capacity(SCAN_CHUNK);
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    if tx
+        .blocking_send(Action::FilesScanDone { generation })
+        .is_err()
+    {
+        tracing::debug!("store is gone, dropping the end of the walk");
     }
 }
 
@@ -224,6 +279,14 @@ impl EffectRunner {
             Effect::WatchDirs { add, remove } => self.watch(&add, &remove),
             Effect::ComputeStats { kind, at, paths } => self.compute_stats(kind, at, &paths),
             Effect::CheckHead => self.check_head(),
+            Effect::ScanFiles { generation } => {
+                let root = self.root.clone();
+                let ignore_enabled = self.ignore_enabled;
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    scan_files(&root, ignore_enabled, generation, &tx);
+                });
+            }
         }
     }
 

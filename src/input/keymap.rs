@@ -33,10 +33,12 @@ pub struct Binding {
 
 const NONE: KeyModifiers = KeyModifiers::NONE;
 const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
+const ALT: KeyModifiers = KeyModifiers::ALT;
 
 const BOTH: &[Context] = &[Context::Tree, Context::Preview];
 const TREE: &[Context] = &[Context::Tree];
 const PREVIEW: &[Context] = &[Context::Preview];
+const FINDER: &[Context] = &[Context::Finder];
 
 macro_rules! binding {
     ($contexts:ident, $code:expr, $mods:expr, $command:ident) => {
@@ -97,6 +99,40 @@ pub const BINDINGS: &[Binding] = &[
     binding!(PREVIEW, KeyCode::Char('L'), NONE, ScrollRight),
     binding!(PREVIEW, KeyCode::Char('0'), NONE, ScrollPageLeft),
     binding!(PREVIEW, KeyCode::Char('$'), NONE, ScrollPageRight),
+    // The finder overlays (§5): a plain character belongs to the query box,
+    // so it never appears here and the reducer hands it over instead (§13.1).
+    binding!(BOTH, KeyCode::Char('p'), CONTROL, OpenFiles),
+    // Line editing.
+    binding!(FINDER, KeyCode::Left, NONE, FinderCursorLeft),
+    binding!(FINDER, KeyCode::Right, NONE, FinderCursorRight),
+    binding!(FINDER, KeyCode::Char('b'), CONTROL, FinderCursorLeft),
+    binding!(FINDER, KeyCode::Char('f'), CONTROL, FinderCursorRight),
+    binding!(FINDER, KeyCode::Char('b'), ALT, FinderCursorWordLeft),
+    binding!(FINDER, KeyCode::Char('f'), ALT, FinderCursorWordRight),
+    binding!(FINDER, KeyCode::Home, NONE, FinderCursorHome),
+    binding!(FINDER, KeyCode::End, NONE, FinderCursorEnd),
+    binding!(FINDER, KeyCode::Char('a'), CONTROL, FinderCursorHome),
+    binding!(FINDER, KeyCode::Char('e'), CONTROL, FinderCursorEnd),
+    binding!(FINDER, KeyCode::Backspace, NONE, FinderDeleteBack),
+    binding!(FINDER, KeyCode::Char('h'), CONTROL, FinderDeleteBack),
+    binding!(FINDER, KeyCode::Delete, NONE, FinderDeleteForward),
+    binding!(FINDER, KeyCode::Char('d'), CONTROL, FinderDeleteForward),
+    binding!(FINDER, KeyCode::Char('w'), CONTROL, FinderDeleteWord),
+    binding!(FINDER, KeyCode::Char('u'), CONTROL, FinderDeleteToStart),
+    binding!(FINDER, KeyCode::Char('k'), CONTROL, FinderDeleteToEnd),
+    // The list.
+    binding!(FINDER, KeyCode::Up, NONE, FinderSelectUp),
+    binding!(FINDER, KeyCode::Down, NONE, FinderSelectDown),
+    binding!(FINDER, KeyCode::Char('p'), CONTROL, FinderSelectUp),
+    binding!(FINDER, KeyCode::Char('n'), CONTROL, FinderSelectDown),
+    binding!(FINDER, KeyCode::PageUp, NONE, FinderPageUp),
+    binding!(FINDER, KeyCode::PageDown, NONE, FinderPageDown),
+    // The preview beside the list scrolls with the readline-ish `Alt+j/k`.
+    binding!(FINDER, KeyCode::Char('j'), ALT, ScrollDown),
+    binding!(FINDER, KeyCode::Char('k'), ALT, ScrollUp),
+    binding!(FINDER, KeyCode::Enter, NONE, FinderAccept),
+    binding!(FINDER, KeyCode::Esc, NONE, Back),
+    binding!(FINDER, KeyCode::Char('c'), CONTROL, Back),
 ];
 
 /// Resolves a key press in a context.
@@ -406,6 +442,98 @@ mod tests {
             command_for(Context::Preview, press(KeyCode::Char('H'))),
             Some(Command::ScrollLeft)
         );
+    }
+
+    #[test]
+    fn the_finder_holds_every_line_editing_key_the_specification_asks_for() {
+        let expected: &[(KeyCode, KeyModifiers, Command)] = &[
+            (KeyCode::Left, NONE, Command::FinderCursorLeft),
+            (KeyCode::Right, NONE, Command::FinderCursorRight),
+            (KeyCode::Char('b'), CONTROL, Command::FinderCursorLeft),
+            (KeyCode::Char('f'), CONTROL, Command::FinderCursorRight),
+            (KeyCode::Char('b'), ALT, Command::FinderCursorWordLeft),
+            (KeyCode::Char('f'), ALT, Command::FinderCursorWordRight),
+            (KeyCode::Home, NONE, Command::FinderCursorHome),
+            (KeyCode::End, NONE, Command::FinderCursorEnd),
+            (KeyCode::Char('a'), CONTROL, Command::FinderCursorHome),
+            (KeyCode::Char('e'), CONTROL, Command::FinderCursorEnd),
+            (KeyCode::Backspace, NONE, Command::FinderDeleteBack),
+            (KeyCode::Char('h'), CONTROL, Command::FinderDeleteBack),
+            (KeyCode::Delete, NONE, Command::FinderDeleteForward),
+            (KeyCode::Char('d'), CONTROL, Command::FinderDeleteForward),
+            (KeyCode::Char('w'), CONTROL, Command::FinderDeleteWord),
+            (KeyCode::Char('u'), CONTROL, Command::FinderDeleteToStart),
+            (KeyCode::Char('k'), CONTROL, Command::FinderDeleteToEnd),
+            (KeyCode::Up, NONE, Command::FinderSelectUp),
+            (KeyCode::Down, NONE, Command::FinderSelectDown),
+            (KeyCode::Char('p'), CONTROL, Command::FinderSelectUp),
+            (KeyCode::Char('n'), CONTROL, Command::FinderSelectDown),
+            (KeyCode::PageUp, NONE, Command::FinderPageUp),
+            (KeyCode::PageDown, NONE, Command::FinderPageDown),
+            (KeyCode::Char('j'), ALT, Command::ScrollDown),
+            (KeyCode::Char('k'), ALT, Command::ScrollUp),
+            (KeyCode::Enter, NONE, Command::FinderAccept),
+            (KeyCode::Esc, NONE, Command::Back),
+            (KeyCode::Char('c'), CONTROL, Command::Back),
+        ];
+        for (code, mods, command) in expected {
+            assert_eq!(
+                command_for(Context::Finder, KeyEvent::new(*code, *mods)),
+                Some(*command),
+                "{code:?} {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_list_from_the_panes_and_moves_the_row_inside_it() {
+        for context in [Context::Tree, Context::Preview] {
+            assert_eq!(
+                command_for(context, ctrl(KeyCode::Char('p'))),
+                Some(Command::OpenFiles),
+                "{context:?}"
+            );
+        }
+        // The specification keeps `Ctrl+P` as readline's "one row up" inside
+        // the overlay: the selection moves, the overlay does not (§5, ※).
+        assert_eq!(
+            command_for(Context::Finder, ctrl(KeyCode::Char('p'))),
+            Some(Command::FinderSelectUp)
+        );
+        assert_eq!(
+            command_for(Context::Finder, ctrl(KeyCode::Char('n'))),
+            Some(Command::FinderSelectDown)
+        );
+    }
+
+    #[test]
+    fn keys_the_query_box_would_undo_or_break_a_line_with_are_unbound() {
+        // The text box library binds these by default and would undo, redo or
+        // break a line with them; yagura answers every key before the library
+        // ever sees one, so none of them may resolve to a command (§13.1).
+        for code in [
+            KeyCode::Char('z'),
+            KeyCode::Char('y'),
+            KeyCode::Char('j'),
+            KeyCode::Char('m'),
+        ] {
+            assert_eq!(
+                command_for(Context::Finder, ctrl(code)),
+                None,
+                "{code:?} with control"
+            );
+        }
+        // `Enter` is answered, but as the one command it means in here: take
+        // the row. It never reaches the library, which would add a line.
+        assert_eq!(
+            command_for(Context::Finder, press(KeyCode::Enter)),
+            Some(Command::FinderAccept)
+        );
+        // A plain letter belongs to the query box, so the finder table has
+        // none of them at all.
+        for code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('h')] {
+            assert_eq!(command_for(Context::Finder, press(code)), None, "{code:?}");
+        }
     }
 
     #[test]

@@ -41,7 +41,13 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
             // One step back: close an overlay, otherwise move the focus from
             // the preview to the tree.
             if state.overlay != Overlay::None {
+                let was_finder = state.overlay.is_finder();
                 state.overlay = Overlay::None;
+                // The pane the overlay drew over is the one showing again,
+                // so it is the height a page of scrolling means now (§13.2).
+                if was_finder {
+                    crate::app::reduce::sync_preview_viewport(state);
+                }
             } else if state.focus == Focus::Preview {
                 state.focus = Focus::Tree;
             }
@@ -91,6 +97,26 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         | Command::Reload
         | Command::CyclePreviewMode
         | Command::ToggleBaseline => {}
+        // The finder overlays own their commands, and the root reducer routes
+        // them there before they can reach this match (§13).
+        Command::OpenFiles
+        | Command::FinderAccept
+        | Command::FinderSelectUp
+        | Command::FinderSelectDown
+        | Command::FinderPageUp
+        | Command::FinderPageDown
+        | Command::FinderInsert(_)
+        | Command::FinderCursorLeft
+        | Command::FinderCursorRight
+        | Command::FinderCursorWordLeft
+        | Command::FinderCursorWordRight
+        | Command::FinderCursorHome
+        | Command::FinderCursorEnd
+        | Command::FinderDeleteBack
+        | Command::FinderDeleteForward
+        | Command::FinderDeleteWord
+        | Command::FinderDeleteToStart
+        | Command::FinderDeleteToEnd => {}
     }
     state.tree.refresh();
     effects
@@ -187,6 +213,62 @@ fn reveal(state: &mut AppState, target: NodeId, effects: &mut Vec<Effect>) {
     for id in chain.into_iter().rev() {
         expand_node(state, id, effects);
     }
+}
+
+/// Enter in the finder: the path becomes the selection and the preview (§4).
+///
+/// The file may sit behind listings the tree has not asked for yet, so the
+/// jump is kept until every directory on the way has answered.
+pub fn jump_to(state: &mut AppState, rel: PathBuf, effects: &mut Vec<Effect>) {
+    // A row the filter hides is a row the reader cannot watch the jump land
+    // on, so the filter comes off and says so (§4).
+    if state.tree.changed_only {
+        toggle_changed_only(state);
+        state.set_info("the changed files filter was turned off");
+    }
+    state.tree.jump = Some(rel);
+    finish_jump(state, effects);
+}
+
+/// Works towards the pending jump, asking for the listing that stands in the
+/// way of the file; called again for every listing that arrives.
+fn finish_jump(state: &mut AppState, effects: &mut Vec<Effect>) {
+    let Some(rel) = state.tree.jump.clone() else {
+        return;
+    };
+    // The deepest directory the model already knows on the way down to it.
+    let mut prefix = PathBuf::new();
+    let mut deepest = state.tree.model.root_id();
+    for component in rel.components() {
+        prefix.push(component);
+        match state.tree.model.lookup(&prefix) {
+            Some(node) => deepest = node,
+            None => break,
+        }
+    }
+    if let Some(target) = state.tree.model.lookup(&rel) {
+        state.tree.jump = None;
+        reveal(state, target, effects);
+        state.tree.select(target);
+        state.tree.refresh();
+        if let Some(index) = state.tree.selected_index() {
+            state.tree.scroll_into_view(index);
+        }
+        return;
+    }
+    // The listing that is in hand has no such path: the file is gone, and
+    // waiting for a listing that will never arrive would keep the jump
+    // pending forever.
+    if state
+        .tree
+        .model
+        .get(deepest)
+        .is_some_and(|entry| entry.loaded)
+    {
+        state.tree.jump = None;
+        return;
+    }
+    expand_node(state, deepest, effects);
 }
 
 /// `c`: only what changed, with the way to it left walkable (design §11.3).
@@ -390,6 +472,11 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     }
     restore_selection(state, selected_row);
     state.tree.refresh();
+    // A jump a finder asked for waits for the listings on its way in, and a
+    // listing is the only thing that can bring it any closer (§4).
+    if state.tree.jump.is_some() {
+        finish_jump(state, &mut effects);
+    }
     effects
 }
 

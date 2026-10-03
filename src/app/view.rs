@@ -2,8 +2,8 @@
 
 use ratatui::Frame;
 
-use crate::app::state::AppState;
-use crate::features::{preview, statusbar, tree};
+use crate::app::state::{AppState, Overlay};
+use crate::features::{finder, preview, statusbar, tree};
 use crate::ui::layout;
 
 /// Draws one frame. Reads the state only, never writes it (invariant I7).
@@ -20,6 +20,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     preview::view::render_header(frame, areas.header, state);
     preview::view::render_body(frame, areas.preview, state);
     statusbar::view::render(frame, areas.status, state);
+    if matches!(state.overlay, Overlay::Files | Overlay::Grep) {
+        finder::view::render(frame, area, state);
+    }
 }
 
 #[cfg(test)]
