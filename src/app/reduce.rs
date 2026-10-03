@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
 use crate::app::action::{Action, StatAnswer};
 use crate::app::command::Command;
 use crate::app::effect::Effect;
-use crate::app::state::{AppState, Focus};
+use crate::app::state::{AppState, Focus, Overlay};
 use crate::core::baseline::{Built, ChangedEntry, Kind, Phase};
 use crate::features::{finder, help, preview, tree, watch};
 use crate::input::keymap;
@@ -70,6 +71,8 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Action::MouseWheel { delta } => mouse_wheel(state, *delta),
+        Action::MouseClick { column } => mouse_click(state, *column),
         Action::Key(_) | Action::Quit => {
             if matches!(action, Action::Quit) {
                 state.quitting = true;
@@ -207,6 +210,69 @@ fn selected_file(state: &AppState) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(state.tree.model.rel_of(node)?))
+}
+
+/// The wheel turned: five lines of the pane of the moment, and one row a
+/// time in the list an overlay draws (§4).
+fn mouse_wheel(state: &mut AppState, delta: isize) -> Vec<Effect> {
+    let down = delta >= 0;
+    let command = match state.overlay {
+        Overlay::None if state.focus == Focus::Preview => {
+            state.preview.scroll_by(delta);
+            return Vec::new();
+        }
+        Overlay::None => {
+            if down {
+                Command::MoveDown
+            } else {
+                Command::MoveUp
+            }
+        }
+        Overlay::Help => {
+            if down {
+                Command::HelpDown
+            } else {
+                Command::HelpUp
+            }
+        }
+        Overlay::Watch => {
+            if down {
+                Command::WatchDown
+            } else {
+                Command::WatchUp
+            }
+        }
+        Overlay::Files | Overlay::Grep => {
+            if down {
+                Command::FinderSelectDown
+            } else {
+                Command::FinderSelectUp
+            }
+        }
+    };
+    // A list moves one row at a time; the whole notch is spent that way,
+    // and every list clamps at its own ends.
+    let mut effects = Vec::new();
+    for _ in 0..delta.unsigned_abs() {
+        effects.extend(reduce(state, Action::Command(command)));
+    }
+    effects
+}
+
+/// A click brings the pane it fell on the focus. An overlay keeps the
+/// screen to itself for now: it is closed the way it was opened (§4).
+fn mouse_click(state: &mut AppState, column: u16) -> Vec<Effect> {
+    if !matches!(state.overlay, Overlay::None) {
+        return Vec::new();
+    }
+    let area = Rect::new(0, 0, state.size.0, state.size.1);
+    let areas = crate::ui::layout::compute(area, state.tree_visible);
+    state.focus = if state.tree_visible && column < areas.tree.right() {
+        Focus::Tree
+    } else {
+        Focus::Preview
+    };
+    Vec::new()
 }
 
 /// Commands the preview pane handles itself.
@@ -428,6 +494,7 @@ mod tests {
     use crate::app::command::Command;
     use crate::app::state::{Config, Focus, Overlay, PreviewMode};
     use crate::cli::{BaselineKind, IconStyle};
+    use crate::input::task::WHEEL_LINES;
 
     fn state() -> AppState {
         AppState::new(
@@ -672,6 +739,153 @@ mod tests {
         let before = fingerprint(&state);
         reduce(&mut state, key(KeyCode::Char('j')));
         assert_eq!(fingerprint(&state), before);
+    }
+
+    /// A document long enough for the wheel to have somewhere to go.
+    fn scrollable() -> crate::core::preview::Doc {
+        crate::core::preview::Doc {
+            rel: PathBuf::from("a.txt"),
+            name: "a.txt".into(),
+            size: 1,
+            language: crate::core::preview::Language::Text,
+            lines: (0..50).map(|index| format!("line {index}")).collect(),
+            truncated: false,
+            too_large: false,
+            spans: Vec::new(),
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+            diff: None,
+            diff_note: None,
+            formatted: false,
+        }
+    }
+
+    #[test]
+    fn the_wheel_moves_the_focused_pane_five_lines_a_notch() {
+        let mut state = state();
+        state.focus = Focus::Preview;
+        state.preview.viewport = 10;
+        state.preview.set_doc(scrollable());
+
+        reduce(&mut state, Action::MouseWheel { delta: WHEEL_LINES });
+        assert_eq!(state.preview.scroll_line, 5, "five lines a notch");
+        reduce(
+            &mut state,
+            Action::MouseWheel {
+                delta: -WHEEL_LINES,
+            },
+        );
+        assert_eq!(state.preview.scroll_line, 0, "and five back");
+    }
+
+    /// The tree with rows under the root, so the selection has somewhere to
+    /// go.
+    fn tree_with_rows() -> AppState {
+        use crate::core::fsmodel::{DirEntry, NodeKind};
+        let mut state = state();
+        let root = state.tree.model.root_id();
+        let rows: Vec<DirEntry> = (0..10)
+            .map(|index| DirEntry {
+                name: format!("f{index}.txt").into(),
+                kind: NodeKind::File,
+                link_target: None,
+                unreadable: false,
+            })
+            .collect();
+        state.tree.model.merge_children(root, &rows);
+        state.tree.bump();
+        state.tree.expand(root);
+        state.tree.refresh();
+        state.tree.selected = state.tree.model.lookup(std::path::Path::new("f0.txt"));
+        state.focus = Focus::Tree;
+        state
+    }
+
+    #[test]
+    fn the_wheel_walks_the_selection_when_the_tree_has_the_focus() {
+        let mut state = tree_with_rows();
+
+        reduce(&mut state, Action::MouseWheel { delta: WHEEL_LINES });
+        let selected = state
+            .tree
+            .selected
+            .and_then(|node| state.tree.model.get(node));
+        assert_eq!(
+            selected.map(|entry| entry.name.to_string_lossy().into_owned()),
+            Some("f5.txt".to_owned()),
+            "five rows down"
+        );
+
+        reduce(
+            &mut state,
+            Action::MouseWheel {
+                delta: -WHEEL_LINES,
+            },
+        );
+        let selected = state
+            .tree
+            .selected
+            .and_then(|node| state.tree.model.get(node));
+        assert_eq!(
+            selected.map(|entry| entry.name.to_string_lossy().into_owned()),
+            Some("f0.txt".to_owned()),
+            "five rows back"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_list_an_overlay_is_showing() {
+        let mut state = state();
+        state.overlay = Overlay::Help;
+
+        reduce(&mut state, Action::MouseWheel { delta: WHEEL_LINES });
+        assert!(state.help.scroll > 0, "the help list moved");
+    }
+
+    #[test]
+    fn a_click_brings_the_pane_it_fell_on_the_focus() {
+        let mut state = state();
+        state.focus = Focus::Preview;
+        reduce(&mut state, Action::MouseClick { column: 0 });
+        assert_eq!(state.focus, Focus::Tree, "the tree lives at the left");
+
+        let tree_width = crate::ui::layout::tree_width(state.size.0);
+        reduce(&mut state, Action::MouseClick { column: tree_width });
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "the preview begins where the tree ends"
+        );
+    }
+
+    #[test]
+    fn a_click_with_the_tree_hidden_finds_no_tree() {
+        let mut state = state();
+        state.tree_visible = false;
+        state.focus = Focus::Tree;
+
+        reduce(&mut state, Action::MouseClick { column: 0 });
+        assert_eq!(
+            state.focus,
+            Focus::Preview,
+            "the whole width belongs to the preview"
+        );
+    }
+
+    #[test]
+    fn a_click_while_an_overlay_is_up_is_ignored() {
+        let mut state = state();
+        state.overlay = Overlay::Help;
+        state.focus = Focus::Tree;
+
+        reduce(&mut state, Action::MouseClick { column: 60 });
+        assert_eq!(
+            state.focus,
+            Focus::Tree,
+            "the overlay keeps the screen to itself"
+        );
     }
 
     fn entry(status: crate::core::fsmodel::Status, at: SystemTime) -> ChangedEntry {

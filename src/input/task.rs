@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEventKind};
 use tokio::sync::mpsc::Sender;
 
 use crate::app::Action;
@@ -27,6 +27,10 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 
 /// How often the pump looks at the flag while an editor has the terminal.
 const SUSPENDED_POLL: Duration = Duration::from_millis(20);
+
+/// Lines one notch of the wheel moves: faster than the three a terminal
+/// usually shows, which is what "the wheel feels slow" comes down to.
+pub const WHEEL_LINES: isize = 5;
 
 /// Whether an editor owns the terminal input right now.
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -101,8 +105,20 @@ pub fn translate(event: Event) -> Option<Action> {
         Event::Key(key) => is_press(&key).then_some(Action::Key(key)),
         Event::Resize(width, height) => Some(Action::Resize { width, height }),
         Event::Paste(text) => Some(Action::Paste(text)),
-        // Mouse and focus events are ignored: the mouse is never captured so
-        // that the user can still select text with it.
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(Action::MouseWheel {
+                delta: -WHEEL_LINES,
+            }),
+            MouseEventKind::ScrollDown => Some(Action::MouseWheel { delta: WHEEL_LINES }),
+            MouseEventKind::Down(MouseButton::Left) => Some(Action::MouseClick {
+                column: mouse.column,
+            }),
+            // Drags, the other buttons and motion without a button are the
+            // terminal's own: with the mouse captured, selecting text is a
+            // Shift+drag and nothing here stands in its way.
+            _ => None,
+        },
+        // Focus events are not ours.
         _ => None,
     }
 }
@@ -150,14 +166,63 @@ mod tests {
     }
 
     #[test]
-    fn mouse_and_focus_events_are_dropped() {
-        let mouse = Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 0,
-            row: 0,
+    fn the_wheel_and_the_button_become_actions() {
+        let wheel_up = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 4,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(translate(mouse).is_none());
+        assert!(
+            matches!(
+                translate(wheel_up),
+                Some(Action::MouseWheel { delta }) if delta == -WHEEL_LINES
+            ),
+            "a notch up scrolls up"
+        );
+        let wheel_down = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(
+                translate(wheel_down),
+                Some(Action::MouseWheel { delta }) if delta == WHEEL_LINES
+            ),
+            "a notch down scrolls down"
+        );
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 42,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(translate(click), Some(Action::MouseClick { column: 42 })),
+            "a click says where it fell"
+        );
+    }
+
+    #[test]
+    fn drags_other_buttons_and_focus_events_are_dropped() {
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            let mouse = Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(translate(mouse).is_none(), "{kind:?} is not ours");
+        }
         assert!(translate(Event::FocusGained).is_none());
     }
 

@@ -7,6 +7,8 @@ pub mod signals;
 
 use std::io::{self, Write};
 
+use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 /// Escape sequences that put the terminal into the state the UI needs.
@@ -14,6 +16,20 @@ const INIT_SEQUENCE: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?25l";
 
 /// The exact inverse of [`INIT_SEQUENCE`].
 const RESTORE_SEQUENCE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
+
+/// The mouse, as much of it as the platform takes.
+///
+/// `execute!` writes the escape sequences on a pty and sets the console
+/// input mode on Windows, where the sequences alone do not make the
+/// terminal send mouse events. Losing this leaves the keyboard untouched,
+/// so a failure is not worth refusing to start or to restore over.
+fn capture_mouse<W: Write>(writer: &mut W) {
+    let _ = execute!(writer, EnableMouseCapture);
+}
+
+fn release_mouse<W: Write>(writer: &mut W) {
+    let _ = execute!(writer, DisableMouseCapture);
+}
 
 /// Restores the terminal on drop and on demand.
 ///
@@ -31,6 +47,9 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(err);
         }
+        // After raw mode on purpose: letting the mouse go later puts the
+        // input mode back as it was now, with raw mode still in it.
+        capture_mouse(writer);
         Ok(Self { active: true })
     }
 
@@ -40,6 +59,7 @@ impl TerminalGuard {
             return Ok(());
         }
         self.active = false;
+        release_mouse(writer);
         write_all(writer, RESTORE_SEQUENCE)?;
         disable_raw_mode()
     }
@@ -70,6 +90,7 @@ impl Drop for TerminalGuard {
 /// loop and cannot reach its guard. Writing the sequence twice is harmless.
 pub fn restore_stdout() {
     let mut stdout = io::stdout();
+    release_mouse(&mut stdout);
     let _ = write_all(&mut stdout, RESTORE_SEQUENCE);
     let _ = disable_raw_mode();
 }
@@ -78,6 +99,10 @@ pub fn restore_stdout() {
 /// design §14.2): raw mode comes off, the alternate screen goes away, and the
 /// cursor comes back so the child draws where the reader can see it.
 pub fn pause<W: Write>(writer: &mut W) -> io::Result<()> {
+    // The mouse first: letting it go puts the input mode back as it was
+    // when it was captured - with raw mode still on - so raw mode has to
+    // come off after that to be the one that stays off.
+    release_mouse(writer);
     let _ = disable_raw_mode();
     write_all(writer, RESTORE_SEQUENCE)
 }
@@ -87,7 +112,9 @@ pub fn pause<W: Write>(writer: &mut W) -> io::Result<()> {
 /// the whole frame rather than only what changed.
 pub fn resume<W: Write>(writer: &mut W) -> io::Result<()> {
     enable_raw_mode()?;
-    write_all(writer, INIT_SEQUENCE)
+    write_all(writer, INIT_SEQUENCE)?;
+    capture_mouse(writer);
+    Ok(())
 }
 
 /// Installs a panic hook that restores the terminal before the default hook
@@ -109,7 +136,9 @@ fn write_all<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use ratatui::crossterm::cursor::{Hide, Show};
-    use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+    use ratatui::crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    };
     use ratatui::crossterm::execute;
     use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 
@@ -138,14 +167,30 @@ mod tests {
         assert!(has(RESTORE_SEQUENCE, b"\x1b[?25h"));
     }
 
+    /// What [`capture_mouse`] and [`release_mouse`] stand for on a pty: the
+    /// same modes, on and off. On Windows `execute!` takes the console API
+    /// path instead, where a writer sees nothing.
+    #[test]
+    fn the_mouse_capture_turns_the_same_modes_on_and_off() {
+        use ratatui::crossterm::Command;
+        let mut on = String::new();
+        EnableMouseCapture.write_ansi(&mut on).expect("ansi");
+        let mut off = String::new();
+        DisableMouseCapture.write_ansi(&mut off).expect("ansi");
+        for mode in ["?1000", "?1002", "?1003", "?1015", "?1006"] {
+            assert!(on.contains(&format!("{mode}h")), "{on:?}");
+            assert!(off.contains(&format!("{mode}l")), "{off:?}");
+        }
+    }
+
     /// The half of the editor handover that needs no console: the sequence
     /// that gives the terminal to the child (§8, design §14.2).
     #[test]
     fn a_pause_hands_the_terminal_over_to_the_child() {
         let mut buffer: Vec<u8> = Vec::new();
         pause(&mut buffer).expect("pause");
-        assert_eq!(
-            buffer, RESTORE_SEQUENCE,
+        assert!(
+            buffer.ends_with(RESTORE_SEQUENCE),
             "the child draws on the real screen"
         );
     }
@@ -156,13 +201,14 @@ mod tests {
     #[test]
     #[ignore = "needs a console to put into raw mode"]
     fn a_pause_and_a_resume_bring_the_terminal_back() {
-        let mut buffer: Vec<u8> = Vec::new();
-        pause(&mut buffer).expect("pause");
-        resume(&mut buffer).expect("resume");
-        assert_eq!(
-            buffer,
-            [RESTORE_SEQUENCE, INIT_SEQUENCE].concat(),
-            "restore first, then the alternate screen again"
+        let mut before: Vec<u8> = Vec::new();
+        pause(&mut before).expect("pause");
+        assert!(before.ends_with(RESTORE_SEQUENCE), "restore first");
+        let mut after: Vec<u8> = Vec::new();
+        resume(&mut after).expect("resume");
+        assert!(
+            after.starts_with(INIT_SEQUENCE),
+            "then the alternate screen again"
         );
     }
 

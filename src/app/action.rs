@@ -27,6 +27,10 @@ pub enum Action {
     Resize { width: u16, height: u16 },
     /// A bracketed paste.
     Paste(String),
+    /// The mouse wheel turned: a signed number of lines, five to a notch.
+    MouseWheel { delta: isize },
+    /// The left button went down on a column of the terminal.
+    MouseClick { column: u16 },
     /// One second clock tick. Carries the time so that the reducer stays pure.
     Tick { now: SystemTime },
     /// Leave the application.
