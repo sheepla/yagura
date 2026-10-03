@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::app::action::Action;
 use crate::app::command::Command;
 use crate::app::effect::Effect;
-use crate::app::state::{AppState, Focus, Overlay};
+use crate::app::state::{AppState, Focus, Overlay, PreviewMode};
 use crate::core::preview::{Doc, PreviewError};
 use crate::core::text;
 use crate::features::preview::state::PreviewStatus;
@@ -210,14 +210,40 @@ pub fn reload(state: &mut AppState) -> Vec<Effect> {
     vec![load(state, rel, generation)]
 }
 
+/// Reads the shown file again when the finder and the pane have traded who
+/// reads it: the overlay reads the file as content whatever the reader has
+/// chosen (design §13.2), and the pane draws the mode the reader kept
+/// (spec §7). The two bodies are built differently, so the mode the pane
+/// needs is the mode that has to be read.
+pub fn reload_for_the_mode(state: &mut AppState) -> Vec<Effect> {
+    if state.preview.path.is_none() || state.preview.mode == mode_for(state) {
+        return Vec::new();
+    }
+    reload(state)
+}
+
+/// The mode a load is asked for: content while the finder is over the pane,
+/// the reader's own mode otherwise.
+fn mode_for(state: &AppState) -> PreviewMode {
+    if state.overlay.is_finder() {
+        PreviewMode::Content
+    } else {
+        state.preview_mode
+    }
+}
+
 /// The load the pane needs for what it is currently showing: the mode says
 /// whether a diff is drawn, and the build number pins which baseline it is
 /// drawn against (§8, §9.2).
-fn load(state: &AppState, rel: PathBuf, generation: u64) -> Effect {
+fn load(state: &mut AppState, rel: PathBuf, generation: u64) -> Effect {
+    let mode = mode_for(state);
+    // What was asked for is remembered, so the pane knows when the file has
+    // to be read again in another mode (§13.2).
+    state.preview.mode = mode;
     Effect::LoadPreview {
         rel,
         generation,
-        mode: state.preview_mode,
+        mode,
         baseline_ver: state.baseline.ver,
     }
 }

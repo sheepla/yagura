@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::app::state::PreviewMode;
 use crate::core::preview::{Doc, Language};
 use crate::features::finder::grep::{GrepMatch, display_ranges};
 
@@ -45,6 +46,9 @@ pub struct PreviewState {
     pub path: Option<PathBuf>,
     /// Incremented on every new target so that late results can be dropped.
     pub generation: u64,
+    /// The mode the current read was asked for, so that a reader whose mode
+    /// the finder traded away knows the file has to be read again (§13.2).
+    pub mode: PreviewMode,
     /// What the pane is showing.
     pub preview: PreviewStatus,
     /// The document, shared with the renderer and with a reload in flight.

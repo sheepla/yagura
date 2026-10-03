@@ -28,8 +28,9 @@ pub enum Focus {
 }
 
 /// How the preview shows the difference to the baseline.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PreviewMode {
+    #[default]
     Content,
     InlineDiff,
     SideBySide,

@@ -114,6 +114,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 effects.extend(tree::reducer::reduce(state, &action));
             }
             effects.extend(preview::reducer::sync_target(state));
+            // Closing an overlay with `Esc` lands here rather than with the
+            // finder, so the pane gets the mode it is kept in back too.
+            effects.extend(preview::reducer::reload_for_the_mode(state));
             effects
         }
         // Changes on disk belong to the tree, and the watch log keeps them as
@@ -153,6 +156,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
 fn finder_effects(state: &mut AppState, action: &Action) -> Vec<Effect> {
     let mut effects = finder::reducer::reduce(state, action);
     effects.extend(preview::reducer::sync_target(state));
+    // The overlay reads the file as content; when it lets go of the pane
+    // (or takes it over), the mode the reader kept is read back (§13.2).
+    effects.extend(preview::reducer::reload_for_the_mode(state));
     effects
 }
 
@@ -950,6 +956,79 @@ mod tests {
             Effect::LoadPreview { mode, .. } => assert_eq!(mode, PreviewMode::Content),
             other => panic!("expected a reload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_finder_reads_content_and_the_reader_gets_the_diff_back() {
+        let mut state = state();
+        state.preview_mode = PreviewMode::InlineDiff;
+
+        reduce(&mut state, Action::Command(Command::OpenFiles));
+        let generation = state.finder.scan_gen;
+        let effects = reduce(
+            &mut state,
+            Action::FilesFound {
+                generation,
+                rels: vec![PathBuf::from("a.rs")],
+            },
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LoadPreview {
+                    mode: PreviewMode::Content,
+                    ..
+                }
+            )),
+            "the overlay reads the file as content (design §13.2): {effects:?}"
+        );
+
+        let effects = reduce(&mut state, Action::Command(Command::FinderAccept));
+        assert_eq!(state.overlay, Overlay::None);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LoadPreview {
+                    mode: PreviewMode::InlineDiff,
+                    ..
+                }
+            )),
+            "the pane gets the mode the reader kept back (spec §7): {effects:?}"
+        );
+        assert_eq!(state.preview.mode, PreviewMode::InlineDiff);
+    }
+
+    #[test]
+    fn escaping_the_finder_gives_the_diff_back_too() {
+        use std::ffi::OsStr;
+
+        use crate::core::fsmodel::NodeKind;
+
+        let mut state = state();
+        state.preview_mode = PreviewMode::InlineDiff;
+        let root = state.tree.model.root_id();
+        let file = state
+            .tree
+            .model
+            .insert_child(root, OsStr::new("a.rs"), NodeKind::File);
+        state.tree.selected = Some(file);
+        // The overlay has been reading the file the tree points at.
+        state.overlay = Overlay::Files;
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        state.preview.mode = PreviewMode::Content;
+
+        let effects = reduce(&mut state, Action::Command(Command::Back));
+        assert_eq!(state.overlay, Overlay::None);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LoadPreview {
+                    mode: PreviewMode::InlineDiff,
+                    ..
+                }
+            )),
+            "Esc lands with the pane: {effects:?}"
+        );
     }
 
     #[test]
