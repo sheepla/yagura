@@ -49,7 +49,7 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|head|snapshot] [--no-ignore] 
 | `[PATH]` | The directory to show. Defaults to the working directory. |
 | `--icons text` | ASCII icons: `d` for a directory, `f` for a file, `l` for a symlink. |
 | `--icons nerd` | Nerd Font glyphs. |
-| `--baseline auto\|head\|snapshot` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and the start of the session outside of one, and `head` outside a repository is an argument error. |
+| `--baseline auto\|head\|snapshot` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and the start of the session outside of one, and `head` outside a repository is an argument error. Without `git` installed anywhere, the baseline says `git not found` and the session snapshot stands in. |
 | `--no-ignore` | Ignore `.gitignore`, the global excludes and the user ignores. |
 | `--log PATH` | Write a `tracing` log to a file. Also read from `YAGURA_LOG`. Nothing is logged without it. |
 
@@ -104,6 +104,10 @@ In the finder overlay, opened with `Ctrl+p` (the file finder) or `Ctrl+g`
 | `Alt+j` / `Alt+k` | Scroll the preview beside the list |
 | `Enter` | Take the row: the tree walks to it and the preview shows it |
 | `Esc` / `Ctrl+c` | Close the overlay and go back to the panes |
+
+`Esc` and `Alt` are told apart by the terminal, and not every terminal tells
+them apart: one that sends an Alt key as `Esc` followed by a letter closes the
+overlay instead of scrolling the preview beside the list.
 
 Editing a query is the usual line editing: `←` / `→` or `Ctrl+b` / `Ctrl+f`,
 `Alt+b` / `Alt+f` by word, `Home` / `End` or `Ctrl+a` / `Ctrl+e`, `Backspace` /
@@ -187,7 +191,9 @@ scan keeps at most 1 MiB per file and 64 MiB in total, favouring source files
 and small ones: a file past that budget answers with no baseline, so its row
 says `?` and the preview says `no baseline`. A change made before the program
 started cannot be noticed at all, because there is no earlier state to compare
-with.
+with. Without `git` on the machine there is no `HEAD` to compare against
+either: the status bar says `git not found`, `B` has nothing to swap to and
+`auto` stands on the snapshot.
 
 The finder overlay keeps one list of every path below the root. Opening it
 starts a walk that runs beside the interface and answers in chunks, so the list
@@ -232,3 +238,10 @@ cargo test
 `tests/ui_snapshot.rs` holds the frame snapshots, `tests/tree_properties.rs`
 the invariants of the tree, `tests/performance.rs` the size of a large
 directory. Review a snapshot with `cargo insta review`.
+
+`tests/benchmarks.rs` holds the measurements behind the performance table of
+the specification. They are ignored by default, because they take their time:
+
+```sh
+cargo test --release --test benchmarks -- --ignored --nocapture
+```

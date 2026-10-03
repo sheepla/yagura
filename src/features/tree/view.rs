@@ -325,6 +325,41 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_file_keeps_its_row_and_says_d_beside_the_name() {
+        let mut state = state_with_tree();
+        let root = state.tree.model.root_id();
+        let gone = state
+            .tree
+            .model
+            .merge_children(root, &entries(&[("gone.txt", NodeKind::File)]));
+        state.tree.model.get_mut(gone[0]).expect("gone").status = Status::Deleted;
+        state.tree.bump();
+        state.tree.refresh();
+        let text = draw(&state);
+        assert!(text.contains("f gone.txt D"), "{text}");
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_carries_a_bang() {
+        let mut state = state_with_tree();
+        let root = state.tree.model.root_id();
+        let locked = state
+            .tree
+            .model
+            .merge_children(root, &entries(&[("locked", NodeKind::Dir)]));
+        state
+            .tree
+            .model
+            .get_mut(locked[0])
+            .expect("locked")
+            .unreadable = true;
+        state.tree.bump();
+        state.tree.refresh();
+        let text = draw(&state);
+        assert!(text.contains("d locked !"), "{text}");
+    }
+
+    #[test]
     fn file_names_never_reach_the_terminal_unescaped() {
         let mut state = state_with_tree();
         let root = state.tree.model.root_id();

@@ -138,6 +138,34 @@ mod tests {
         assert!(has(RESTORE_SEQUENCE, b"\x1b[?25h"));
     }
 
+    /// The half of the editor handover that needs no console: the sequence
+    /// that gives the terminal to the child (§8, design §14.2).
+    #[test]
+    fn a_pause_hands_the_terminal_over_to_the_child() {
+        let mut buffer: Vec<u8> = Vec::new();
+        pause(&mut buffer).expect("pause");
+        assert_eq!(
+            buffer, RESTORE_SEQUENCE,
+            "the child draws on the real screen"
+        );
+    }
+
+    /// The round trip, which puts the console into raw mode and therefore
+    /// needs one: `cargo test -- --ignored` on a real terminal (§12, design
+    /// §14.2).
+    #[test]
+    #[ignore = "needs a console to put into raw mode"]
+    fn a_pause_and_a_resume_bring_the_terminal_back() {
+        let mut buffer: Vec<u8> = Vec::new();
+        pause(&mut buffer).expect("pause");
+        resume(&mut buffer).expect("resume");
+        assert_eq!(
+            buffer,
+            [RESTORE_SEQUENCE, INIT_SEQUENCE].concat(),
+            "restore first, then the alternate screen again"
+        );
+    }
+
     #[test]
     fn restore_is_idempotent() {
         let mut buffer: Vec<u8> = Vec::new();

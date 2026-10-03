@@ -545,6 +545,37 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_worktree_answers_as_a_repository() {
+        // The `.git` of a linked worktree is a file naming a git directory
+        // elsewhere; `rev-parse --git-dir` reads through it, and the status
+        // of the linked working tree is the status of that repository (§12).
+        let main = repo();
+        let holder = tempfile::tempdir().expect("temp dir");
+        let linked = holder.path().join("linked");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "side",
+                linked.to_str().expect("a path git can read"),
+                "HEAD",
+            ],
+        );
+        assert!(
+            linked.join(".git").is_file(),
+            "a linked worktree carries a gitfile rather than a directory"
+        );
+
+        probe(&linked).expect("the linked worktree is a repository");
+
+        std::fs::write(linked.join("a.txt"), "changed\n").expect("write");
+        let head = build(&linked, now()).expect("build");
+        assert_eq!(head.changed[Path::new("a.txt")].status, Status::Modified);
+    }
+
+    #[test]
     fn modified_added_and_deleted_files_appear_with_head_oid() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").expect("write");

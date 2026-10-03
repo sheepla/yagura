@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: make the release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 ||
+            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes
+
+  archive:
+    name: binary for ${{ matrix.target }}
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      # Every target here is the target of the runner itself, so nothing has
+      # to be installed and nothing is cross compiled.
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          stage="yagura-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/yagura" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar czf "$stage.tar.gz" "$stage"
+          echo "ASSET=$stage.tar.gz" >> "$GITHUB_ENV"
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "yagura-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/yagura.exe" $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
+          "ASSET=$stage.zip" >> $env:GITHUB_ENV
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$ASSET" --repo "${{ github.repository }}" --clobber

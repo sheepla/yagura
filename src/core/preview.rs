@@ -378,21 +378,47 @@ pub fn load_doc_with(
     let name = path
         .file_name()
         .map_or_else(|| path.as_os_str().to_owned(), OsString::from);
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let body = match retry_if_gone(|| read_body(path)) {
+        Ok(body) => body,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // The file is really gone: its baseline stands in for it, and
+            // without one the caller hears the NotFound (§6, §12).
             let doc = deleted_doc(rel, name, baseline, want_diff).ok_or(err)?;
             return Ok(doc);
         }
         Err(err) => return Err(err.into()),
     };
+    Ok(assemble(
+        rel,
+        name,
+        body.size,
+        body.link_target,
+        body.bytes,
+        body.truncated,
+        baseline,
+    ))
+}
+
+/// What one attempt at reading the file brings back.
+struct Body {
+    size: u64,
+    link_target: Option<PathBuf>,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// The metadata and the body of the file, up to the byte limit.
+///
+/// Every step can lose a race with a writer, which is why the whole attempt is
+/// the unit that gets retried.
+fn read_body(path: &Path) -> std::io::Result<Body> {
+    let metadata = std::fs::symlink_metadata(path)?;
     let link_target = if metadata.file_type().is_symlink() {
         std::fs::read_link(path).ok()
     } else {
         None
     };
-    let stat = std::fs::metadata(path)?;
-    let size = stat.len();
+    let size = std::fs::metadata(path)?.len();
 
     // One byte past the limit is enough to know that the limit was passed.
     let mut bytes = Vec::new();
@@ -403,15 +429,22 @@ pub fn load_doc_with(
     if truncated {
         bytes.truncate(MAX_BYTES);
     }
-    Ok(assemble(
-        rel,
-        name,
+    Ok(Body {
         size,
         link_target,
         bytes,
         truncated,
-        baseline,
-    ))
+    })
+}
+
+/// Reads once more when the path went away in the middle of the first
+/// attempt (§12): a writer that works by rename puts the file back between
+/// two of the steps, while a file that is really gone fails both times.
+fn retry_if_gone<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    match attempt() {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => attempt(),
+        outcome => outcome,
+    }
 }
 
 /// Builds the document of bytes read from a file that still exists.
@@ -796,6 +829,46 @@ mod tests {
             PreviewError::Io(err) => text::os_error(err),
         };
         assert!(message.contains("not found"), "{message}");
+    }
+
+    #[test]
+    fn a_file_that_came_back_after_the_first_attempt_is_read_the_second_time() {
+        let mut attempts = 0;
+        let body = retry_if_gone(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(String::from("body"))
+            }
+        })
+        .expect("the second attempt answers");
+        assert_eq!(body, "body");
+        assert_eq!(attempts, 2, "one retry and no more");
+    }
+
+    #[test]
+    fn a_file_that_is_really_gone_fails_after_one_more_attempt() {
+        let mut attempts = 0;
+        let err = retry_if_gone::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .expect_err("still gone");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 2, "one retry and no more");
+    }
+
+    #[test]
+    fn a_failure_that_is_not_a_missing_file_is_not_retried() {
+        let mut attempts = 0;
+        let err = retry_if_gone::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("denied");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1, "only a missing file earns a second attempt");
     }
 
     #[test]

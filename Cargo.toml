@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "A TUI file tree watcher for observing what a coding agent is doing"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0"

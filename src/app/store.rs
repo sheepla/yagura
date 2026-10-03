@@ -1,7 +1,7 @@
 //! The store loop: actions in, state changed, frame out.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -227,13 +227,21 @@ async fn edit<B: Backend>(
     crate::input::task::resume();
     terminal_back?;
     if let Err(err) = outcome {
-        store.state.set_error(format!(
-            "cannot open {}: {}",
-            text::sanitize_os(path.as_os_str()),
-            text::os_error(&err)
-        ));
+        store.state.set_error(cannot_open(&path, &err));
     }
     Ok(())
+}
+
+/// What the status bar says when the editor will not start (§8).
+///
+/// The path is the user's, so it reaches the terminal through the same
+/// sanitizing as every other text.
+fn cannot_open(path: &Path, err: &io::Error) -> String {
+    format!(
+        "cannot open {}: {}",
+        text::sanitize_os(path.as_os_str()),
+        text::os_error(err)
+    )
 }
 
 /// Waits for the child while the state keeps up with the filesystem; no frame
@@ -310,6 +318,15 @@ mod tests {
             TestBackend::new(width, height),
         )
         .expect("store")
+    }
+
+    #[test]
+    fn an_editor_that_will_not_start_says_why_with_the_path_sanitized() {
+        let message = cannot_open(
+            Path::new("/root/weird\u{1b}[2J.rs"),
+            &io::Error::from(io::ErrorKind::NotFound),
+        );
+        assert_eq!(message, "cannot open /root/weird\u{241b}[2J.rs: not found");
     }
 
     #[test]
