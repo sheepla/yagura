@@ -6,13 +6,14 @@ preview on the right, and puts the mode, the position in the tree and anything
 that needs saying on the status bar.
 
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
-M1 (the static file tree), M2 (the preview content, with syntax highlighting),
-M3 (the git baseline and the diff), M4 (real-time updates: watching, batches,
-refreshed statistics, the head check, ages and the `F`/`c`/`o` keys), M5 (the
-snapshot baseline, for watching a directory that is not a repository), M6
-(the file finder overlay, `Ctrl+P`), M7 (the grep finder, `Ctrl+G`) and M8 (the
-watch log, `w`, the help overlay, `?`, and the editor launch, `e`). The markdown
-rendering is not implemented yet.
+M1 (the static file tree), M2 (the preview content, with syntax highlighting and
+the markdown layout), M3 (the git baseline and the diff), M4 (real-time updates:
+watching, batches, refreshed statistics, the head check, ages and the `F`/`c`/`o`
+keys), M5 (the snapshot baseline, for watching a directory that is not a
+repository), M6 (the file finder overlay, `Ctrl+P`), M7 (the grep finder,
+`Ctrl+G`), M8 (the watch log, `w`, the help overlay, `?`, and the editor launch,
+`e`) and M9 (the edge cases, the performance numbers, the README, CI and the
+release workflow).
 
 ## Status
 
@@ -20,14 +21,14 @@ rendering is not implemented yet.
 | --- | --- | --- |
 | M0 | CLI, terminal lifecycle, Flux loop, theme, layout, store loop | done |
 | M1 | `core/fsmodel`, lazy tree, sorting, scrolling, icons, status bar, keymap | done |
-| M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting | done |
+| M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting, the markdown layout | done |
 | M3 | git baseline, diff engine, InlineDiff / SideBySide, `M/A/D` in the tree, `+N -N ~N` counts, hunk keys | done |
 | M4 | filesystem watching, batched updates, statistics refresh, `.git` head check, ages and freshness, follow / filter / order | done |
 | M5 | snapshot baseline, startup scan with its budgets, `auto` fallback outside a repository, the `B` swap | done |
 | M6 | file finder overlay: query box, parallel walk, fuzzy match, preview beside the list, the jump into the tree | done |
 | M7 | grep finder overlay: `rg --json`, debounce and generations, hits as `path:line: text`, the lit line in the preview | done |
 | M8 | watch log overlay (`w`), help overlay (`?`), editor launch (`e`) | done |
-| M9 | edge cases, performance and benchmarks, README, CI, release | not started |
+| M9 | edge cases, performance and benchmarks, README, CI, release | done |
 
 ## Build
 
@@ -173,6 +174,16 @@ load the first time something is highlighted rather than at startup, and the
 run stops at 10,000 lines or 150 ms, with `highlight truncated` in the header
 when it does.
 
+A markdown file in the content view is laid out instead of being parsed token
+by token: `pulldown-cmark` walks it and the pane draws a heading in its own
+color, a list with `•` and numbers, a quote behind a bar, a code block dim and
+a link as its text alone, while a table or an image stays as it was written.
+The layout keeps one line per source line, so the gutter's numbers, a grep hit
+and the scroll position still name the line they named before, and the pane
+wraps the result to its width when it draws, rather than cutting it short. A
+diff is computed against the file as it stands on disk, so it is never drawn
+through the layout.
+
 Inside a git repository the baseline is the `HEAD` commit. `git status` names
 the files that differ, `git cat-file` reads the versions to compare against,
 and each of them gets a status letter in the tree (`M`, `A`, `D`) and a count
@@ -237,7 +248,10 @@ cargo test
 
 `tests/ui_snapshot.rs` holds the frame snapshots, `tests/tree_properties.rs`
 the invariants of the tree, `tests/performance.rs` the size of a large
-directory. Review a snapshot with `cargo insta review`.
+directory. Review a snapshot with `cargo insta review`. The snapshots
+themselves are local files rather than repository files, so a fresh checkout
+has nothing to compare against and CI lets `insta` write them
+(`INSTA_UPDATE=always`) instead of failing.
 
 `tests/benchmarks.rs` holds the measurements behind the performance table of
 the specification. They are ignored by default, because they take their time:

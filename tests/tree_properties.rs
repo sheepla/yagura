@@ -484,6 +484,7 @@ fn a_selection_asks_the_preview_for_a_file_and_for_nothing_else() {
                 link_target: None,
                 diff: None,
                 diff_note: None,
+                formatted: false,
             }),
         },
     );

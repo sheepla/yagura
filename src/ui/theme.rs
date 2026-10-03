@@ -25,6 +25,20 @@ pub enum Role {
     PreviewHeader,
     PreviewPlaceholder,
     PreviewGutter,
+    /// A heading of a markdown document (§9.4).
+    PreviewHeading,
+    /// Emphasis or strong emphasis in markdown.
+    PreviewEmphasis,
+    /// A quoted line in markdown.
+    PreviewQuote,
+    /// A line inside a markdown code block.
+    PreviewCodeBlock,
+    /// `code` inside a markdown line.
+    PreviewInlineCode,
+    /// The text of a markdown link, with no address behind it.
+    PreviewLink,
+    /// Markdown kept as it was written: tables, images, rules (§9.4).
+    PreviewDim,
     /// The part of a preview line a grep hit lands on (§13.3).
     MatchHighlight,
     /// A line only the current file has, in a diff.
@@ -113,7 +127,15 @@ fn color(role: Role) -> Color {
         Role::PreviewHeader | Role::StatusInfo | Role::StatusModified | Role::TreeFresh => {
             Color::Yellow
         }
-        Role::PreviewPlaceholder | Role::PreviewGutter => Color::DarkGray,
+        Role::PreviewPlaceholder
+        | Role::PreviewGutter
+        | Role::PreviewCodeBlock
+        | Role::PreviewQuote
+        | Role::PreviewDim => Color::DarkGray,
+        Role::PreviewHeading => Color::Blue,
+        Role::PreviewEmphasis => Color::Reset,
+        Role::PreviewInlineCode => Color::Green,
+        Role::PreviewLink => Color::Cyan,
         Role::DiffAdded | Role::StatusAdded => Color::Green,
         Role::DiffRemoved => Color::Red,
         Role::StatusMode => Color::Black,
@@ -131,7 +153,8 @@ fn color(role: Role) -> Color {
 /// set.
 fn modifiers(role: Role) -> Modifier {
     match role {
-        Role::PaneTitle => Modifier::BOLD,
+        Role::PaneTitle | Role::PreviewHeading | Role::PreviewEmphasis => Modifier::BOLD,
+        Role::PreviewLink => Modifier::UNDERLINED,
         Role::TreeSelected | Role::MatchHighlight => Modifier::REVERSED | Modifier::BOLD,
         Role::TreeDirectory => Modifier::BOLD,
         Role::TreeFresh => Modifier::BOLD,
@@ -140,6 +163,9 @@ fn modifiers(role: Role) -> Modifier {
         Role::StatusMuted
         | Role::PreviewPlaceholder
         | Role::PreviewGutter
+        | Role::PreviewCodeBlock
+        | Role::PreviewQuote
+        | Role::PreviewDim
         | Role::TooSmall
         | Role::PaneBorder
         | Role::SyntaxComment => Modifier::DIM,
@@ -160,7 +186,8 @@ fn modifiers(role: Role) -> Modifier {
         | Role::SyntaxString
         | Role::SyntaxNumber
         | Role::SyntaxType
-        | Role::SyntaxFunction => Modifier::empty(),
+        | Role::SyntaxFunction
+        | Role::PreviewInlineCode => Modifier::empty(),
     }
 }
 
@@ -182,6 +209,10 @@ mod tests {
             Role::SyntaxNumber,
             Role::SyntaxType,
             Role::SyntaxFunction,
+            Role::PreviewHeading,
+            Role::PreviewQuote,
+            Role::PreviewInlineCode,
+            Role::PreviewLink,
             Role::MatchHighlight,
         ] {
             let style = theme.style(role);

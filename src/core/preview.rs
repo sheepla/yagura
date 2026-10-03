@@ -261,6 +261,10 @@ pub struct Doc {
     pub diff: Option<Diff>,
     /// Why a diff mode fell back to the plain content.
     pub diff_note: Option<DiffNote>,
+    /// The lines were laid out for reading rather than copied from the file,
+    /// so the pane wraps them to its width instead of scrolling sideways
+    /// (§9.4).
+    pub formatted: bool,
 }
 
 impl Doc {
@@ -388,15 +392,7 @@ pub fn load_doc_with(
         }
         Err(err) => return Err(err.into()),
     };
-    Ok(assemble(
-        rel,
-        name,
-        body.size,
-        body.link_target,
-        body.bytes,
-        body.truncated,
-        baseline,
-    ))
+    Ok(assemble(rel, name, body, baseline, !want_diff))
 }
 
 /// What one attempt at reading the file brings back.
@@ -448,15 +444,22 @@ fn retry_if_gone<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io:
 }
 
 /// Builds the document of bytes read from a file that still exists.
+///
+/// `content` says the reader wants the file as it reads, not as a diff: that
+/// is the view a markdown document is laid out for (§9.4).
 fn assemble(
     rel: &Path,
     name: OsString,
-    size: u64,
-    link_target: Option<PathBuf>,
-    bytes: Vec<u8>,
-    truncated: bool,
+    body: Body,
     baseline: Option<Baseline>,
+    content: bool,
 ) -> Doc {
+    let Body {
+        size,
+        link_target,
+        bytes,
+        truncated,
+    } = body;
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         let kind = binary_kind(&name.to_string_lossy().to_lowercase());
         return Doc {
@@ -474,6 +477,7 @@ fn assemble(
             link_target,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
     }
 
@@ -497,14 +501,28 @@ fn assemble(
         link_target,
         diff: None,
         diff_note: None,
+        formatted: false,
     };
     // The pane draws colour, so a document is not ready until it has its
     // spans. This is the one place that runs on the worker anyway.
-    crate::core::highlight::fill(&mut doc);
+    style(&mut doc, content);
     if let Some(baseline) = baseline {
         apply_diff(&mut doc, baseline);
     }
     doc
+}
+
+/// Gives the document its spans: markdown is laid out as structure in the
+/// content view (§9.4), everything else goes through the language.
+///
+/// A diff draws every row in the colour of the side it came from, so it
+/// never asks for either.
+fn style(doc: &mut Doc, content: bool) {
+    if content && doc.language == Language::Markdown && !doc.lines.is_empty() {
+        crate::core::markdown::format(doc);
+    } else {
+        crate::core::highlight::fill(doc);
+    }
 }
 
 /// The document of a file that no longer exists: the baseline stands in for
@@ -545,6 +563,7 @@ fn deleted_doc(
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         });
     }
     let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
@@ -566,8 +585,9 @@ fn deleted_doc(
         link_target: None,
         diff: None,
         diff_note: None,
+        formatted: false,
     };
-    crate::core::highlight::fill(&mut doc);
+    style(&mut doc, !want_diff);
     if want_diff {
         if truncated || doc.too_large {
             // A baseline line is never drawn as it is, but past the limits
@@ -1041,6 +1061,33 @@ mod tests {
         let path = write(&dir, "notes.txt", b"just words\n");
         let doc = load_doc(&path, Path::new("notes.txt")).expect("doc");
         assert!(doc.spans.is_empty());
+    }
+
+    #[test]
+    fn a_markdown_file_is_laid_out_for_reading() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(
+            &dir,
+            "README.md",
+            b"# Title\n\n- one\n\n```rust\nfn main() {}\n```\n",
+        );
+        let doc = load_doc(&path, Path::new("README.md")).expect("doc");
+        assert_eq!(doc.language, Language::Markdown);
+        assert!(doc.formatted);
+        // One line in, one line out, so the gutter still counts the file.
+        assert_eq!(doc.lines.len(), 7, "{:#?}", doc.lines);
+        assert_eq!(doc.lines[0], "Title");
+        assert_eq!(doc.lines[2], "• one");
+        assert_eq!(doc.lines[5], "fn main() {}");
+        assert_eq!(doc.spans.len(), doc.lines.len());
+
+        // A diff is computed against the file as it stands on disk, so it is
+        // never drawn through the layout (§9.4).
+        let doc = load_doc_with(&path, Path::new("README.md"), Some(Baseline::Absent), true)
+            .expect("doc");
+        assert!(!doc.formatted, "a diff was laid out for reading");
+        assert!(doc.spans.is_empty());
+        assert!(doc.diff.is_some());
     }
 
     #[test]

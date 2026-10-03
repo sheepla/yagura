@@ -298,6 +298,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         }
     }
 

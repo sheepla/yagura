@@ -143,41 +143,93 @@ fn body<'a>(state: &'a AppState, mode: PreviewMode, doc: &'a Doc, area: Rect) ->
 
 /// The document as it is on disk, drawn with the meanings of each line and
 /// the hit the row is on lit up (§13.3).
+///
+/// A laid out document (§9.4) is wrapped to the pane and never scrolled
+/// sideways: its lines are already as wide as they read.
 fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     let height = state.preview.height();
     // The gutter takes five columns, and the pane keeps one column of margin.
     let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
     let marks = state.preview.marks();
     let mut lines: Vec<Line> = Vec::with_capacity(height);
-    let end = doc
-        .lines
-        .len()
-        .min(state.preview.scroll_line.saturating_add(height));
-    for index in state.preview.scroll_line..end {
+    let mut index = state.preview.scroll_line;
+    while lines.len() < height && index < doc.lines.len() {
+        let text = &doc.lines[index];
         let runs = doc.spans.get(index).map(Vec::as_slice).unwrap_or_default();
         // The hit is only ever on the line it names.
         let hit = marks
             .filter(|marks| marks.line as usize == index + 1)
             .map(|marks| marks.ranges.as_slice())
             .unwrap_or_default();
-        let mut spans = vec![Span::styled(
-            format!("{:>4} ", index + 1),
-            state.theme.style(Role::PreviewGutter),
-        )];
-        spans.extend(cut(
-            &doc.lines[index],
-            runs,
-            hit,
-            state.preview.scroll_col,
-            width,
-            &state.theme,
-        ));
-        lines.push(Line::from(spans));
+        if doc.formatted && width > 0 {
+            // Only the first row of the line carries its number: a wrapped
+            // continuation is still the same line (§9.4).
+            let mut first = true;
+            for (start, end) in wrap_ranges(text, width) {
+                if lines.len() >= height {
+                    break;
+                }
+                let gutter = if first {
+                    first = false;
+                    format!("{:>4} ", index + 1)
+                } else {
+                    " ".repeat(GUTTER_COLS)
+                };
+                let mut spans = vec![Span::styled(gutter, state.theme.style(Role::PreviewGutter))];
+                spans.extend(cut_range(text, runs, hit, start, end, &state.theme));
+                lines.push(Line::from(spans));
+            }
+        } else {
+            let mut spans = vec![Span::styled(
+                format!("{:>4} ", index + 1),
+                state.theme.style(Role::PreviewGutter),
+            )];
+            spans.extend(cut(
+                text,
+                runs,
+                hit,
+                state.preview.scroll_col,
+                width,
+                &state.theme,
+            ));
+            lines.push(Line::from(spans));
+        }
+        index += 1;
     }
     while lines.len() < height {
         lines.push(Line::default());
     }
     Text::from(lines)
+}
+
+/// The byte range of each display row of a laid out line, wrapped to `width`
+/// columns. A break lands after a space when the row has one (§9.4).
+fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
+    if line.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut rows = Vec::new();
+    let mut row_start = 0;
+    let mut used = 0;
+    let mut last_space = None;
+    for (offset, ch) in line.char_indices() {
+        let columns = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + columns > width && offset > row_start {
+            // Breaking after a space keeps the word whole; a row without one
+            // is broken where it ran out of room.
+            let break_at = last_space.filter(|&at| at > row_start).unwrap_or(offset);
+            rows.push((row_start, break_at));
+            row_start = break_at;
+            used = text::display_width(&line[break_at..offset]);
+            last_space = None;
+        }
+        if ch == ' ' {
+            last_space = Some(offset + ch.len_utf8());
+        }
+        used += columns;
+    }
+    rows.push((row_start, line.len()));
+    rows
 }
 
 /// The diff as one column: every row keeps its number and gets a `+` or a
@@ -361,12 +413,8 @@ fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
     cells
 }
 
-/// One line, cut to the pane and split by what each run of it means.
-///
-/// The gaps between runs mean nothing and are drawn as the pane's own text,
-/// so a line the reader never highlighted still comes out whole. A hit on the
-/// line lights its own part up, over whatever the language says of it
-/// (§13.3).
+/// One line, cut to a window of `width` columns starting at `from`, with an
+/// ellipsis when there is more of it than the pane can show.
 fn cut<'a>(
     line: &'a str,
     runs: &'a [highlight::Span],
@@ -376,42 +424,62 @@ fn cut<'a>(
     theme: &Theme,
 ) -> Vec<Span<'a>> {
     let window = crate::core::text::window(line, from, width);
-    // Every place the drawing can change: both ends of the window, the ends
-    // of the runs, and the ends of the hit.
-    let mut cuts = vec![window.start, window.end];
-    for run in runs {
-        cuts.push(run.start.max(window.start));
-        cuts.push(run.end.min(window.end));
+    let mut out = cut_range(line, runs, hits, window.start, window.end, theme);
+    if window.cut {
+        out.push(Span::styled("…", theme.style(Role::PreviewText)));
     }
-    for &(start, end) in hits {
-        cuts.push(start.max(window.start));
-        cuts.push(end.min(window.end));
+    out
+}
+
+/// One line, split by what each run of it means, over the byte range
+/// `[start, end)` — a window of the line, or one row of it when the pane
+/// wrapped it.
+///
+/// The gaps between runs mean nothing and are drawn as the pane's own text,
+/// so a line the reader never highlighted still comes out whole. A hit on the
+/// line lights its own part up, over whatever the language says of it
+/// (§13.3).
+fn cut_range<'a>(
+    line: &'a str,
+    runs: &'a [highlight::Span],
+    hits: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    // Every place the drawing can change: both ends of the range, the ends
+    // of the runs, and the ends of the hit.
+    let mut cuts = vec![start, end];
+    for run in runs {
+        cuts.push(run.start.max(start));
+        cuts.push(run.end.min(end));
+    }
+    for &(hit_start, hit_end) in hits {
+        cuts.push(hit_start.max(start));
+        cuts.push(hit_end.min(end));
     }
     cuts.sort_unstable();
     cuts.dedup();
     let mut out = Vec::new();
     for pair in cuts.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
-        if start >= end {
+        let (from, to) = (pair[0], pair[1]);
+        if from >= to {
             continue;
         }
         let style = if hits
             .iter()
-            .any(|&(hit_start, hit_end)| hit_start <= start && end <= hit_end)
+            .any(|&(hit_start, hit_end)| hit_start <= from && to <= hit_end)
         {
             theme.style(Role::MatchHighlight)
         } else {
             let meaning = runs
                 .iter()
-                .find(|run| run.start <= start && end <= run.end)
+                .find(|run| run.start <= from && to <= run.end)
                 .map(|run| role(run.semantic))
                 .unwrap_or(Role::PreviewText);
             theme.style(meaning)
         };
-        out.push(Span::styled(&line[start..end], style));
-    }
-    if window.cut {
-        out.push(Span::styled("…", theme.style(Role::PreviewText)));
+        out.push(Span::styled(&line[from..to], style));
     }
     out
 }
@@ -426,6 +494,13 @@ fn role(semantic: Semantic) -> Role {
         Semantic::Number => Role::SyntaxNumber,
         Semantic::Type => Role::SyntaxType,
         Semantic::Function => Role::SyntaxFunction,
+        Semantic::Heading => Role::PreviewHeading,
+        Semantic::Emphasis => Role::PreviewEmphasis,
+        Semantic::Quote => Role::PreviewQuote,
+        Semantic::CodeBlock => Role::PreviewCodeBlock,
+        Semantic::InlineCode => Role::PreviewInlineCode,
+        Semantic::Link => Role::PreviewLink,
+        Semantic::Raw => Role::PreviewDim,
     }
 }
 
@@ -580,6 +655,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -615,6 +691,80 @@ mod tests {
         assert!(!text.contains("line 10"), "{text}");
     }
 
+    /// A document the pane has laid out for reading (§9.4).
+    fn laid_out(line: &str) -> AppState {
+        let mut state = state();
+        state.preview.viewport = 4;
+        let doc = Doc {
+            rel: PathBuf::from("README.md"),
+            name: "README.md".into(),
+            size: line.len() as u64,
+            language: Language::Markdown,
+            lines: vec![line.to_owned()],
+            spans: Vec::new(),
+            truncated: false,
+            too_large: false,
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+            diff: None,
+            diff_note: None,
+            formatted: true,
+        };
+        state.preview.path = Some(doc.rel.clone());
+        state.preview.set_doc(doc);
+        state
+    }
+
+    #[test]
+    fn a_laid_out_line_wraps_and_only_its_first_row_is_numbered() {
+        let long = "word ".repeat(20);
+        let text = buffer(&laid_out(long.trim_end()));
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[1].starts_with("   1 word"), "{:?}", rows[1]);
+        assert!(
+            rows[2].starts_with("     word"),
+            "the continuation took a number of its own: {:?}",
+            rows[2]
+        );
+        assert!(rows[3].starts_with("     word"), "{:?}", rows[3]);
+        // The pane wraps it; it never cuts a laid out line short.
+        assert!(!text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn a_markdown_heading_is_drawn_in_its_own_colour() {
+        let mut state = state();
+        state.preview.viewport = 4;
+        let mut doc = Doc {
+            rel: PathBuf::from("README.md"),
+            name: "README.md".into(),
+            size: 8,
+            language: Language::Markdown,
+            lines: vec!["# Title".to_owned()],
+            spans: Vec::new(),
+            truncated: false,
+            too_large: false,
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+            diff: None,
+            diff_note: None,
+            formatted: false,
+        };
+        crate::core::markdown::format(&mut doc);
+        assert_eq!(doc.lines, vec!["Title"]);
+        state.preview.path = Some(doc.rel.clone());
+        state.preview.set_doc(doc);
+        let buffer = draw(&state);
+        let title = &buffer[(5, 1)];
+        assert_eq!(title.symbol(), "T");
+        assert_eq!(title.fg, Color::Blue);
+        assert!(title.modifier.contains(Modifier::BOLD), "not a heading");
+    }
+
     #[test]
     fn a_binary_document_shows_its_kind_and_size_instead_of_bytes() {
         let mut state = state();
@@ -633,6 +783,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         doc.lines.clear();
         state.preview.path = Some(doc.rel.clone());
@@ -660,6 +811,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -686,6 +838,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -728,6 +881,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -780,6 +934,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);
@@ -882,6 +1037,7 @@ mod tests {
             link_target: None,
             diff: Some(diff),
             diff_note: None,
+            formatted: false,
         };
         state.preview.path = Some(doc.rel.clone());
         state.preview.set_doc(doc);

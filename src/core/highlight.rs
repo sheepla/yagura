@@ -25,6 +25,20 @@ pub enum Semantic {
     Number,
     Type,
     Function,
+    /// The title line of a markdown heading (§9.4).
+    Heading,
+    /// `*emphasis*` and `**strong**` in markdown.
+    Emphasis,
+    /// The text of a quoted line, and the bar in front of it.
+    Quote,
+    /// One line inside a fenced markdown block.
+    CodeBlock,
+    /// `code` inside a markdown line.
+    InlineCode,
+    /// The text of a link, with the address left out.
+    Link,
+    /// Markdown kept as it was written: tables, images, raw HTML.
+    Raw,
 }
 
 /// A run of text inside one line, as byte offsets into that line.
@@ -275,6 +289,7 @@ mod tests {
             link_target: None,
             diff: None,
             diff_note: None,
+            formatted: false,
             spans: Vec::new(),
             highlight_truncated: false,
         }

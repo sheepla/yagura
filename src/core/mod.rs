@@ -7,5 +7,6 @@ pub mod editor;
 pub mod fsmodel;
 pub mod fswatch;
 pub mod highlight;
+pub mod markdown;
 pub mod preview;
 pub mod text;
