@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::core::diff::{Diff, MAX_DIFF_LINES, Row};
-use crate::core::highlight::Span;
+use crate::core::highlight::{Limits, Span};
 use crate::core::text::{self, sanitize};
 
 /// Bytes read from a file. Anything past this is dropped.
@@ -515,8 +515,8 @@ fn assemble(
 /// Gives the document its spans: markdown is laid out as structure in the
 /// content view (§9.4), everything else goes through the language.
 ///
-/// A diff draws every row in the colour of the side it came from, so it
-/// never asks for either.
+/// A diff keeps the runs too (§6): each row is drawn in the colour of the
+/// side it came from, with the language colouring the meaning inside it.
 fn style(doc: &mut Doc, content: bool) {
     if content && doc.language == Language::Markdown && !doc.lines.is_empty() {
         crate::core::markdown::format(doc);
@@ -640,10 +640,54 @@ fn fold_into(doc: &mut Doc, base_text: &str, current: &str) {
         doc.diff_note = Some(DiffNote::NoChanges);
         return;
     }
+    let spans = std::mem::take(&mut doc.spans);
     doc.lines = diff.rows.iter().map(row_text).collect();
-    // A diff row is coloured by its kind alone, so the runs of meaning that
-    // the highlighter found are dropped with the content lines.
-    doc.spans.clear();
+    // The language applies to the rows of a diff as much as to the content
+    // (§6), so the runs found for the file carry onto the rows that show it,
+    // and the baseline is read the same way for the rows it lost. A row of
+    // the pane's own (a fold) means nothing and keeps nothing.
+    doc.spans = if spans.is_empty() {
+        Vec::new()
+    } else {
+        let baseline_lines: Vec<String> = base_text.lines().map(str::to_owned).collect();
+        let (baseline_spans, _) =
+            crate::core::highlight::lines_of(doc.language, &baseline_lines, Limits::default());
+        let mut out = Vec::with_capacity(diff.rows.len());
+        let mut current_index = 0;
+        let mut baseline_index = 0;
+        for row in &diff.rows {
+            let runs = match row {
+                Row::Context(_) => {
+                    let runs = spans.get(current_index).cloned().unwrap_or_default();
+                    current_index += 1;
+                    baseline_index += 1;
+                    runs
+                }
+                Row::Added(_) => {
+                    let runs = spans.get(current_index).cloned().unwrap_or_default();
+                    current_index += 1;
+                    runs
+                }
+                Row::Removed(_) => {
+                    let runs = baseline_spans
+                        .get(baseline_index)
+                        .cloned()
+                        .unwrap_or_default();
+                    baseline_index += 1;
+                    runs
+                }
+                Row::Fold(count) => {
+                    // The folded lines are still lines of both sides: the
+                    // rows after them are further down both files.
+                    current_index += count;
+                    baseline_index += count;
+                    Vec::new()
+                }
+            };
+            out.push(runs);
+        }
+        out
+    };
     doc.diff_note = diff.approximated.then_some(DiffNote::Approximated);
     doc.diff = Some(diff);
 }
@@ -1231,13 +1275,17 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_drop_the_syntax_runs() {
+    fn diff_rows_keep_the_syntax_runs() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = write(&dir, "main.rs", b"fn main() {}\n");
         let baseline = Baseline::Bytes(b"fn old() {}\n".to_vec());
         let doc = load_doc_with(&path, Path::new("main.rs"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_some());
-        assert!(doc.spans.is_empty(), "colour comes from the row kind now");
+        assert_eq!(doc.spans.len(), doc.lines.len(), "every row keeps its runs");
+        assert!(
+            doc.spans.iter().any(|runs| !runs.is_empty()),
+            "the language still colours the rows (§6)"
+        );
     }
 
     #[test]

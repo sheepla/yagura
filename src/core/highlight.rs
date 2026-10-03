@@ -127,18 +127,31 @@ pub fn fill(doc: &mut Doc) {
 /// [`fill`] with the run allowed to stop early, which is what the tests use to
 /// reach the limits without a document big enough to hit them by itself.
 pub fn fill_with(doc: &mut Doc, limits: Limits) {
-    doc.spans.clear();
     doc.highlight_truncated = false;
-    if doc.binary.is_some() || doc.lines.is_empty() {
+    if doc.binary.is_some() {
+        doc.spans.clear();
         return;
     }
-    let Some(token) = syntax_token(doc.language) else {
-        return;
+    let (spans, truncated) = lines_of(doc.language, &doc.lines, limits);
+    doc.spans = spans;
+    doc.highlight_truncated = truncated;
+}
+
+/// The meaning of every one of `lines`, the way [`Doc::spans`] holds them.
+///
+/// The second half says whether the run stopped at a limit. An empty result
+/// means there was nothing to colour: no lines, or a language with no rules.
+pub fn lines_of(language: Language, lines: &[String], limits: Limits) -> (Vec<Vec<Span>>, bool) {
+    if lines.is_empty() {
+        return (Vec::new(), false);
+    }
+    let Some(token) = syntax_token(language) else {
+        return (Vec::new(), false);
     };
     let syntaxes = &*SYNTAXES;
     let Some(syntax) = syntaxes.find_syntax_by_token(token) else {
         tracing::debug!(token, "no syntax definition for this language");
-        return;
+        return (Vec::new(), false);
     };
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
@@ -147,9 +160,11 @@ pub fn fill_with(doc: &mut Doc, limits: Limits) {
     // otherwise the first file the reader opens is the one that gets cut.
     let _ = ParseState::new(syntax).parse_line("", syntaxes);
     let deadline = Instant::now() + limits.max_duration;
-    for (index, line) in doc.lines.iter().enumerate() {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut truncated = false;
+    for (index, line) in lines.iter().enumerate() {
         if index >= limits.max_lines || Instant::now() >= deadline {
-            doc.highlight_truncated = true;
+            truncated = true;
             break;
         }
         // A line at the column limit is one that was cut, or a minified line.
@@ -163,12 +178,13 @@ pub fn fill_with(doc: &mut Doc, limits: Limits) {
                 Vec::new()
             }
         };
-        doc.spans.push(spans);
+        out.push(spans);
     }
     // The limits can stop the run short, and a short `spans` would silently
     // hide colour from the view, so the untouched lines are filled in as
     // plain rather than left as a hole.
-    doc.spans.resize_with(doc.lines.len(), Vec::new);
+    out.resize_with(lines.len(), Vec::new);
+    (out, truncated)
 }
 
 /// Walks one line's scope changes, recording where each meaning begins and

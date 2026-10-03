@@ -176,7 +176,15 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
                     " ".repeat(GUTTER_COLS)
                 };
                 let mut spans = vec![Span::styled(gutter, state.theme.style(Role::PreviewGutter))];
-                spans.extend(cut_range(text, runs, hit, start, end, &state.theme));
+                spans.extend(cut_range(
+                    text,
+                    runs,
+                    hit,
+                    start,
+                    end,
+                    Role::PreviewText,
+                    &state.theme,
+                ));
                 lines.push(Line::from(spans));
             }
         } else {
@@ -190,6 +198,7 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
                 hit,
                 state.preview.scroll_col,
                 width,
+                Role::PreviewText,
                 &state.theme,
             ));
             lines.push(Line::from(spans));
@@ -235,6 +244,8 @@ fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
 /// The diff as one column: every row keeps its number and gets a `+` or a
 /// `-` in front of it, and the row is drawn in the colour of the side it
 /// came from (§9.2).
+///
+/// The language colours the meaning inside the row over that colour (§6).
 fn inline_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect) -> Text<'a> {
     let height = state.preview.height();
     let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
@@ -245,19 +256,24 @@ fn inline_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rec
         .min(state.preview.scroll_line.saturating_add(height));
     for index in state.preview.scroll_line..end {
         let (marker, role) = marker_of(rows.get(index));
-        let style = state.theme.style(role);
-        let window = text::window(&doc.lines[index], state.preview.scroll_col, width);
+        let text = &doc.lines[index];
+        let runs = doc.spans.get(index).map(Vec::as_slice).unwrap_or_default();
         let mut spans = vec![
             Span::styled(
                 format!("{:>4}", index + 1),
                 state.theme.style(Role::PreviewGutter),
             ),
-            Span::styled(marker.to_string(), style),
-            Span::styled(&doc.lines[index][window.start..window.end], style),
+            Span::styled(marker.to_string(), state.theme.style(role)),
         ];
-        if window.cut {
-            spans.push(Span::styled("…", style));
-        }
+        spans.extend(cut(
+            text,
+            runs,
+            &[],
+            state.preview.scroll_col,
+            width,
+            role,
+            &state.theme,
+        ));
         lines.push(Line::from(spans));
     }
     while lines.len() < height {
@@ -276,15 +292,16 @@ fn marker_of(row: Option<&Row>) -> (char, Role) {
     }
 }
 
-/// What one half of a split row shows.
+/// What one half of a split row shows, with the runs of meaning its text
+/// has (empty for a row the pane made up itself).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cell<'a> {
     /// The same text on both sides.
-    Shared(&'a str),
+    Shared(&'a str, &'a [highlight::Span]),
     /// A collapsed run, spelled out on both sides.
     Fold(&'a str),
     /// A line only one side has.
-    Changed(&'a str),
+    Changed(&'a str, &'a [highlight::Span]),
     /// Nothing on this side.
     Blank,
 }
@@ -299,7 +316,7 @@ fn split_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect
     let right = area.width.saturating_sub(left + 1);
     let left_text = left.saturating_sub(GUTTER_COLS as u16) as usize;
     let right_text = right.saturating_sub(GUTTER_COLS as u16) as usize;
-    let cells = side_cells(rows, &doc.lines);
+    let cells = side_cells(rows, &doc.lines, &doc.spans);
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     let start = state.preview.scroll_line;
     let end = cells.len().min(start.saturating_add(height));
@@ -317,8 +334,11 @@ fn split_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect
     Text::from(lines)
 }
 
-/// One half of a split row: the number, the marker, the window of text, and
-/// the padding that holds the other half in place.
+/// One half of a split row: the number, the marker, the window of text with
+/// its language runs, and the padding that holds the other half in place.
+///
+/// The text takes the colour of the side it came from, over whatever the
+/// language says of it (§6).
 fn cell_spans<'a>(
     state: &'a AppState,
     index: usize,
@@ -330,12 +350,13 @@ fn cell_spans<'a>(
         format!("{:>4}", index + 1),
         state.theme.style(Role::PreviewGutter),
     );
-    let (text, marker, role) = match (cell, baseline_side) {
-        (Cell::Changed(text), true) => (text, '-', Role::DiffRemoved),
-        (Cell::Changed(text), false) => (text, '+', Role::DiffAdded),
-        (Cell::Fold(text), _) => (text, ' ', Role::PreviewPlaceholder),
-        (Cell::Shared(text), _) => (text, ' ', Role::PreviewText),
-        (Cell::Blank, _) => ("", ' ', Role::PreviewText),
+    let plain: &'a [highlight::Span] = &[];
+    let (text, runs, marker, role) = match (cell, baseline_side) {
+        (Cell::Changed(text, runs), true) => (text, runs, '-', Role::DiffRemoved),
+        (Cell::Changed(text, runs), false) => (text, runs, '+', Role::DiffAdded),
+        (Cell::Fold(text), _) => (text, plain, ' ', Role::PreviewPlaceholder),
+        (Cell::Shared(text, runs), _) => (text, runs, ' ', Role::PreviewText),
+        (Cell::Blank, _) => ("", plain, ' ', Role::PreviewText),
     };
     let style = state.theme.style(role);
     if matches!(cell, Cell::Blank) {
@@ -347,11 +368,16 @@ fn cell_spans<'a>(
         ];
     }
     let window = text::window(text, state.preview.scroll_col, width);
-    let mut spans = vec![
-        gutter,
-        Span::styled(marker.to_string(), style),
-        Span::styled(&text[window.start..window.end], style),
-    ];
+    let mut spans = vec![gutter, Span::styled(marker.to_string(), style)];
+    spans.extend(cut_range(
+        text,
+        runs,
+        &[],
+        window.start,
+        window.end,
+        role,
+        &state.theme,
+    ));
     if window.cut {
         spans.push(Span::styled("…", style));
     }
@@ -368,14 +394,23 @@ fn cell_spans<'a>(
 
 /// Pairs the rows into the two columns: within a change block the two runs
 /// are matched from the top, and whatever one side has too much of keeps its
-/// own side, exactly as `Diff::side_rows` draws it.
-fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
+/// own side, exactly as `Diff::side_rows` draws it. Each cell keeps the runs
+/// of the row its text came from.
+fn side_cells<'a>(
+    rows: &'a [Row],
+    lines: &'a [String],
+    spans: &'a [Vec<highlight::Span>],
+) -> Vec<[Cell<'a>; 2]> {
+    let runs_at = |index: usize| -> &'a [highlight::Span] {
+        spans.get(index).map(Vec::as_slice).unwrap_or_default()
+    };
     let mut cells = Vec::with_capacity(rows.len());
     let mut index = 0;
     while index < rows.len() {
         match &rows[index] {
             Row::Context(line) => {
-                cells.push([Cell::Shared(line), Cell::Shared(line)]);
+                let runs = runs_at(index);
+                cells.push([Cell::Shared(line, runs), Cell::Shared(line, runs)]);
                 index += 1;
             }
             Row::Fold(_) => {
@@ -388,24 +423,27 @@ fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
                 while index < rows.len() && matches!(rows[index], Row::Removed(_) | Row::Added(_)) {
                     index += 1;
                 }
-                let mut removed: Vec<&str> = Vec::new();
-                let mut added: Vec<&str> = Vec::new();
-                for row in &rows[start..index] {
+                let mut removed: Vec<(&str, &'a [highlight::Span])> = Vec::new();
+                let mut added: Vec<(&str, &'a [highlight::Span])> = Vec::new();
+                for (row_index, row) in rows.iter().enumerate().take(index).skip(start) {
+                    let runs = runs_at(row_index);
                     match row {
-                        Row::Removed(line) => removed.push(line),
-                        Row::Added(line) => added.push(line),
+                        Row::Removed(line) => removed.push((line, runs)),
+                        Row::Added(line) => added.push((line, runs)),
                         _ => {}
                     }
                 }
                 let paired = removed.len().min(added.len());
                 for pair in 0..paired {
-                    cells.push([Cell::Changed(removed[pair]), Cell::Changed(added[pair])]);
+                    let (old, old_runs) = removed[pair];
+                    let (new, new_runs) = added[pair];
+                    cells.push([Cell::Changed(old, old_runs), Cell::Changed(new, new_runs)]);
                 }
-                for line in &removed[paired..] {
-                    cells.push([Cell::Changed(line), Cell::Blank]);
+                for &(line, runs) in &removed[paired..] {
+                    cells.push([Cell::Changed(line, runs), Cell::Blank]);
                 }
-                for line in &added[paired..] {
-                    cells.push([Cell::Blank, Cell::Changed(line)]);
+                for &(line, runs) in &added[paired..] {
+                    cells.push([Cell::Blank, Cell::Changed(line, runs)]);
                 }
             }
         }
@@ -415,18 +453,22 @@ fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
 
 /// One line, cut to a window of `width` columns starting at `from`, with an
 /// ellipsis when there is more of it than the pane can show.
+///
+/// `base` is what the parts the language says nothing of are drawn in: the
+/// pane's own text, or the colour of the side a diff row came from.
 fn cut<'a>(
     line: &'a str,
     runs: &'a [highlight::Span],
     hits: &[(usize, usize)],
     from: usize,
     width: usize,
+    base: Role,
     theme: &Theme,
 ) -> Vec<Span<'a>> {
     let window = crate::core::text::window(line, from, width);
-    let mut out = cut_range(line, runs, hits, window.start, window.end, theme);
+    let mut out = cut_range(line, runs, hits, window.start, window.end, base, theme);
     if window.cut {
-        out.push(Span::styled("…", theme.style(Role::PreviewText)));
+        out.push(Span::styled("…", theme.style(base)));
     }
     out
 }
@@ -435,16 +477,16 @@ fn cut<'a>(
 /// `[start, end)` — a window of the line, or one row of it when the pane
 /// wrapped it.
 ///
-/// The gaps between runs mean nothing and are drawn as the pane's own text,
-/// so a line the reader never highlighted still comes out whole. A hit on the
-/// line lights its own part up, over whatever the language says of it
-/// (§13.3).
+/// The gaps between runs are drawn in `base`, so a line the reader never
+/// highlighted still comes out whole. A hit on the line lights its own part
+/// up, over whatever the language says of it (§13.3).
 fn cut_range<'a>(
     line: &'a str,
     runs: &'a [highlight::Span],
     hits: &[(usize, usize)],
     start: usize,
     end: usize,
+    base: Role,
     theme: &Theme,
 ) -> Vec<Span<'a>> {
     // Every place the drawing can change: both ends of the range, the ends
@@ -476,7 +518,7 @@ fn cut_range<'a>(
                 .iter()
                 .find(|run| run.start <= from && to <= run.end)
                 .map(|run| role(run.semantic))
-                .unwrap_or(Role::PreviewText);
+                .unwrap_or(base);
             theme.style(meaning)
         };
         out.push(Span::styled(&line[from..to], style));
@@ -1064,6 +1106,31 @@ mod tests {
     }
 
     #[test]
+    fn the_language_colours_the_inside_of_a_diff_row() {
+        let mut state = diffed("fn old() {}\n", "fn main() {}\n", PreviewMode::InlineDiff);
+        // The runs the language found, standing in for the loader's: `fn` is
+        // a keyword on both rows.
+        let keyword = highlight::Span {
+            start: 0,
+            end: 2,
+            semantic: Semantic::Keyword,
+        };
+        let doc = state.preview.doc.take().expect("the doc is shown");
+        let mut doc = (*doc).clone();
+        doc.spans = doc.lines.iter().map(|_| vec![keyword]).collect();
+        state.preview.set_doc(doc);
+
+        let buffer = draw(&state);
+        // Row one is the removal, row two the addition.
+        assert_eq!(buffer[(5, 1)].symbol(), "f", "the removal text");
+        assert_eq!(buffer[(5, 1)].fg, Color::Magenta, "the keyword in it");
+        assert_eq!(buffer[(8, 1)].symbol(), "o", "past the keyword");
+        assert_eq!(buffer[(8, 1)].fg, Color::Red, "the colour of the side");
+        assert_eq!(buffer[(5, 2)].fg, Color::Magenta, "the keyword again");
+        assert_eq!(buffer[(8, 2)].fg, Color::Green, "the side of the addition");
+    }
+
+    #[test]
     fn a_fold_is_drawn_as_a_marker_row() {
         let baseline = (1..=13)
             .map(|n| format!("line{n}"))
@@ -1118,7 +1185,7 @@ mod tests {
             let diff = Diff::compute(baseline, current).expect("diff");
             // The fold texts live in the lines; nothing here compares them.
             let lines: Vec<String> = diff.rows.iter().map(|_| String::new()).collect();
-            let mine: Vec<(Option<String>, Option<String>)> = side_cells(&diff.rows, &lines)
+            let mine: Vec<(Option<String>, Option<String>)> = side_cells(&diff.rows, &lines, &[])
                 .iter()
                 .map(|[left, right]| (mark(left), mark(right)))
                 .collect();
@@ -1138,7 +1205,7 @@ mod tests {
 
         fn mark(cell: &Cell<'_>) -> Option<String> {
             match cell {
-                Cell::Shared(text) | Cell::Changed(text) => Some((*text).to_owned()),
+                Cell::Shared(text, _) | Cell::Changed(text, _) => Some((*text).to_owned()),
                 Cell::Fold(_) => Some("\u{22ef}".to_owned()),
                 Cell::Blank => None,
             }
