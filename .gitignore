@@ -1,3 +1,5 @@
 AGENTS.md
 /target
 docs
+/tests/snapshots/
+*.snap.new

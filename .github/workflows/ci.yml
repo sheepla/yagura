@@ -24,6 +24,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
+        # The frame snapshots are a local artifact, not in the repository, so
+        # insta writes them instead of failing on a fresh checkout.
+        env:
+          INSTA_UPDATE: always
         run: cargo test
 
   # Windows only has to build: its test suite is the same one the other two
