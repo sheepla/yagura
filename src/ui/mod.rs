@@ -1,5 +1,6 @@
 //! Rendering helpers shared by the panes.
 
+pub mod elapsed;
 pub mod layout;
 pub mod theme;
 

@@ -60,6 +60,9 @@ pub const BINDINGS: &[Binding] = &[
     binding!(BOTH, KeyCode::Char('t'), NONE, ToggleTree),
     binding!(BOTH, KeyCode::Char('s'), NONE, CyclePreviewMode),
     binding!(BOTH, KeyCode::Char('B'), NONE, ToggleBaseline),
+    binding!(BOTH, KeyCode::Char('F'), NONE, ToggleFollow),
+    binding!(BOTH, KeyCode::Char('c'), NONE, ToggleChangedOnly),
+    binding!(BOTH, KeyCode::Char('o'), NONE, CycleSort),
     binding!(BOTH, KeyCode::Char('r'), NONE, Reload),
     // Hunk navigation: only a diff has hunks, so the reducer ignores these
     // outside the diff modes.
@@ -178,11 +181,35 @@ mod tests {
 
     #[test]
     fn plain_and_control_keys_are_not_confused() {
-        assert_eq!(command_for(Context::Tree, press(KeyCode::Char('c'))), None);
+        assert_eq!(
+            command_for(Context::Tree, press(KeyCode::Char('c'))),
+            Some(Command::ToggleChangedOnly)
+        );
         assert_eq!(
             command_for(Context::Tree, ctrl(KeyCode::Char('c'))),
             Some(Command::Quit)
         );
+    }
+
+    #[test]
+    fn follow_changed_only_and_order_are_bound_in_both_panes() {
+        for context in [Context::Tree, Context::Preview] {
+            assert_eq!(
+                command_for(context, press(KeyCode::Char('F'))),
+                Some(Command::ToggleFollow),
+                "{context:?} F"
+            );
+            assert_eq!(
+                command_for(context, press(KeyCode::Char('c'))),
+                Some(Command::ToggleChangedOnly),
+                "{context:?} c"
+            );
+            assert_eq!(
+                command_for(context, press(KeyCode::Char('o'))),
+                Some(Command::CycleSort),
+                "{context:?} o"
+            );
+        }
     }
 
     #[test]
@@ -254,6 +281,17 @@ mod tests {
                 KeyCode::Char('B'),
                 Some(Command::ToggleBaseline),
             ),
+            (
+                Context::Tree,
+                KeyCode::Char('F'),
+                Some(Command::ToggleFollow),
+            ),
+            (
+                Context::Tree,
+                KeyCode::Char('c'),
+                Some(Command::ToggleChangedOnly),
+            ),
+            (Context::Tree, KeyCode::Char('o'), Some(Command::CycleSort)),
             (
                 Context::Preview,
                 KeyCode::Char('B'),

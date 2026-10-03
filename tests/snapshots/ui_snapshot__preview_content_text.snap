@@ -4,7 +4,7 @@ assertion_line: 103
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f README.md  9 B──────────────────────────────┐
-│▾d root                      …│   1 # yagura                                   
+│▾d root                       │   1 # yagura                                   
 │  ▸d docs                    …│                                                
 │  ▸d src                     …│                                                
 │   f README.md                │                                                

@@ -371,6 +371,17 @@ impl FsModel {
                 None => {}
             }
             for parent in ancestor_dirs(rel) {
+                // The newest age below a directory is part of its totals, so
+                // that a collapsed row knows how fresh it is without the view
+                // walking the subtree under it (design §11.1).
+                if let Some(id) = self.lookup(&parent)
+                    && let Some(node) = self.arena.get_mut(id)
+                {
+                    node.changed_at = Some(match node.changed_at {
+                        Some(earlier) => earlier.max(entry.changed_at),
+                        None => entry.changed_at,
+                    });
+                }
                 let slot = directories.entry(parent).or_insert(None);
                 *slot = match (*slot, entry.stat) {
                     (Some(Some(total)), Some(next)) => {

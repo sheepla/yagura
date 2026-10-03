@@ -4,7 +4,7 @@ assertion_line: 30
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌──────────────────────────────────────────────┐
-│▾d root                      …│                no file selected                
+│▾d root                       │                no file selected                
 │  ▸d docs                    …│                                                
 │  ▸d src                     …│                                                
 │   f README.md                │                                                

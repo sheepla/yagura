@@ -31,6 +31,14 @@ pub enum Command {
     /// Expand a directory, or move the focus to the preview.
     OpenPreview,
 
+    // The way the tree is shown.
+    /// Keep the selection on whatever changed last (design §11.4).
+    ToggleFollow,
+    /// Show only the paths that changed or were seen to change (§11.3).
+    ToggleChangedOnly,
+    /// The sibling order: by name, or by the most recent change.
+    CycleSort,
+
     // Preview scrolling.
     ScrollDown,
     ScrollUp,
@@ -50,7 +58,7 @@ pub enum Command {
     PrevHunk,
     /// Read the shown file again, keeping the scroll where it is.
     ///
-    /// Watches are not in yet, so this is the only way to pick up a file that
-    /// changed on disk.
+    /// A watch picks up a change on its own; this is for the case where it
+    /// did not, and for a look at a file nothing has watched yet.
     Reload,
 }

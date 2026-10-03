@@ -4,7 +4,7 @@ assertion_line: 149
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f README.md───────────────────────────────────┐
-│▾d root                      …│ cannot read this file                          
+│▾d root                       │ cannot read this file                          
 │  ▸d docs                    …│                                                
 │  ▸d src                     …│                                                
 │   f README.md                │                                                

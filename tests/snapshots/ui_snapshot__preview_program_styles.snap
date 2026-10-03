@@ -7,7 +7,7 @@ fg:darkgray+dim | bold+dim | fg:darkgray+dim | bold+dim | fg:darkgray+dim
 fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:yellow | default | fg:blue | default
 fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | default | fg:yellow | default | fg:magenta | default | fg:cyan | default | fg:darkgray+dim | default
 fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | fg:blue+bold | fg:darkgray+dim | default
-fg:darkgray+dim | reversed+bold | fg:darkgray+reversed+bold+dim | reversed+bold | default | fg:darkgray+dim | default
+fg:darkgray+dim | reversed+bold | fg:darkgray+reversed+bold+dim | reversed+bold | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default
 fg:darkgray+dim | default | fg:darkgray+dim | default

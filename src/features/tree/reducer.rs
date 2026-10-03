@@ -66,6 +66,10 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         Command::ToggleExpand => toggle_selected(state, &mut effects),
         Command::OpenPreview => open_selected(state, &mut effects),
 
+        Command::ToggleFollow => toggle_follow(state, &mut effects),
+        Command::ToggleChangedOnly => toggle_changed_only(state),
+        Command::CycleSort => cycle_sort(state),
+
         // The preview pane owns the scroll commands, the reload and the jumps
         // between hunks, and the root reducer owns the baseline toggle and the
         // mode cycle; the tree only has to not claim them, so that the root
@@ -130,6 +134,80 @@ fn follow_selection(state: &mut AppState) {
     }
     // A new generation marks the pending load as the current one.
     state.preview.generation = state.preview.generation.wrapping_add(1);
+}
+
+/// `F`: the selection follows the changes instead of the reader's hand.
+///
+/// Turning the mode on goes to the newest change straight away, so the key
+/// does something the first time it is pressed (design §11.4).
+fn toggle_follow(state: &mut AppState, effects: &mut Vec<Effect>) {
+    state.follow = !state.follow;
+    if state.follow {
+        apply_follow(state, effects);
+    }
+}
+
+/// Moves the selection onto the most recently changed file and lets the
+/// preview follow it (design §11.4).
+fn apply_follow(state: &mut AppState, effects: &mut Vec<Effect>) {
+    if !state.follow {
+        return;
+    }
+    let Some(rel) = newest_change(state) else {
+        return;
+    };
+    let Some(target) = state.tree.model.lookup(&rel) else {
+        return;
+    };
+    reveal(state, target, effects);
+    state.tree.select(target);
+    follow_selection(state);
+}
+
+/// The path that changed last, ties going to the one that sorts last so that
+/// two runs of the same state pick the same row.
+fn newest_change(state: &AppState) -> Option<PathBuf> {
+    state
+        .baseline
+        .changed
+        .iter()
+        .max_by_key(|(_, entry)| entry.changed_at)
+        .map(|(rel, _)| rel.clone())
+}
+
+/// Opens the way to a node: every directory above it, root first, so that
+/// the row the caller is about to select is a row that exists.
+fn reveal(state: &mut AppState, target: NodeId, effects: &mut Vec<Effect>) {
+    let mut chain = Vec::new();
+    let mut current = state.tree.model.get(target).and_then(|entry| entry.parent);
+    while let Some(id) = current {
+        chain.push(id);
+        current = state.tree.model.get(id).and_then(|entry| entry.parent);
+    }
+    for id in chain.into_iter().rev() {
+        expand_node(state, id, effects);
+    }
+}
+
+/// `c`: only what changed, with the way to it left walkable (design §11.3).
+fn toggle_changed_only(state: &mut AppState) {
+    state.tree.changed_only = !state.tree.changed_only;
+    state.tree.bump();
+    state.tree.refresh();
+    // The selection may have been on a row the filter took away; the row
+    // closest to the top is as good a place to carry on from as any.
+    if state.tree.selected_index().is_none() {
+        state.tree.select_first();
+    }
+}
+
+/// `o`: the other sibling order, applied to the whole tree at once.
+fn cycle_sort(state: &mut AppState) {
+    let mode = match state.tree.sort {
+        SortMode::Name => SortMode::Recent,
+        SortMode::Recent => SortMode::Name,
+    };
+    resort_all(state, mode);
 }
 
 fn expand_selected(state: &mut AppState, effects: &mut Vec<Effect>) {
@@ -374,6 +452,7 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
     let mut effects = Vec::new();
     let mut relists = BTreeSet::new();
     let mut stats = BTreeSet::new();
+    let mut touched = BTreeSet::new();
     let mut head_may_have_moved = false;
     let mut ignore_changed = false;
     let mut preview_changed = false;
@@ -391,7 +470,7 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
             // changed, so every one of them has to be made again (§7.3).
             ignore_changed = true;
         }
-        stamp(state, rel, at);
+        stamp(state, rel, at, &mut touched);
         // A change to the contents keeps the row it has; anything that adds
         // or takes a row away, or names a path the tree has never seen, has
         // to be looked up in the listing again.
@@ -452,6 +531,18 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
     if preview_changed {
         effects.extend(crate::features::preview::reducer::reload(state));
     }
+    // The rows themselves only move when the order or the filter has
+    // something to say about the times just written into them.
+    if !touched.is_empty() && (state.tree.sort == SortMode::Recent || state.tree.changed_only) {
+        if state.tree.sort == SortMode::Recent {
+            for dir in &touched {
+                sort_children(&mut state.tree.model, *dir, SortMode::Recent);
+            }
+        }
+        state.tree.bump();
+    }
+    apply_follow(state, &mut effects);
+    state.tree.refresh();
     effects
 }
 
@@ -567,17 +658,23 @@ fn is_ignore_file(rel: &Path) -> bool {
 /// Records when a path was last seen to change (spec, `LastChanged`).
 ///
 /// The directories above it are stamped as well, so a collapsed row knows
-/// how fresh it is without the view walking the subtree below it.
-fn stamp(state: &mut AppState, rel: &Path, at: SystemTime) {
+/// how fresh it is without the view walking the subtree below it, and each
+/// one is reported in `touched` so that the caller can reorder them.
+fn stamp(state: &mut AppState, rel: &Path, at: SystemTime, touched: &mut BTreeSet<NodeId>) {
     if let Some(entry) = state.baseline.changed.get_mut(rel) {
         entry.changed_at = at;
     }
     let mut dir = rel;
     loop {
-        if let Some(node) = state.tree.model.lookup(dir)
-            && let Some(node) = state.tree.model.get_mut(node)
-        {
-            node.changed_at = Some(at);
+        if let Some(id) = state.tree.model.lookup(dir) {
+            let mut is_dir = false;
+            if let Some(node) = state.tree.model.get_mut(id) {
+                node.changed_at = Some(at);
+                is_dir = node.is_expandable();
+            }
+            if is_dir {
+                touched.insert(id);
+            }
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -612,7 +709,8 @@ mod tests {
     use super::*;
     use crate::app::state::Config;
     use crate::cli::{BaselineKind, IconStyle};
-    use crate::core::fsmodel::{DirEntry, NodeKind};
+    use crate::core::baseline::ChangedEntry;
+    use crate::core::fsmodel::{DirEntry, NodeKind, Status};
 
     fn state() -> AppState {
         AppState::new(
@@ -1003,5 +1101,168 @@ mod tests {
             Some("src".to_owned())
         );
         assert_eq!(state.tree.selected_index(), Some(1), "the same row");
+    }
+
+    /// One path the baseline says differs, seen at `at`.
+    fn differs(state: &mut AppState, rel: &str, at: SystemTime) {
+        state.baseline.changed.insert(
+            PathBuf::from(rel),
+            ChangedEntry {
+                status: Status::Modified,
+                changed_at: at,
+                stat: None,
+            },
+        );
+    }
+
+    /// The path of a node, as the tree holds it.
+    fn rel_of(state: &AppState, node: NodeId) -> Option<PathBuf> {
+        state.tree.model.get(node).map(|entry| entry.rel.clone())
+    }
+
+    /// The rows in view, indented the way the pane draws them.
+    fn names(state: &AppState) -> Vec<String> {
+        state
+            .tree
+            .visible
+            .iter()
+            .map(|row| {
+                let node = state.tree.model.get(row.node).expect("node");
+                format!(
+                    "{}{}",
+                    "  ".repeat(row.depth as usize),
+                    node.name.to_string_lossy()
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn follow_takes_the_selection_to_the_newest_change_and_opens_the_way() {
+        let mut state = populated();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        differs(&mut state, "README.md", at());
+        differs(&mut state, "docs/guide.md", at() + Duration::from_secs(5));
+        state.tree.collapse(docs);
+        state.tree.refresh();
+
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleFollow));
+
+        assert!(state.follow);
+        let selected = state.tree.selected.expect("a selection");
+        assert_eq!(
+            rel_of(&state, selected),
+            Some(PathBuf::from("docs/guide.md"))
+        );
+        assert!(
+            state.tree.is_expanded(docs),
+            "the way to the change was closed"
+        );
+        assert_eq!(
+            state.preview.path,
+            Some(PathBuf::from("docs/guide.md")),
+            "the preview follows the selection"
+        );
+    }
+
+    #[test]
+    fn a_following_selection_moves_to_whatever_changed_last() {
+        let mut state = populated();
+        differs(&mut state, "README.md", at());
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleFollow));
+        let first = state.tree.selected.expect("a selection");
+        assert_eq!(rel_of(&state, first), Some(PathBuf::from("README.md")));
+
+        let later = at() + Duration::from_secs(5);
+        differs(&mut state, "docs/guide.md", later);
+        on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            later,
+        );
+
+        let second = state.tree.selected.expect("a selection");
+        assert_eq!(rel_of(&state, second), Some(PathBuf::from("docs/guide.md")));
+    }
+
+    #[test]
+    fn c_shows_only_what_changed_and_carries_the_selection_out_of_the_way() {
+        let mut state = populated();
+        state.baseline.phase = Phase::Ready;
+        let readme = state
+            .tree
+            .model
+            .lookup(Path::new("README.md"))
+            .expect("README");
+        state.tree.select(readme);
+
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleChangedOnly));
+
+        assert!(state.tree.changed_only);
+        assert_eq!(names(&state), vec!["root"], "nothing differs yet");
+        assert_eq!(
+            state.tree.selected,
+            Some(state.tree.model.root_id()),
+            "the selection was on a row the filter took away"
+        );
+
+        differs(&mut state, "docs/guide.md", at());
+        crate::app::reduce::apply_changed(&mut state);
+        assert_eq!(names(&state), vec!["root", "  docs", "    guide.md"]);
+
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleChangedOnly));
+
+        assert!(!state.tree.changed_only);
+        assert_eq!(
+            names(&state),
+            vec!["root", "  docs", "    guide.md", "  src", "  README.md"],
+            "the whole tree came back"
+        );
+    }
+
+    #[test]
+    fn o_switches_the_sibling_order_between_name_and_recency() {
+        let mut state = populated();
+        let docs = state.tree.model.lookup(Path::new("docs")).expect("docs");
+        state.tree.model.merge_children(
+            docs,
+            &[
+                entry("guide.md", NodeKind::File),
+                entry("aaa.md", NodeKind::File),
+            ],
+        );
+        sort_children(&mut state.tree.model, docs, SortMode::Name);
+        state.tree.bump();
+        state.tree.refresh();
+        assert_eq!(names(&state)[2], "    aaa.md", "by name");
+
+        let aaa = state
+            .tree
+            .model
+            .lookup(Path::new("docs/aaa.md"))
+            .expect("aaa");
+        let guide = state
+            .tree
+            .model
+            .lookup(Path::new("docs/guide.md"))
+            .expect("guide");
+        state.tree.model.get_mut(aaa).expect("aaa").changed_at = Some(at());
+        state.tree.model.get_mut(guide).expect("guide").changed_at =
+            Some(at() + Duration::from_secs(5));
+
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::CycleSort));
+
+        assert_eq!(state.tree.sort, SortMode::Recent);
+        assert_eq!(
+            names(&state)[2],
+            "    guide.md",
+            "the newest change stands first"
+        );
+        assert_eq!(names(&state)[3], "    aaa.md");
+
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::CycleSort));
+
+        assert_eq!(state.tree.sort, SortMode::Name);
+        assert_eq!(names(&state)[2], "    aaa.md", "back to the name");
     }
 }

@@ -19,6 +19,8 @@ pub enum Role {
     TreeSymlink,
     TreeUnreadable,
     TreeSelected,
+    /// The age of a change that is seconds old, at the right end of a row.
+    TreeFresh,
     PreviewText,
     PreviewHeader,
     PreviewPlaceholder,
@@ -106,7 +108,9 @@ fn color(role: Role) -> Color {
         Role::TreeSymlink => Color::Cyan,
         Role::TreeUnreadable | Role::StatusError | Role::StatusDeleted => Color::Red,
         Role::TreeSelected => Color::Reset,
-        Role::PreviewHeader | Role::StatusInfo | Role::StatusModified => Color::Yellow,
+        Role::PreviewHeader | Role::StatusInfo | Role::StatusModified | Role::TreeFresh => {
+            Color::Yellow
+        }
         Role::PreviewPlaceholder | Role::PreviewGutter => Color::DarkGray,
         Role::DiffAdded | Role::StatusAdded => Color::Green,
         Role::DiffRemoved => Color::Red,
@@ -128,6 +132,7 @@ fn modifiers(role: Role) -> Modifier {
         Role::PaneTitle => Modifier::BOLD,
         Role::TreeSelected => Modifier::REVERSED | Modifier::BOLD,
         Role::TreeDirectory => Modifier::BOLD,
+        Role::TreeFresh => Modifier::BOLD,
         Role::StatusMode => Modifier::REVERSED | Modifier::BOLD,
         Role::StatusError => Modifier::BOLD,
         Role::StatusMuted

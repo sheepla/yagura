@@ -4,7 +4,7 @@ assertion_line: 119
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f long.txt  1.7 KiB───────────────────────────┐
-│▾d root                      …│  24 line 24                                    
+│▾d root                       │  24 line 24                                    
 │  ▸d docs                    …│  25 line 25                                    
 │  ▸d src                     …│  26 line 26                                    
 │   f long.txt                 │  27 line 27                                    

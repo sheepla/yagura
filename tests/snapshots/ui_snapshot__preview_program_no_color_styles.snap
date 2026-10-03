@@ -7,7 +7,7 @@ dim | bold+dim | dim | bold+dim | dim
 dim | bold | dim | default
 dim | bold | dim | bold | dim | default
 dim | bold | dim | bold | dim | default
-dim | reversed+bold | reversed+bold+dim | reversed+bold | default | dim | default
+dim | reversed+bold | reversed+bold+dim | reversed+bold | dim | default
 dim | default | dim | default | dim | default
 dim | default | dim | default
 dim | default | dim | default

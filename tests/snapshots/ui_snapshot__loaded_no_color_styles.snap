@@ -4,7 +4,7 @@ assertion_line: 39
 expression: render_row_styles(&state)
 ---
 dim | bold+dim | dim
-dim | reversed+bold+dim | reversed+bold | reversed+bold+dim | dim | default | dim | default
+dim | reversed+bold+dim | reversed+bold | dim | default | dim | default
 dim | bold | dim | bold | dim | default
 dim | bold | dim | bold | dim | default
 dim | default | dim | default | dim | default

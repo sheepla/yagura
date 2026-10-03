@@ -12,7 +12,7 @@ use crate::core::text;
 use crate::core::text::sanitize_os;
 use crate::features::tree::icons::{COLLAPSED, EXPANDED, LEAF};
 use crate::ui::theme::Role;
-use crate::ui::{pane, placeholder};
+use crate::ui::{elapsed, pane, placeholder};
 
 use crate::core::fsmodel::NodeId;
 
@@ -93,38 +93,56 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
             state.theme.style(Role::PreviewPlaceholder),
         ));
     }
-    // The statistics sit at the right end of the row. The name is what
-    // yields columns for them, and the part of it that tells names apart is
-    // its end, so the cut is made at the front (§11.1).
-    let stat = stat_cell(state, entry);
-    let stat_width = text::display_width(&stat);
-    let gap = usize::from(!stat.is_empty());
+    // The statistics and the age sit at the right end of the row. The name
+    // is what yields columns for them, and the part of it that tells names
+    // apart is its end, so the cut is made at the front (§11.1).
+    let stat = stat_cell(state, node, entry);
+    let elapsed = elapsed_cell(state, node, entry);
+    let separator = if stat.is_empty() || elapsed.is_empty() {
+        ""
+    } else {
+        " "
+    };
+    let right_width = text::display_width(&stat)
+        + text::display_width(&elapsed)
+        + usize::from(!separator.is_empty());
+    let gap = usize::from(right_width > 0);
     let name_width = text::display_width(&name);
     let others_width: usize = spans
         .iter()
         .map(|span| text::display_width(span.content.as_ref()))
         .sum::<usize>()
         - name_width;
-    if others_width + stat_width + gap > width {
+    if others_width + right_width + gap > width {
         // Even the ellipsis has no room left; the pane clips what remains.
         spans[3].content = String::new().into();
     } else {
         // One column of the room goes to the ellipsis of a shortened name.
-        let room = width.saturating_sub(others_width + stat_width + gap + 1);
+        let room = width.saturating_sub(others_width + right_width + gap + 1);
         if name_width > room {
             spans[3].content = text::truncate_tail_to_width(&name, room).into();
         }
     }
+    // Every row is filled out to the pane's width, whether or not it has
+    // anything to say at its right end, so that the selection's background
+    // reaches the border.
+    let filled: usize = spans
+        .iter()
+        .map(|span| text::display_width(span.content.as_ref()))
+        .sum();
+    let pad = width.saturating_sub(filled + right_width);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), base));
+    }
     if !stat.is_empty() {
-        let filled: usize = spans
-            .iter()
-            .map(|span| text::display_width(span.content.as_ref()))
-            .sum();
-        let pad = width.saturating_sub(filled + stat_width);
-        if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), base));
-        }
         spans.push(Span::styled(stat, state.theme.style(Role::StatusMuted)));
+    }
+    if !elapsed.is_empty() {
+        let style = state.theme.style(elapsed::role(elapsed::freshness(
+            entry.changed_at.expect("an age to draw"),
+            state.now,
+        )));
+        spans.push(Span::styled(format!("{separator}{elapsed}"), style));
     }
     if selected {
         // The selection is a background, so its modifiers are added to every
@@ -138,7 +156,13 @@ fn row_line<'a>(state: &'a AppState, node: NodeId, depth: u16, width: usize) -> 
 }
 
 /// What the right end of a row says about the node's statistics (§11.1).
-fn stat_cell(state: &AppState, entry: &Node) -> String {
+///
+/// A directory keeps the totals of the rows it hides; once it is open, those
+/// rows say it themselves (spec, tree rows).
+fn stat_cell(state: &AppState, node: NodeId, entry: &Node) -> String {
+    if entry.is_expandable() && state.tree.is_expanded(node) {
+        return String::new();
+    }
     match entry.stat {
         NodeStat::Known(stat) => stat.format(),
         NodeStat::NotApplicable => String::new(),
@@ -152,6 +176,20 @@ fn stat_cell(state: &AppState, entry: &Node) -> String {
             Phase::Ready => "?".to_owned(),
         },
     }
+}
+
+/// How long ago the node was last seen to change (spec, tree rows).
+///
+/// A directory carries the newest age below it, and hides it while it is
+/// open for the same reason as its statistics.
+fn elapsed_cell(state: &AppState, node: NodeId, entry: &Node) -> String {
+    if entry.is_expandable() && state.tree.is_expanded(node) {
+        return String::new();
+    }
+    entry
+        .changed_at
+        .map(|changed_at| elapsed::label(changed_at, state.now))
+        .unwrap_or_default()
 }
 
 /// The marker in front of the name.
@@ -181,9 +219,11 @@ fn base_role(entry: &Node) -> Role {
 mod tests {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::app::state::{Config, Focus};
@@ -325,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn the_selection_reaches_the_end_of_the_row() {
+        let state = state_with_tree();
+        let area = layout::compute(state.area(), state.tree_visible).tree;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, area, &state))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        // The root has nothing to draw at its right end while it is open,
+        // and the bar must still run to the border.
+        let row = state.tree.selected_index().expect("selected") + 1;
+        let right = area.left() + area.width - 2;
+        let cell = &buffer[(right, row as u16)];
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "the selection stopped short of the border: {cell:?}"
+        );
+    }
+
+    #[test]
     fn a_zero_area_draws_nothing() {
         let state = state_with_tree();
         let mut terminal = Terminal::new(TestBackend::new(10, 3)).expect("terminal");
@@ -357,17 +417,21 @@ mod tests {
         use crate::core::diff::DiffStat;
 
         let mut state = state_with_tree();
+        let src = state.tree.model.lookup(Path::new("src")).expect("src");
+        state.tree.collapse(src);
+        state.tree.refresh();
         assert!(
             row_of(&state, "d src").trim_end().ends_with('\u{2026}'),
             "a directory counts while the baseline builds"
         );
+        state.tree.expand(src);
+        state.tree.refresh();
         assert!(
             row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
             "a file has no number before the count"
         );
 
         state.baseline.phase = Phase::Ready;
-        let src = state.tree.model.lookup(Path::new("src")).expect("src");
         state.tree.model.get_mut(src).expect("src").stat = NodeStat::Known(DiffStat {
             added: 2,
             removed: 1,
@@ -388,16 +452,28 @@ mod tests {
 
         let text = draw(&state);
         assert!(
-            row_of(&state, "d src").trim_end().ends_with("+2 -1"),
-            "the collapsed rows were not summed up: {text}"
-        );
-        assert!(
             row_of(&state, "f readme.md").trim_end().ends_with('?'),
             "a file with no number says so: {text}"
         );
         assert!(
             row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
             "a file that cannot differ shows no cell: {text}"
+        );
+        // The rows below an open directory say it themselves, so the
+        // directory's own totals are drawn only while it hides them.
+        state.tree.collapse(src);
+        state.tree.refresh();
+        let hidden = draw(&state);
+        assert!(
+            row_of(&state, "d src").trim_end().ends_with("+2 -1"),
+            "the collapsed rows were not summed up: {hidden}"
+        );
+        state.tree.expand(src);
+        state.tree.refresh();
+        let open = row_of(&state, "d src");
+        assert!(
+            open.trim_end().ends_with("src"),
+            "an open directory kept a cell of its own: {open:?}"
         );
     }
 
@@ -428,5 +504,100 @@ mod tests {
             "the name was not cut to make room: {row:?}"
         );
         assert!(!row.contains(long), "the whole name fit after all: {row:?}");
+    }
+
+    /// Puts a change on `path`, `ago` before the clock the state reads.
+    fn changed_at(state: &mut AppState, path: &str, ago: Duration) {
+        let id = state.tree.model.lookup(Path::new(path)).expect(path);
+        let now = state.now;
+        state.tree.model.get_mut(id).expect(path).changed_at = Some(now - ago);
+    }
+
+    /// A clock far enough ahead that any age can be counted back from it.
+    fn set_clock(state: &mut AppState) {
+        state.now = SystemTime::UNIX_EPOCH + Duration::from_secs(30 * 24 * 60 * 60);
+    }
+
+    /// The style the word `word` is drawn in, somewhere in the tree pane.
+    fn word_style(state: &AppState, word: &str) -> (Color, Modifier) {
+        let area = layout::compute(state.area(), state.tree_visible).tree;
+        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, area, state))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        for y in inner.top()..inner.bottom() {
+            let line: String = (inner.left()..inner.right())
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect();
+            if let Some(byte) = line.find(word) {
+                // The pane draws one cell per character, so the column is a
+                // character count and not a byte offset.
+                let column = line[..byte].chars().count();
+                let cell = &buffer[(inner.left() + column as u16, y)];
+                return (cell.fg, cell.modifier);
+            }
+        }
+        panic!("no {word:?} drawn in the tree pane");
+    }
+
+    #[test]
+    fn a_row_that_changed_says_how_long_ago_and_a_plain_one_does_not() {
+        let mut state = state_with_tree();
+        set_clock(&mut state);
+        changed_at(&mut state, "readme.md", Duration::from_secs(12));
+
+        let row = row_of(&state, "f readme.md");
+        assert!(row.trim_end().ends_with("12s"), "{row:?}");
+        assert!(
+            row_of(&state, "f main.rs").trim_end().ends_with("main.rs"),
+            "a row nothing happened to said an age"
+        );
+    }
+
+    #[test]
+    fn the_age_of_a_change_is_drawn_in_its_freshness() {
+        let mut state = state_with_tree();
+        set_clock(&mut state);
+        changed_at(&mut state, "readme.md", Duration::from_secs(9));
+        changed_at(&mut state, "src/main.rs", Duration::from_secs(5 * 60));
+        changed_at(&mut state, "link", Duration::from_secs(5 * 24 * 60 * 60));
+
+        let (fresh_color, fresh_mods) = word_style(&state, "9s");
+        assert_eq!(fresh_color, Color::Yellow);
+        assert!(fresh_mods.contains(Modifier::BOLD), "{fresh_mods:?}");
+
+        let (recent_color, recent_mods) = word_style(&state, "5m");
+        assert_eq!(recent_color, Color::Reset);
+        assert!(!recent_mods.intersects(Modifier::BOLD | Modifier::DIM));
+
+        let (stale_color, stale_mods) = word_style(&state, "5d");
+        assert_eq!(stale_color, Color::DarkGray);
+        assert!(stale_mods.contains(Modifier::DIM), "{stale_mods:?}");
+    }
+
+    #[test]
+    fn a_directory_keeps_its_age_until_it_is_opened() {
+        let mut state = state_with_tree();
+        set_clock(&mut state);
+        changed_at(&mut state, "src", Duration::from_secs(42));
+
+        state
+            .tree
+            .collapse(state.tree.model.lookup(Path::new("src")).expect("src"));
+        state.tree.refresh();
+        let hidden = row_of(&state, "d src");
+        assert!(hidden.trim_end().ends_with("42s"), "{hidden:?}");
+
+        state
+            .tree
+            .expand(state.tree.model.lookup(Path::new("src")).expect("src"));
+        state.tree.refresh();
+        let open = row_of(&state, "d src");
+        assert!(
+            open.trim_end().ends_with("src"),
+            "an open directory kept the age of what it hides: {open:?}"
+        );
     }
 }

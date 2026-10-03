@@ -163,8 +163,6 @@ pub struct AppState {
     pub overlay: Overlay,
     pub tree_visible: bool,
     pub follow: bool,
-    pub changed_only: bool,
-    pub sort: SortMode,
     /// Time of the most recent tick, so that views never read the clock.
     pub now: SystemTime,
     pub message: Option<Message>,
@@ -206,8 +204,6 @@ impl AppState {
             overlay: Overlay::None,
             tree_visible: true,
             follow: false,
-            changed_only: false,
-            sort: SortMode::Name,
             now: SystemTime::UNIX_EPOCH,
             message: None,
             quitting: false,
@@ -338,14 +334,46 @@ impl AppState {
 
     /// Whether an action needs a new frame.
     ///
-    /// A clock tick does not: the elapsed time labels it feeds only appear once
-    /// change tracking exists, and repainting every second is both wasteful and
-    /// visible as flicker.
+    /// A clock tick only repaints when something on screen would read
+    /// differently: the elapsed times are what a tick changes, and a frame
+    /// nobody can tell from the last one is both wasted work and visible as
+    /// flicker (design §14.1). `Paste` changes nothing the user can see
+    /// before the text box of an overlay exists.
     pub fn wants_repaint(&self, action: &crate::app::Action) -> bool {
-        !matches!(
-            action,
-            crate::app::Action::Tick { .. } | crate::app::Action::Paste(_)
-        )
+        match action {
+            crate::app::Action::Tick { now } => {
+                self.elapsed_tick_changes(*now) || self.message_tick_changes(*now)
+            }
+            crate::app::Action::Paste(_) => false,
+            _ => true,
+        }
+    }
+
+    /// True when a row in view would say something else after this tick.
+    fn elapsed_tick_changes(&self, next: SystemTime) -> bool {
+        if !self.tree_visible {
+            return false;
+        }
+        let start = self.tree.scroll.min(self.tree.visible.len());
+        let end = (start + self.tree.viewport.max(1)).min(self.tree.visible.len());
+        self.tree.visible[start..end].iter().any(|row| {
+            let Some(node) = self.tree.model.get(row.node) else {
+                return false;
+            };
+            let Some(changed_at) = node.changed_at else {
+                return false;
+            };
+            crate::ui::elapsed::label(changed_at, self.now)
+                != crate::ui::elapsed::label(changed_at, next)
+        })
+    }
+
+    /// True when a message drawn right now would be gone after this tick.
+    fn message_tick_changes(&self, next: SystemTime) -> bool {
+        let Some(message) = &self.message else {
+            return false;
+        };
+        message.is_visible(self.now) && !message.is_visible(next)
     }
 }
 
@@ -466,5 +494,78 @@ mod tests {
         let mut state = state();
         state.size = (40, 10);
         assert_eq!(state.tree_viewport_height(), 0);
+    }
+
+    #[test]
+    fn a_tick_asks_for_a_frame_only_when_a_row_would_say_something_else() {
+        use std::ffi::OsStr;
+
+        use crate::app::Action;
+        use crate::core::fsmodel::NodeKind;
+
+        let mut state = state();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(300);
+        state.now = now;
+        let root = state.tree.model.root_id();
+        let file = state
+            .tree
+            .model
+            .insert_child(root, OsStr::new("a.txt"), NodeKind::File);
+        state.tree.bump();
+        state.tree.refresh();
+        let tick = |at: SystemTime| Action::Tick { now: at };
+
+        assert!(
+            !state.wants_repaint(&tick(now)),
+            "a row nothing happened to has nothing to say"
+        );
+
+        // `12s` and `13s` are two words for the same row.
+        state.tree.model.get_mut(file).expect("a.txt").changed_at =
+            Some(now - Duration::from_secs(12));
+        assert!(state.wants_repaint(&tick(now + Duration::from_secs(1))));
+
+        // `3m40s` and `3m41s` are the same word, so no frame is needed.
+        state.tree.model.get_mut(file).expect("a.txt").changed_at =
+            Some(now - Duration::from_secs(3 * 60 + 40));
+        assert!(!state.wants_repaint(&tick(now + Duration::from_secs(1))));
+
+        // With the tree off there is no row to read at all.
+        state.tree.model.get_mut(file).expect("a.txt").changed_at =
+            Some(now - Duration::from_secs(12));
+        state.tree_visible = false;
+        assert!(!state.wants_repaint(&tick(now + Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn a_tick_gives_a_frame_to_a_message_that_has_run_out() {
+        use crate::app::Action;
+
+        let mut state = state();
+        state.now = SystemTime::UNIX_EPOCH;
+        state.set_info("note");
+        assert!(
+            !state.wants_repaint(&Action::Tick { now: state.now }),
+            "the message is still on screen"
+        );
+        assert!(
+            state.wants_repaint(&Action::Tick {
+                now: state.now + MESSAGE_TTL + Duration::from_secs(1)
+            }),
+            "the message is gone but still drawn"
+        );
+    }
+
+    #[test]
+    fn every_action_but_a_bland_paste_asks_for_a_frame() {
+        use crate::app::Action;
+
+        let state = state();
+        assert!(state.wants_repaint(&Action::Quit));
+        assert!(state.wants_repaint(&Action::Resize {
+            width: 80,
+            height: 24
+        }));
+        assert!(!state.wants_repaint(&Action::Paste("text".to_owned())));
     }
 }

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::app::state::SortMode;
-use crate::core::fsmodel::{FsModel, NodeId};
+use crate::core::fsmodel::{FsModel, NodeId, Status};
 
 /// Hard cap on the flattened tree so that a pathological tree cannot exhaust
 /// memory. Rows past the cap are not drawn.
@@ -37,6 +37,8 @@ pub struct TreeState {
     pub loading: HashSet<NodeId>,
     /// Sibling order.
     pub sort: SortMode,
+    /// Only the rows that changed or were seen to change (`c`, design §11.3).
+    pub changed_only: bool,
     /// Rows that fit on screen, kept in step with the layout by the reducer.
     pub viewport: usize,
 }
@@ -55,6 +57,7 @@ impl TreeState {
             load_gen: HashMap::new(),
             loading: HashSet::new(),
             sort: SortMode::Name,
+            changed_only: false,
             viewport: 0,
         }
     }
@@ -93,17 +96,40 @@ impl TreeState {
         self.visible = rows;
     }
 
-    fn walk(&self, node: NodeId, depth: u16, out: &mut Vec<VisibleRow>) {
+    /// Adds a row for `node` and, when it is open, for everything below it.
+    ///
+    /// The row is kept only when the filter has something to say about the
+    /// subtree it heads, so with `changed_only` on a directory survives for
+    /// the change below it and the path to that change stays walkable
+    /// (design §11.3). Returns whether the subtree matched.
+    fn walk(&self, node: NodeId, depth: u16, out: &mut Vec<VisibleRow>) -> bool {
         if out.len() >= MAX_VISIBLE_ROWS {
-            return;
+            return false;
         }
+        let start = out.len();
         out.push(VisibleRow { node, depth });
-        if !self.is_expanded(node) {
-            return;
+        // The root frames everything else and stays even when the filter
+        // finds nothing to show under it.
+        let mut matched = node == self.model.root_id() || self.keeps(node);
+        if self.is_expanded(node) {
+            for child in self.model.children(node) {
+                matched |= self.walk(*child, depth + 1, out);
+            }
         }
-        for child in self.model.children(node) {
-            self.walk(*child, depth + 1, out);
+        if !matched {
+            out.truncate(start);
         }
+        matched
+    }
+
+    /// Whether a row is shown while `changed_only` is on.
+    fn keeps(&self, node: NodeId) -> bool {
+        if !self.changed_only {
+            return true;
+        }
+        self.model
+            .get(node)
+            .is_some_and(|entry| entry.status != Status::Unchanged || entry.changed_at.is_some())
     }
 
     pub fn is_expanded(&self, node: NodeId) -> bool {
@@ -432,5 +458,55 @@ mod tests {
         tree.refresh();
         assert!(!tree.is_expanded(link));
         assert_eq!(tree.row_count(), 2);
+    }
+
+    #[test]
+    fn the_filter_shows_what_changed_and_the_way_to_it() {
+        let mut tree = sample();
+        let src = src(&tree);
+        tree.expand(src);
+        // A directory carries the change below it, the way the baseline's set
+        // writes it (design §11.1), so it survives the filter even closed.
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        tree.model.get_mut(src).expect("src").changed_at = Some(now);
+        let main = tree.model.lookup(Path::new("src/main.rs")).expect("main");
+        tree.model.get_mut(main).expect("main").status = Status::Modified;
+
+        tree.changed_only = true;
+        tree.bump();
+        tree.refresh();
+        assert_eq!(names(&tree), vec!["root", "  src", "    main.rs"]);
+        assert_eq!(tree.row_count(), 3, "readme.md did not change");
+
+        tree.collapse(src);
+        tree.refresh();
+        assert_eq!(names(&tree), vec!["root", "  src"], "a closed directory");
+    }
+
+    #[test]
+    fn a_row_seen_to_change_is_shown_by_the_filter_too() {
+        let mut tree = sample();
+        let readme = tree.model.lookup(Path::new("readme.md")).expect("readme");
+        tree.model.get_mut(readme).expect("readme").changed_at =
+            Some(std::time::SystemTime::UNIX_EPOCH);
+
+        tree.changed_only = true;
+        tree.bump();
+        tree.refresh();
+        assert_eq!(names(&tree), vec!["root", "  readme.md"]);
+    }
+
+    #[test]
+    fn the_filter_keeps_the_root_and_comes_off_again() {
+        let mut tree = sample();
+        tree.changed_only = true;
+        tree.bump();
+        tree.refresh();
+        assert_eq!(names(&tree), vec!["root"]);
+
+        tree.changed_only = false;
+        tree.bump();
+        tree.refresh();
+        assert_eq!(names(&tree), vec!["root", "  src", "  readme.md"]);
     }
 }

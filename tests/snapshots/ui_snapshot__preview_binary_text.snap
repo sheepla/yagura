@@ -4,7 +4,7 @@ assertion_line: 131
 expression: render_text(&state)
 ---
 ┌root──────────────────────────┐┌f logo.png  image  8 B────────────────────────┐
-│▾d root                      …│                   image · 8 B                  
+│▾d root                       │                   image · 8 B                  
 │  ▸d docs                    …│                                                
 │  ▸d src                     …│                                                
 │   f logo.png                 │                                                
