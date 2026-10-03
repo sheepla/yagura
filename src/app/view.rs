@@ -139,4 +139,53 @@ mod tests {
             "the status bar is still there: {status}"
         );
     }
+
+    #[test]
+    fn an_overlay_hides_everything_it_covers() {
+        use crate::core::fsmodel::{FsModel, NodeKind};
+        use crate::core::preview::{Doc, Language};
+
+        let mut state = state(80, 24, false);
+        state.preview.viewport = 20;
+        // A tree with a selected file, so opening the log keeps the document
+        // the pane is showing instead of clearing it.
+        let mut model = FsModel::new(PathBuf::from("/root"));
+        let root = model.root_id();
+        let file = model.insert_child(root, std::ffi::OsStr::new("a.txt"), NodeKind::File);
+        state.tree.model = model;
+        state.tree.select(file);
+        let doc = Doc {
+            rel: PathBuf::from("a.txt"),
+            name: "a.txt".into(),
+            size: 64,
+            language: Language::Text,
+            lines: std::iter::once("first row, above the popup".to_owned())
+                .chain((2..=10).map(|i| format!("ROW_{i}_BEHIND_THE_OVERLAY")))
+                .collect(),
+            spans: Vec::new(),
+            truncated: false,
+            too_large: false,
+            highlight_truncated: false,
+            invalid_utf8: false,
+            binary: None,
+            link_target: None,
+            diff: None,
+            diff_note: None,
+            formatted: false,
+        };
+        state.preview.path = Some(doc.rel.clone());
+        state.preview.set_doc(doc);
+        // The rows after the first fall where the popup is about to stand.
+        assert!(text(&state).contains("ROW_5_BEHIND_THE_OVERLAY"));
+        crate::app::reduce::reduce(
+            &mut state,
+            crate::app::Action::Command(crate::app::command::Command::OpenWatch),
+        );
+        let text = text(&state);
+        assert!(text.contains("WATCH"), "{text}");
+        assert!(
+            !text.contains("BEHIND_THE_OVERLAY"),
+            "the panes behind the overlay show through: {text}"
+        );
+    }
 }

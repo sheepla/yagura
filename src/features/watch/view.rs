@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::state::AppState;
 use crate::core::fswatch::ChangeKind;
@@ -14,12 +14,16 @@ use crate::ui::layout;
 use crate::ui::theme::Role;
 use crate::ui::{pane_line, placeholder};
 
-/// Draws the log over the panes, which stay readable around the status bar.
+/// Draws the log over the panes, which stay readable around it.
+///
+/// The popup's area is cleared first, so a row the log does not reach cannot
+/// show the tree or the preview that was drawn behind it.
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let popup = layout::watch(area);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
+    frame.render_widget(Clear, popup);
     frame.render_widget(pane_line(title(state), &state.theme), popup);
     let inner = popup.inner(Margin::new(1, 1));
     if inner.width == 0 || inner.height == 0 {

@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::state::{AppState, Overlay, PreviewMode};
 use crate::core::text;
@@ -14,12 +14,16 @@ use crate::ui::layout;
 use crate::ui::theme::Role;
 use crate::ui::{pane, placeholder};
 
-/// Draws the overlay on top of whatever the panes behind it are showing.
+/// Draws the overlay on top of the panes, which stay readable around it.
+///
+/// The popup's own area is cleared first: every cell no widget writes into
+/// would otherwise keep the tree or the preview that was drawn behind it.
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let areas = layout::finder(area);
     if areas.popup.width == 0 || areas.popup.height == 0 {
         return;
     }
+    frame.render_widget(Clear, areas.popup);
     frame.render_widget(
         pane(state.overlay.label().unwrap_or("FILES"), &state.theme),
         areas.popup,
