@@ -85,6 +85,76 @@ pub fn build(root: &Path, now: SystemTime) -> Result<Head, GitError> {
     Ok(Head { head_oid, changed })
 }
 
+/// How many bytes of pathspecs one `git status` argument list may hold.
+///
+/// Past this the whole work tree is asked about instead: a single `git
+/// status` is cheaper than one per few hundred paths, and the answer is
+/// filtered back down to what was asked for.
+const PATHSPEC_BUDGET: usize = 8_000;
+
+/// The status of the given paths against `HEAD` (§7.3).
+///
+/// One answer per requested path, in the order it was asked for; a path
+/// that no longer differs at all is answered with `None`, which is what
+/// takes it back out of the changed set. An empty result means nothing
+/// could be worked out - no `git`, no repository, a command that failed -
+/// and the caller then leaves what it has alone.
+pub fn stats(
+    root: &Path,
+    paths: &[PathBuf],
+    at: SystemTime,
+) -> Vec<(PathBuf, Option<ChangedEntry>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let output = match status(root, paths) {
+        Some(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let reported = parse_status(&output.stdout, at);
+    // The counts are read through one process, and only while there is a
+    // `HEAD` to count against: without one the two sides cannot be compared.
+    let source = head_oid(root)
+        .is_some()
+        .then(|| GitSource::open(root).ok())
+        .flatten();
+    paths
+        .iter()
+        .map(|rel| {
+            let entry = reported.get(rel).map(|found| ChangedEntry {
+                status: found.status,
+                changed_at: at,
+                stat: source
+                    .as_ref()
+                    .and_then(|source| stat_of(source, root, rel, found.status)),
+            });
+            (rel.clone(), entry)
+        })
+        .collect()
+}
+
+/// `git status` for the given paths, or for the whole work tree when they
+/// do not fit on one command line.
+fn status(root: &Path, paths: &[PathBuf]) -> Option<std::process::Output> {
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|rel| format!(":(literal){}", rel.to_string_lossy().replace('\\', "/")))
+        .collect();
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args([
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+    ]);
+    if specs.iter().map(String::len).sum::<usize>() <= PATHSPEC_BUDGET {
+        command.arg("--");
+        command.args(specs);
+    }
+    command.output().map_err(spawn_error).ok()
+}
+
 /// The `+N -N ~N` of one changed file against `HEAD`, or `None` when the
 /// two sides are not text, not there, or past the budget (§10).
 fn stat_of(source: &GitSource, root: &Path, rel: &Path, status: Status) -> Option<DiffStat> {
@@ -142,7 +212,7 @@ fn stderr_line(output: &std::process::Output) -> String {
 }
 
 /// `HEAD`, or `None` while no commit has been made yet.
-fn head_oid(root: &Path) -> Option<String> {
+pub fn head_oid(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -394,6 +464,7 @@ fn path_after(record: &[u8], fields: usize) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
     use super::*;
 
@@ -621,5 +692,80 @@ mod tests {
         assert_eq!(source.blob(Path::new("bad\nname.txt")), Blob::Unreadable);
         assert_eq!(source.blob(Path::new("../outside.txt")), Blob::Unreadable);
         assert_eq!(source.blob(Path::new("")), Blob::Unreadable);
+    }
+
+    #[test]
+    fn the_status_of_some_paths_answers_each_of_them_in_the_order_asked() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").expect("write");
+        std::fs::remove_file(dir.path().join("b.txt")).expect("remove");
+        std::fs::write(dir.path().join("new.txt"), "new\n").expect("write");
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(7);
+
+        let asked = vec![
+            PathBuf::from("new.txt"),
+            PathBuf::from("never.txt"),
+            PathBuf::from("b.txt"),
+            PathBuf::from("a.txt"),
+        ];
+        let answers = stats(dir.path(), &asked, at);
+        let answered: Vec<(&Path, Option<Status>)> = answers
+            .iter()
+            .map(|(rel, entry)| (rel.as_path(), entry.as_ref().map(|entry| entry.status)))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (Path::new("new.txt"), Some(Status::Added)),
+                // A path nothing is wrong with is answered, not left out:
+                // the answer is what takes it back out of the changed set.
+                (Path::new("never.txt"), None),
+                (Path::new("b.txt"), Some(Status::Deleted)),
+                (Path::new("a.txt"), Some(Status::Modified)),
+            ]
+        );
+        assert_eq!(answers.len(), asked.len());
+        assert_eq!(
+            answers[0].1.as_ref().map(|entry| entry.changed_at),
+            Some(at)
+        );
+    }
+
+    #[test]
+    fn a_list_of_paths_past_the_budget_is_answered_from_the_whole_work_tree() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").expect("write");
+        let at = SystemTime::UNIX_EPOCH;
+
+        let mut asked = vec![PathBuf::from("a.txt")];
+        for index in 0..60 {
+            asked.push(PathBuf::from(format!("{index:04}{}", "x".repeat(160))));
+        }
+        let budget: usize = asked
+            .iter()
+            .map(|rel| format!(":(literal){}", rel.display()).len())
+            .sum();
+        assert!(budget > PATHSPEC_BUDGET, "{budget} fits on one command");
+
+        let answers = stats(dir.path(), &asked, at);
+        assert_eq!(answers.len(), asked.len());
+        assert_eq!(
+            answers[0].1.as_ref().map(|entry| entry.status),
+            Some(Status::Modified)
+        );
+        assert!(
+            answers[1..].iter().all(|(_, entry)| entry.is_none()),
+            "a path outside the work tree was answered as changed: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_without_an_answer_leaves_the_caller_to_its_own_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let at = SystemTime::UNIX_EPOCH;
+        // No repository, so nothing could be worked out: the caller is told
+        // so by an empty result rather than by paths that all look clean.
+        assert!(stats(dir.path(), &[PathBuf::from("a.txt")], at).is_empty());
+        assert!(stats(dir.path(), &[], at).is_empty());
     }
 }

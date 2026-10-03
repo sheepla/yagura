@@ -7,11 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::app::action::Action;
+use crate::app::action::{Action, StatAnswer};
 use crate::app::command::Command;
 use crate::app::effect::Effect;
 use crate::app::state::AppState;
-use crate::core::baseline::{Built, ChangedEntry, Kind};
+use crate::core::baseline::{Built, ChangedEntry, Kind, Phase};
 use crate::features::{preview, tree};
 use crate::input::keymap;
 
@@ -36,6 +36,9 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
     if let Action::BaselineReady { ver, built } = action {
         return apply_baseline(state, ver, built);
+    }
+    if let Action::StatsComputed { results } = action {
+        return apply_stats(state, results);
     }
     if let Action::Command(Command::ToggleBaseline) = action {
         return toggle_baseline(state);
@@ -86,6 +89,26 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         // must not move the view (§7.3).
         Action::FsBatch { changes, at } => tree::reducer::on_fs_batch(state, changes, *at),
         Action::FsRescanNeeded => tree::reducer::on_rescan(state),
+        // A `HEAD` that moved is a new baseline to diff against, and only a
+        // rebuild can say what differs below it (§8.2). Before the first
+        // build has answered there is nothing to compare against, and a
+        // rebuild of it would only be thrown away.
+        Action::HeadChecked { oid } => {
+            if state.baseline.kind != Kind::Head
+                || state.baseline.phase != Phase::Ready
+                || oid == &state.baseline.head_oid
+            {
+                return Vec::new();
+            }
+            state.baseline.ver += 1;
+            vec![Effect::BuildBaseline {
+                kind: state.baseline.kind,
+                ver: state.baseline.ver,
+            }]
+        }
+        // Handed to [`apply_stats`] above; here only so that every action
+        // has a case.
+        Action::StatsComputed { .. } => Vec::new(),
     }
 }
 
@@ -182,6 +205,39 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Writes one stats answer into the changed set (§7.3).
+///
+/// An answer to a request that has been superseded is dropped: the newer
+/// one is already on its way, and the two would disagree only for as long
+/// as it takes to arrive. A path that no longer differs at all leaves the
+/// set, which is what takes its status off the row again.
+fn apply_stats(state: &mut AppState, results: Vec<StatAnswer>) -> Vec<Effect> {
+    let mut answered = false;
+    for answer in results {
+        if state.stats_gen.get(&answer.rel) != Some(&answer.generation) {
+            continue;
+        }
+        answered = true;
+        match answer.entry {
+            None => {
+                state.baseline.changed.remove(&answer.rel);
+            }
+            Some(mut entry) => {
+                // What was first seen to change keeps that moment: the
+                // answer says what is different now, not when it happened.
+                if let Some(known) = state.baseline.changed.get(&answer.rel) {
+                    entry.changed_at = known.changed_at;
+                }
+                state.baseline.changed.insert(answer.rel, entry);
+            }
+        }
+    }
+    if answered {
+        apply_changed(state);
+    }
+    Vec::new()
+}
+
 /// Writes the changed set into the tree: every node gets its status, a file
 /// deleted on disk keeps a row of its own, and the rows are rebuilt to show
 /// them (design §11.1).
@@ -232,7 +288,7 @@ fn resolve(state: &AppState, action: Action) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -751,5 +807,182 @@ mod tests {
             Some(Status::Deleted),
             "the listing of another directory cleared a status"
         );
+    }
+
+    /// A baseline that is in hand, with `a.txt` known to differ from it.
+    fn with_a_changed_file() -> AppState {
+        use crate::core::fsmodel::Status;
+
+        let mut state = state();
+        state.baseline.repo = true;
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(
+                    true,
+                    Some("aaa"),
+                    BTreeMap::from([(
+                        PathBuf::from("a.txt"),
+                        entry(Status::Modified, SystemTime::UNIX_EPOCH),
+                    )]),
+                ),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn an_answer_to_a_stats_request_that_was_superseded_is_dropped() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = with_a_changed_file();
+        state.stats_gen.insert(PathBuf::from("a.txt"), 2);
+        let effects = reduce(
+            &mut state,
+            Action::StatsComputed {
+                results: vec![StatAnswer {
+                    rel: PathBuf::from("a.txt"),
+                    generation: 1,
+                    entry: Some(entry(
+                        Status::Added,
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+                    )),
+                }],
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            state.baseline.changed[Path::new("a.txt")].status,
+            Status::Modified,
+            "an answer from a request that had been superseded landed"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_says_a_file_no_longer_differs_takes_it_out_of_the_set() {
+        let mut state = with_a_changed_file();
+        state.stats_gen.insert(PathBuf::from("a.txt"), 1);
+        reduce(
+            &mut state,
+            Action::StatsComputed {
+                results: vec![StatAnswer {
+                    rel: PathBuf::from("a.txt"),
+                    generation: 1,
+                    entry: None,
+                }],
+            },
+        );
+        assert!(
+            !state.baseline.changed.contains_key(Path::new("a.txt")),
+            "the file is still marked as changed: {:?}",
+            state.baseline.changed
+        );
+    }
+
+    #[test]
+    fn an_answer_keeps_the_moment_the_change_was_first_seen() {
+        use crate::core::fsmodel::Status;
+
+        let first_seen = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut state = state();
+        state.baseline.repo = true;
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(
+                    true,
+                    Some("aaa"),
+                    BTreeMap::from([(PathBuf::from("a.txt"), entry(Status::Modified, first_seen))]),
+                ),
+            },
+        );
+        state.stats_gen.insert(PathBuf::from("a.txt"), 1);
+        reduce(
+            &mut state,
+            Action::StatsComputed {
+                results: vec![StatAnswer {
+                    rel: PathBuf::from("a.txt"),
+                    generation: 1,
+                    entry: Some(entry(
+                        Status::Added,
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(50),
+                    )),
+                }],
+            },
+        );
+        assert_eq!(
+            state.baseline.changed[Path::new("a.txt")].status,
+            Status::Added
+        );
+        assert_eq!(
+            state.baseline.changed[Path::new("a.txt")].changed_at,
+            first_seen
+        );
+    }
+
+    #[test]
+    fn a_head_check_rebuilds_only_when_the_head_really_moved() {
+        let mut state = with_a_changed_file();
+        assert_eq!(state.baseline.ver, 1);
+
+        let effects = reduce(
+            &mut state,
+            Action::HeadChecked {
+                oid: Some("aaa".to_owned()),
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.baseline.ver, 1);
+
+        let effects = reduce(
+            &mut state,
+            Action::HeadChecked {
+                oid: Some("bbb".to_owned()),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Head,
+                ver: 2
+            }],
+            "{effects:?}"
+        );
+        assert_eq!(state.baseline.ver, 2);
+
+        // A snapshot baseline has nothing to do with where `HEAD` points,
+        // so a move under it costs no rebuild at all.
+        let effects = reduce(&mut state, Action::Command(Command::ToggleBaseline));
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Snapshot,
+                ver: 3
+            }]
+        );
+        let effects = reduce(
+            &mut state,
+            Action::HeadChecked {
+                oid: Some("ccc".to_owned()),
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.baseline.ver, 3);
+    }
+
+    #[test]
+    fn a_head_check_has_nothing_to_compare_against_before_the_first_build() {
+        let mut state = state();
+        assert_eq!(state.baseline.phase, Phase::Loading);
+        let effects = reduce(
+            &mut state,
+            Action::HeadChecked {
+                oid: Some("aaa".to_owned()),
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.baseline.ver, 1);
     }
 }

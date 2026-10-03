@@ -171,6 +171,9 @@ pub struct AppState {
     pub tree: TreeState,
     pub preview: PreviewState,
     pub baseline: BaselineState,
+    /// Generation of the newest stats request per path; an answer carrying
+    /// another one belongs to a request that has been superseded (I3).
+    pub stats_gen: BTreeMap<PathBuf, u64>,
     /// Set once a quit action has been handled.
     pub quitting: bool,
     /// Immutable rendering decisions derived from the configuration.
@@ -193,6 +196,7 @@ impl AppState {
             tree: TreeState::new(model),
             preview: PreviewState::default(),
             baseline: BaselineState::new(kind),
+            stats_gen: BTreeMap::new(),
             theme,
             icons,
             config,

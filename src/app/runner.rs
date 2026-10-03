@@ -2,11 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc::Sender;
 
-use crate::app::action::Action;
+use crate::app::action::{Action, StatAnswer};
 use crate::app::effect::Effect;
 use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
 use crate::core::fswatch::watcher::FsWatcher;
@@ -15,6 +15,33 @@ use crate::core::{dirload, preview};
 
 /// How often the clock tick fires.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the repository has to go quiet before `HEAD` is read (§8.2).
+const HEAD_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// How far apart two moves of `HEAD` are kept, so that a burst of commits
+/// costs one rebuild rather than one per event (§8.2).
+const HEAD_THROTTLE: Duration = Duration::from_millis(500);
+
+/// One `HEAD` check at a time, with the requests that arrived meanwhile.
+#[derive(Default)]
+struct HeadState {
+    /// A request is waiting to be answered.
+    pending: bool,
+    /// A check is under way.
+    running: bool,
+    /// What `HEAD` was last read as, and when that answer was sent. Both
+    /// belong to the check and not to one run of it: a check that starts
+    /// later has to keep the same spacing as the one it follows.
+    previous: Option<Option<String>>,
+    sent_at: Option<Instant>,
+}
+
+/// Takes the lock on `state`, a lock that a panic has left behind being no
+/// reason to stop reading the tree.
+fn lock(state: &Arc<Mutex<HeadState>>) -> std::sync::MutexGuard<'_, HeadState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The source of baseline content of the newest build, with its build number.
 type BaselineSlot = Arc<Mutex<Option<(u64, Arc<dyn BaselineSource>)>>>;
@@ -28,6 +55,8 @@ pub struct EffectRunner {
     /// The watch on the root, started by the first [`Effect::WatchDirs`] and
     /// kept alive for as long as the application runs.
     watcher: Mutex<Option<FsWatcher>>,
+    /// Whether a check of `HEAD` is wanted, and whether one is running.
+    head: Arc<Mutex<HeadState>>,
 }
 
 impl EffectRunner {
@@ -38,6 +67,7 @@ impl EffectRunner {
             action_tx,
             baseline: Arc::new(Mutex::new(None)),
             watcher: Mutex::new(None),
+            head: Arc::new(Mutex::new(HeadState::default())),
         }
     }
 
@@ -122,7 +152,124 @@ impl EffectRunner {
             }
             Effect::ScheduleTick => self.spawn_clock(),
             Effect::WatchDirs { add, remove } => self.watch(&add, &remove),
+            Effect::ComputeStats { at, paths } => self.compute_stats(at, &paths),
+            Effect::CheckHead => self.check_head(),
         }
+    }
+
+    /// Answers how some paths differ from the baseline (§7.3).
+    ///
+    /// The question is asked off the UI thread like every other read
+    /// (invariant I1), and only for the paths the reducer named: a batch of
+    /// changes costs one `git status` of those paths rather than one of the
+    /// whole work tree.
+    fn compute_stats(&self, at: SystemTime, paths: &[(PathBuf, u64)]) {
+        let root = self.root.clone();
+        let tx = self.action_tx.clone();
+        let asked = paths.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let rels: Vec<PathBuf> = asked.iter().map(|(rel, _)| rel.clone()).collect();
+            let answers = baseline::git::stats(&root, &rels, at);
+            if answers.is_empty() {
+                // Nothing could be worked out: the state it has is better
+                // than an answer nobody can check.
+                return;
+            }
+            let results = answers
+                .into_iter()
+                .zip(asked.iter())
+                .map(|((rel, entry), &(_, generation))| StatAnswer {
+                    rel,
+                    generation,
+                    entry,
+                })
+                .collect();
+            let action = Action::StatsComputed { results };
+            if let Err(err) = tx.blocking_send(action) {
+                tracing::debug!(%err, "store is gone, dropping stats");
+            }
+        });
+    }
+
+    /// Reads `HEAD` once the repository has gone quiet (§8.2).
+    ///
+    /// A request that arrives while a check runs is answered by the run in
+    /// progress rather than starting a second one, and only a value that
+    /// really moved is sent on: a repository that merely wrote its index
+    /// costs nothing but the read.
+    fn check_head(&self) {
+        {
+            let mut head = lock(&self.head);
+            head.pending = true;
+            if head.running {
+                return;
+            }
+            head.running = true;
+        }
+        let head = Arc::clone(&self.head);
+        let tx = self.action_tx.clone();
+        let root = self.root.clone();
+        tokio::spawn(async move {
+            loop {
+                // Everything from here on is read by this turn: a request
+                // that arrives later is the next turn's.
+                lock(&head).pending = false;
+                tokio::time::sleep(HEAD_DEBOUNCE).await;
+                let reading = root.clone();
+                let Ok(oid) =
+                    tokio::task::spawn_blocking(move || baseline::git::head_oid(&reading)).await
+                else {
+                    // The read itself failed, which is not a reason for
+                    // every later request to go unanswered.
+                    let mut state = lock(&head);
+                    state.running = false;
+                    state.pending = false;
+                    break;
+                };
+                let (moved, wait) = {
+                    let state = lock(&head);
+                    let moved = state
+                        .previous
+                        .as_ref()
+                        .is_none_or(|known| known.as_ref() != oid.as_ref());
+                    let wait = state.sent_at.map_or(Duration::ZERO, |sent| {
+                        HEAD_THROTTLE.saturating_sub(sent.elapsed())
+                    });
+                    (moved, wait)
+                };
+                if moved {
+                    // The rebuild of one move is under way while the next
+                    // move is being read, so the two are spaced out (§8.2).
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    let action = Action::HeadChecked { oid: oid.clone() };
+                    if tx.send(action).await.is_err() {
+                        // The store is gone: nobody is reading the tree.
+                        let mut state = lock(&head);
+                        state.running = false;
+                        state.pending = false;
+                        break;
+                    }
+                    lock(&head).sent_at = Some(Instant::now());
+                }
+                lock(&head).previous = Some(oid);
+                // Another request waits for this run rather than starting
+                // its own; otherwise the run is over and the flag is free.
+                let again = {
+                    let mut state = lock(&head);
+                    if state.pending {
+                        true
+                    } else {
+                        state.running = false;
+                        false
+                    }
+                };
+                if !again {
+                    break;
+                }
+            }
+        });
     }
 
     /// Applies the watch changes a listing asked for.
@@ -431,6 +578,96 @@ mod tests {
         assert!(doc.diff.is_none());
         assert!(doc.diff_note.is_none());
         assert_eq!(doc.lines, vec!["one", "changed"]);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_head_requests_is_answered_by_one_read() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(PathBuf::from("/root"), true, tx);
+        runner.run(Effect::CheckHead);
+        runner.run(Effect::CheckHead);
+        runner.run(Effect::CheckHead);
+
+        let action = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no head check in time")
+            .expect("channel closed");
+        assert!(matches!(action, Action::HeadChecked { .. }), "{action:?}");
+        let extra = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await;
+        assert!(extra.is_err(), "the same burst was read again: {extra:?}");
+    }
+
+    #[tokio::test]
+    async fn a_head_that_moved_again_is_reported_after_a_pause() {
+        let dir = changed_repo();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+
+        runner.run(Effect::CheckHead);
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no head check in time")
+            .expect("channel closed");
+        let Action::HeadChecked { oid: first_oid } = first else {
+            panic!("expected a head check, got {first:?}");
+        };
+        assert!(first_oid.is_some(), "the commit was not seen");
+        let reported = Instant::now();
+
+        // The branch goes where `HEAD` no longer names it, which costs no
+        // git of its own: the next read answers differently.
+        std::fs::write(
+            dir.path().join(".git/HEAD"),
+            "ref: refs/heads/no-such-branch\n",
+        )
+        .expect("write");
+        runner.run(Effect::CheckHead);
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no second head check in time")
+            .expect("channel closed");
+        let Action::HeadChecked { oid: second_oid } = second else {
+            panic!("expected a head check, got {second:?}");
+        };
+        assert_ne!(first_oid, second_oid);
+        let gap = reported.elapsed();
+        assert!(
+            gap >= HEAD_THROTTLE - Duration::from_millis(50),
+            "the move was reported again after {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stats_answer_carries_the_generation_it_answers_for() {
+        use crate::core::fsmodel::Status;
+
+        let dir = changed_repo();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        runner.run(Effect::ComputeStats {
+            at,
+            paths: vec![(PathBuf::from("a.txt"), 4), (PathBuf::from("gone.txt"), 9)],
+        });
+
+        let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no stats answer in time")
+            .expect("channel closed");
+        let Action::StatsComputed { results } = action else {
+            panic!("expected a stats answer, got {action:?}");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].rel, PathBuf::from("a.txt"));
+        assert_eq!(results[0].generation, 4);
+        let changed = results[0].entry.as_ref().expect("a.txt is changed");
+        assert_eq!(changed.status, Status::Modified);
+        assert_eq!(changed.changed_at, at);
+        // A path nothing is wrong with is answered too, so that it leaves
+        // the changed set rather than staying as it was.
+        assert_eq!(results[1].rel, PathBuf::from("gone.txt"));
+        assert_eq!(results[1].generation, 9);
+        assert!(results[1].entry.is_none());
     }
 
     async fn preview_loaded(

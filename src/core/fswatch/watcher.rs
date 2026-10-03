@@ -67,7 +67,11 @@ impl Shared {
                 // an entry inside it, which is reported on its own.
                 continue;
             };
-            if !self.watched().contains(directory) {
+            if !rel.starts_with(".git") && !self.watched().contains(directory) {
+                // The repository metadata is watched below its first level as
+                // well, so that a branch moving is seen; the tree is watched
+                // one directory at a time, and only where a listing asked
+                // for it (§7.1, §8.2).
                 continue;
             }
             let Some(name) = rel.file_name() else {
@@ -141,6 +145,17 @@ pub struct FsWatcher {
     flush: tokio::task::JoinHandle<()>,
 }
 
+/// The repository metadata next to the tree, with how it has to be watched
+/// (§8.2).
+///
+/// Nothing ever lists it, so it is watched here rather than through a
+/// listing: `HEAD` alone is enough to notice a checkout, but a commit only
+/// moves the branch under `refs`, and that one has to be followed down.
+const GIT_WATCHES: [(&str, RecursiveMode); 2] = [
+    (".git", RecursiveMode::NonRecursive),
+    (".git/refs", RecursiveMode::Recursive),
+];
+
 impl FsWatcher {
     /// Starts watching `root`, with the events sent to `tx` as actions.
     ///
@@ -167,6 +182,12 @@ impl FsWatcher {
             flush,
         };
         this.watch(Path::new(""))?;
+        for (rel, mode) in GIT_WATCHES {
+            let path = this.path(Path::new(rel));
+            if path.is_dir() {
+                let _ = this.add_watch(Path::new(rel), mode);
+            }
+        }
         Ok(this)
     }
 
@@ -175,12 +196,16 @@ impl FsWatcher {
     /// The directory is known as watched before the backend is told about
     /// it, so an event that races the call is kept rather than dropped.
     pub fn watch(&mut self, rel: &Path) -> notify::Result<()> {
+        self.add_watch(rel, RecursiveMode::NonRecursive)
+    }
+
+    fn add_watch(&mut self, rel: &Path, mode: RecursiveMode) -> notify::Result<()> {
         if self.shared.watched().contains(rel) {
             return Ok(());
         }
         self.shared.watched().insert(rel.to_path_buf());
         let path = self.path(rel);
-        if let Err(err) = self.watcher.watch(&path, RecursiveMode::NonRecursive) {
+        if let Err(err) = self.watcher.watch(&path, mode) {
             self.shared.watched().remove(rel);
             return Err(err);
         }
@@ -337,6 +362,30 @@ mod tests {
         assert!(
             !reports_within(&mut rx, Duration::from_millis(600)).await,
             "a subdirectory leaked into the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_repository_metadata_is_reported_from_where_it_sits() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join(".git/refs/heads")).expect("mkdir");
+        let (_runner, mut rx) = watching(dir.path());
+        settle(&mut rx).await;
+
+        // `.git/refs` is followed down to its leaves, so a branch that moves
+        // is seen even though no directory below `.git` is ever listed.
+        std::fs::write(dir.path().join(".git/refs/heads/main"), "000000\n").expect("write");
+
+        let action = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("no batch in time")
+            .expect("channel closed");
+        let changes = change(&action);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.rel.as_path() == Path::new(".git/refs/heads/main")),
+            "{changes:?}"
         );
     }
 

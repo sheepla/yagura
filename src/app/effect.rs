@@ -5,6 +5,7 @@
 //! which keeps the reducer free of handles and side effects.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::core::fsmodel::NodeId;
 
@@ -47,4 +48,15 @@ pub enum Effect {
         add: Vec<PathBuf>,
         remove: Vec<PathBuf>,
     },
+    /// Work out how some paths differ from the baseline (§7.3).
+    ComputeStats {
+        /// When the changes were seen: a path that has just become changed
+        /// takes this as the moment it changed (invariant I1).
+        at: SystemTime,
+        /// The paths to ask about, each with the generation of its request;
+        /// an answer carrying another one is stale.
+        paths: Vec<(PathBuf, u64)>,
+    },
+    /// Read `HEAD` once the repository has gone quiet (§8.2).
+    CheckHead,
 }

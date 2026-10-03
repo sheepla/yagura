@@ -10,6 +10,7 @@ use crate::app::action::Action;
 use crate::app::command::Command;
 use crate::app::effect::Effect;
 use crate::app::state::{AppState, Focus, Overlay, SortMode};
+use crate::core::baseline::{Kind, Phase};
 use crate::core::dirload::DirError;
 use crate::core::fsmodel::{NodeId, NodeKind};
 use crate::core::fswatch::{ChangeKind, FsChange};
@@ -271,13 +272,32 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     // Where the selection sits now, in case this listing takes the row away.
     state.tree.refresh();
     let selected_row = state.tree.selected_index();
+    // The first listing of a directory puts files in the tree that nothing
+    // has watched until now: what they are is whatever the baseline said
+    // when it was built, which may be from before they changed (§7.3).
+    let first_listing = !state
+        .tree
+        .model
+        .get(*node)
+        .is_some_and(|entry| entry.loaded);
+    let mut effects = Vec::new();
     match result {
         Ok(entries) => {
-            state.tree.model.merge_children(*node, entries);
+            let children = state.tree.model.merge_children(*node, entries);
             sort_children(&mut state.tree.model, *node, state.tree.sort);
             // The listing pruned the rows of deleted files; the baseline
             // puts them back before the rows are shown again.
             crate::app::reduce::apply_changed(state);
+            if first_listing && state.now != SystemTime::UNIX_EPOCH {
+                let at = state.now;
+                let files = children
+                    .into_iter()
+                    .filter_map(|child| state.tree.model.get(child))
+                    .filter(|child| !child.is_expandable())
+                    .map(|child| child.rel.clone())
+                    .collect();
+                request_stats(state, at, files, &mut effects);
+            }
         }
         Err(err) => {
             tracing::warn!(?node, %err, "directory listing failed");
@@ -292,7 +312,7 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     }
     restore_selection(state, selected_row);
     state.tree.refresh();
-    Vec::new()
+    effects
 }
 
 /// Puts the selection back after a listing took the row it was on.
@@ -353,6 +373,8 @@ fn display_rel(state: &AppState, node: NodeId) -> String {
 pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -> Vec<Effect> {
     let mut effects = Vec::new();
     let mut relists = BTreeSet::new();
+    let mut stats = BTreeSet::new();
+    let mut head_may_have_moved = false;
     let mut ignore_changed = false;
     let mut preview_changed = false;
 
@@ -361,6 +383,7 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
         if rel.starts_with(".git") {
             // The repository metadata is not part of the tree: a new commit
             // reaches the baseline through a head check instead (§8.2).
+            head_may_have_moved = true;
             continue;
         }
         if is_ignore_file(rel) {
@@ -378,14 +401,25 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
         {
             relists.insert(parent.to_path_buf());
         }
-        if change.kind == ChangeKind::Remove
-            && state
+        let listed = state.tree.model.lookup(rel);
+        let is_directory = listed.is_some_and(|node| {
+            state
                 .tree
                 .model
-                .lookup(rel)
-                .and_then(|node| state.tree.model.get(node))
-                .is_some_and(|node| node.is_expandable())
-        {
+                .get(node)
+                .is_some_and(|entry| entry.is_expandable())
+        });
+        if is_directory {
+            // A directory has no status of its own, but every file below it
+            // does - and once the directory is gone they are all changed at
+            // once (§7.3).
+            if change.kind == ChangeKind::Remove {
+                stats.extend(descendant_files(state, rel));
+            }
+        } else {
+            stats.insert(change.rel.clone());
+        }
+        if change.kind == ChangeKind::Remove && is_directory {
             // The directory is gone, and with it the watches below it; they
             // are dropped together so that the same path can be watched
             // again once something recreates it (§7.1).
@@ -411,6 +445,10 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
             issue_load(state, node, &mut effects);
         }
     }
+    if head_may_have_moved {
+        effects.push(Effect::CheckHead);
+    }
+    request_stats(state, at, stats, &mut effects);
     if preview_changed {
         effects.extend(crate::features::preview::reducer::reload(state));
     }
@@ -423,10 +461,88 @@ pub fn on_rescan(state: &mut AppState) -> Vec<Effect> {
     for node in loaded_dirs(state) {
         issue_load(state, node, &mut effects);
     }
+    // The listings come back either way; what they cannot say is whether a
+    // file they already held has changed, so every file in them is asked
+    // about. Past the argument budget one `git status` answers for all of
+    // them anyway (§7.4).
+    let at = state.now;
+    let files = loaded_files(state).into_iter().collect();
+    request_stats(state, at, files, &mut effects);
     if state.preview.path.is_some() {
         effects.extend(crate::features::preview::reducer::reload(state));
     }
     effects
+}
+
+/// Registers a stats request for `paths` and asks for it (§7.3).
+///
+/// The generation is handed out per path, so that an answer to an older
+/// request for one path cannot undo what a newer one has already said
+/// (invariant I3). Without a baseline to compare against there is no answer
+/// to give, and the question is not asked at all.
+fn request_stats(
+    state: &mut AppState,
+    at: SystemTime,
+    paths: BTreeSet<PathBuf>,
+    effects: &mut Vec<Effect>,
+) {
+    if state.baseline.kind != Kind::Head || state.baseline.phase != Phase::Ready {
+        return;
+    }
+    let requested: Vec<(PathBuf, u64)> = paths
+        .into_iter()
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| {
+            let generation = state.stats_gen.entry(rel.clone()).or_insert(0);
+            *generation += 1;
+            (rel, *generation)
+        })
+        .collect();
+    if !requested.is_empty() {
+        effects.push(Effect::ComputeStats {
+            at,
+            paths: requested,
+        });
+    }
+}
+
+/// The files below `rel`, for a directory that is being taken away.
+fn descendant_files(state: &AppState, rel: &Path) -> Vec<PathBuf> {
+    let Some(node) = state.tree.model.lookup(rel) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        let Some(entry) = state.tree.model.get(node) else {
+            continue;
+        };
+        if entry.is_expandable() {
+            stack.extend(state.tree.model.children(node));
+        } else {
+            found.push(entry.rel.clone());
+        }
+    }
+    found
+}
+
+/// The files of every listing in hand: all of them could have changed while
+/// nothing was listening (§7.4).
+fn loaded_files(state: &AppState) -> Vec<PathBuf> {
+    loaded_dirs(state)
+        .into_iter()
+        .flat_map(|dir| {
+            state
+                .tree
+                .model
+                .children(dir)
+                .iter()
+                .filter_map(move |child| {
+                    let child = state.tree.model.get(*child)?;
+                    (!child.is_expandable()).then(|| child.rel.clone())
+                })
+        })
+        .collect()
 }
 
 /// The directories whose listing is in hand: only those can have gone stale.
@@ -688,7 +804,138 @@ mod tests {
     fn the_repository_metadata_reaches_nothing_in_the_tree() {
         let mut state = populated();
         let effects = on_fs_batch(&mut state, &[change(".git/HEAD", ChangeKind::Modify)], at());
+        assert_eq!(effects, vec![Effect::CheckHead], "{effects:?}");
+    }
+
+    /// The paths a batch of changes asked to be checked, with the
+    /// generation each was asked with.
+    fn stats_requested(effects: &[Effect]) -> Vec<(PathBuf, u64)> {
+        effects
+            .iter()
+            .flat_map(|effect| match effect {
+                Effect::ComputeStats { paths, .. } => paths.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_file_is_asked_how_it_differs() {
+        let mut state = populated();
+        state.baseline.phase = Phase::Ready;
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            at(),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::ComputeStats {
+                at: at(),
+                paths: vec![(PathBuf::from("docs/guide.md"), 1)],
+            }],
+            "{effects:?}"
+        );
+        // The next question about the same path is a newer one, whose
+        // answer cannot be mistaken for the first one's (invariant I3).
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            at(),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::ComputeStats {
+                at: at(),
+                paths: vec![(PathBuf::from("docs/guide.md"), 2)],
+            }],
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_about_without_a_baseline_to_compare_against() {
+        let mut state = populated();
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            at(),
+        );
         assert!(effects.is_empty(), "{effects:?}");
+
+        state.baseline.kind = Kind::Snapshot;
+        state.baseline.phase = Phase::Ready;
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            at(),
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn the_first_listing_asks_about_the_files_it_brings_in() {
+        let mut state = state();
+        state.baseline.phase = Phase::Ready;
+        state.now = at();
+        let root = state.tree.model.root_id();
+        let generation = state.tree.load_gen[&root];
+        let first = crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: root,
+                generation,
+                result: Ok(root_entries()),
+            },
+        );
+        assert_eq!(
+            first,
+            vec![Effect::ComputeStats {
+                at: at(),
+                paths: vec![(PathBuf::from("README.md"), 1)],
+            }],
+            "{first:?}"
+        );
+        // The same listing read again says nothing new about its files.
+        let again = crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: root,
+                generation,
+                result: Ok(root_entries()),
+            },
+        );
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn a_removed_directory_asks_about_the_files_it_held() {
+        let mut state = populated();
+        state.baseline.phase = Phase::Ready;
+        let root = state.tree.model.root_id();
+        let effects = on_fs_batch(&mut state, &[change("docs", ChangeKind::Remove)], at());
+        assert_eq!(load_dirs(&effects), vec![root]);
+        assert_eq!(
+            stats_requested(&effects),
+            vec![(PathBuf::from("docs/guide.md"), 1)],
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_rescan_asks_about_every_file_in_hand() {
+        let mut state = populated();
+        state.baseline.phase = Phase::Ready;
+        state.now = at();
+        let effects = on_rescan(&mut state);
+        assert_eq!(
+            stats_requested(&effects),
+            vec![
+                (PathBuf::from("README.md"), 1),
+                (PathBuf::from("docs/guide.md"), 1),
+            ],
+            "{effects:?}"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use ratatui::crossterm::event::KeyEvent;
 
 use super::command::Command;
+use crate::core::baseline::ChangedEntry;
 use crate::core::dirload::DirError;
 use crate::core::fsmodel::{DirEntry, NodeId};
 use crate::core::preview::{Doc, PreviewError};
@@ -60,4 +61,21 @@ pub enum Action {
     /// So much happened at once that nothing was remembered: the tree has to
     /// be read again (§7.2).
     FsRescanNeeded,
+    /// The status of some paths came back from the baseline (§7.3).
+    StatsComputed { results: Vec<StatAnswer> },
+    /// What `git rev-parse HEAD` answered (§8.2).
+    HeadChecked { oid: Option<String> },
+}
+
+/// The status of one path an [`crate::app::effect::Effect::ComputeStats`]
+/// asked about.
+#[derive(Debug)]
+pub struct StatAnswer {
+    /// Path relative to the root.
+    pub rel: PathBuf,
+    /// Generation the request carried; a mismatch means the answer is stale
+    /// and must be dropped (invariant I3).
+    pub generation: u64,
+    /// The new entry, or `None` when the path no longer differs at all.
+    pub entry: Option<ChangedEntry>,
 }
