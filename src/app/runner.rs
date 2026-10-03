@@ -99,8 +99,11 @@ fn scan_files(root: &Path, ignore_enabled: bool, generation: u64, tx: &Sender<Ac
         .filter_entry(|entry| !dirload::is_skipped(entry.file_name()));
     builder.build_parallel().run(|| {
         let root = root.to_path_buf();
-        let tx = tx.clone();
-        let mut chunk: Vec<PathBuf> = Vec::with_capacity(SCAN_CHUNK);
+        let mut collector = Collector {
+            generation,
+            tx: tx.clone(),
+            chunk: Vec::with_capacity(SCAN_CHUNK),
+        };
         Box::new(move |result| {
             let Ok(entry) = result else {
                 return ignore::WalkState::Continue;
@@ -108,16 +111,7 @@ fn scan_files(root: &Path, ignore_enabled: bool, generation: u64, tx: &Sender<Ac
             if entry.file_type().is_some_and(|kind| kind.is_file())
                 && let Ok(rel) = entry.path().strip_prefix(&root)
             {
-                chunk.push(rel.to_path_buf());
-                if chunk.len() >= SCAN_CHUNK {
-                    let rels = std::mem::take(&mut chunk);
-                    let action = Action::FilesFound { generation, rels };
-                    if tx.blocking_send(action).is_err() {
-                        // The store is gone: nobody is reading the tree.
-                        return ignore::WalkState::Quit;
-                    }
-                    chunk = Vec::with_capacity(SCAN_CHUNK);
-                }
+                return collector.push(rel.to_path_buf());
             }
             ignore::WalkState::Continue
         })
@@ -127,6 +121,52 @@ fn scan_files(root: &Path, ignore_enabled: bool, generation: u64, tx: &Sender<Ac
         .is_err()
     {
         tracing::debug!("store is gone, dropping the end of the walk");
+    }
+}
+
+/// One walk worker's share of the paths it found, in chunks.
+///
+/// The parallel walk owns the closure that holds it and lets it go when the
+/// walk ends, so `Drop` sends whatever the last chunk never filled: every
+/// worker collects below `SCAN_CHUNK` on a small tree, or on its share of a
+/// big one, and those paths are the ones the list would otherwise never see.
+struct Collector {
+    generation: u64,
+    tx: Sender<Action>,
+    chunk: Vec<PathBuf>,
+}
+
+impl Collector {
+    /// Takes one path, sending a chunk once it holds a walk's worth of them.
+    fn push(&mut self, rel: PathBuf) -> ignore::WalkState {
+        self.chunk.push(rel);
+        if self.chunk.len() < SCAN_CHUNK {
+            return ignore::WalkState::Continue;
+        }
+        let rels = std::mem::replace(&mut self.chunk, Vec::with_capacity(SCAN_CHUNK));
+        let action = Action::FilesFound {
+            generation: self.generation,
+            rels,
+        };
+        if self.tx.blocking_send(action).is_err() {
+            // The store is gone: nobody is reading the list.
+            return ignore::WalkState::Quit;
+        }
+        ignore::WalkState::Continue
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        if self.chunk.is_empty() {
+            return;
+        }
+        let rels = std::mem::take(&mut self.chunk);
+        let action = Action::FilesFound {
+            generation: self.generation,
+            rels,
+        };
+        let _ = self.tx.blocking_send(action);
     }
 }
 
@@ -759,6 +799,46 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, std::ffi::OsString::from("a.txt"));
         assert_eq!(entries[0].kind, NodeKind::File);
+    }
+
+    #[tokio::test]
+    async fn a_walk_with_fewer_paths_than_a_chunk_still_answers_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("file{i}.txt")), "x").expect("write");
+        }
+        let root = dir.path().to_path_buf();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::task::spawn_blocking(move || scan_files(&root, false, 3, &tx))
+            .await
+            .expect("the walk runs");
+
+        let mut found = Vec::new();
+        let mut done = false;
+        while let Some(action) = rx.recv().await {
+            match action {
+                Action::FilesFound { generation, rels } => {
+                    assert_eq!(generation, 3);
+                    found.extend(rels);
+                }
+                Action::FilesScanDone { generation } => {
+                    assert_eq!(generation, 3);
+                    done = true;
+                    break;
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+        }
+        assert!(done, "the walk reported its end");
+        found.sort();
+        let mut expected: Vec<PathBuf> = (0..5)
+            .map(|i| PathBuf::from(format!("file{i}.txt")))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the paths that never filled a chunk still reach the list"
+        );
     }
 
     #[tokio::test]
