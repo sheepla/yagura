@@ -6,9 +6,11 @@ preview on the right, and puts the mode, the position in the tree and anything
 that needs saying on the status bar.
 
 This is milestone M0 (program skeleton, terminal lifecycle, Flux loop, layout),
-M1 (the static file tree), M2 (the preview content, with syntax highlighting)
-and M3 (the git baseline and the diff). Filesystem watching, the finders and
-the help overlay are not implemented yet.
+M1 (the static file tree), M2 (the preview content, with syntax highlighting),
+M3 (the git baseline and the diff) and M4 (real-time updates: watching,
+batches, refreshed statistics, the head check, ages and the `F`/`c`/`o` keys).
+The snapshot baseline, the finders, the help overlay, the editor launch and
+the markdown rendering are not implemented yet.
 
 ## Status
 
@@ -18,7 +20,8 @@ the help overlay are not implemented yet.
 | M1 | `core/fsmodel`, lazy tree, sorting, scrolling, icons, status bar, keymap | done |
 | M2 | `core/preview`, lazy document loading, sanitized body, line numbers, scrolling, syntax highlighting | done |
 | M3 | git baseline, diff engine, InlineDiff / SideBySide, `M/A/D` in the tree, `+N -N ~N` counts, hunk keys | done |
-| M2+ | watching, finders, markdown, help, editor | not started |
+| M4 | filesystem watching, batched updates, statistics refresh, `.git` head check, ages and freshness, follow / filter / order | done |
+| M5+ | snapshot baseline, finders, help, editor, markdown | not started |
 
 ## Build
 
@@ -64,6 +67,9 @@ In the tree:
 | `g` / `G` | First / last row |
 | `d` / `u` | Half a screen down / up |
 | `f` / `b` | A screen down / up |
+| `F` | Follow the newest change, then any change after it |
+| `c` | Show only the paths that changed |
+| `o` | Order the siblings by name, or by the most recent change |
 
 In the preview:
 
