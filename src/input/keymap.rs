@@ -102,6 +102,10 @@ pub const BINDINGS: &[Binding] = &[
     // The finder overlays (§5): a plain character belongs to the query box,
     // so it never appears here and the reducer hands it over instead (§13.1).
     binding!(BOTH, KeyCode::Char('p'), CONTROL, OpenFiles),
+    binding!(BOTH, KeyCode::Char('g'), CONTROL, OpenGrep),
+    // Inside the overlay the two lists are switched between with the same
+    // key that opened them (§13.3).
+    binding!(FINDER, KeyCode::Char('g'), CONTROL, OpenGrep),
     // Line editing.
     binding!(FINDER, KeyCode::Left, NONE, FinderCursorLeft),
     binding!(FINDER, KeyCode::Right, NONE, FinderCursorRight),
@@ -503,6 +507,23 @@ mod tests {
         assert_eq!(
             command_for(Context::Finder, ctrl(KeyCode::Char('n'))),
             Some(Command::FinderSelectDown)
+        );
+    }
+
+    #[test]
+    fn ctrl_g_opens_the_search_from_the_panes_and_is_the_way_between_the_lists() {
+        for context in [Context::Tree, Context::Preview] {
+            assert_eq!(
+                command_for(context, ctrl(KeyCode::Char('g'))),
+                Some(Command::OpenGrep),
+                "{context:?}"
+            );
+        }
+        // Inside an overlay it does not type and it does not select: it is
+        // the switch between the file list and the search (§13.3).
+        assert_eq!(
+            command_for(Context::Finder, ctrl(KeyCode::Char('g'))),
+            Some(Command::OpenGrep)
         );
     }
 

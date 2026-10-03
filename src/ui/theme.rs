@@ -25,6 +25,8 @@ pub enum Role {
     PreviewHeader,
     PreviewPlaceholder,
     PreviewGutter,
+    /// The part of a preview line a grep hit lands on (§13.3).
+    MatchHighlight,
     /// A line only the current file has, in a diff.
     DiffAdded,
     /// A line only the baseline has, in a diff.
@@ -107,7 +109,7 @@ fn color(role: Role) -> Color {
         Role::TreeDirectory => Color::Blue,
         Role::TreeSymlink => Color::Cyan,
         Role::TreeUnreadable | Role::StatusError | Role::StatusDeleted => Color::Red,
-        Role::TreeSelected => Color::Reset,
+        Role::TreeSelected | Role::MatchHighlight => Color::Reset,
         Role::PreviewHeader | Role::StatusInfo | Role::StatusModified | Role::TreeFresh => {
             Color::Yellow
         }
@@ -130,7 +132,7 @@ fn color(role: Role) -> Color {
 fn modifiers(role: Role) -> Modifier {
     match role {
         Role::PaneTitle => Modifier::BOLD,
-        Role::TreeSelected => Modifier::REVERSED | Modifier::BOLD,
+        Role::TreeSelected | Role::MatchHighlight => Modifier::REVERSED | Modifier::BOLD,
         Role::TreeDirectory => Modifier::BOLD,
         Role::TreeFresh => Modifier::BOLD,
         Role::StatusMode => Modifier::REVERSED | Modifier::BOLD,
@@ -180,6 +182,7 @@ mod tests {
             Role::SyntaxNumber,
             Role::SyntaxType,
             Role::SyntaxFunction,
+            Role::MatchHighlight,
         ] {
             let style = theme.style(role);
             let color = style.fg.expect("a color");

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::app::action::Action;
 use crate::app::command::Command;
 use crate::app::effect::Effect;
-use crate::app::state::{AppState, Focus};
+use crate::app::state::{AppState, Focus, Overlay};
 use crate::core::preview::{Doc, PreviewError};
 use crate::core::text;
 use crate::features::preview::state::PreviewStatus;
@@ -144,11 +144,18 @@ pub fn on_loaded(
 /// headed; the tree has its turn again once neither is true (§13.2).
 pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
     if state.overlay.is_finder() || state.tree.jump.is_some() {
+        // While the grep list is up the pane is aimed at the line of the row
+        // it has selected, so the reader lands where the row points (§13.3).
+        if state.overlay == Overlay::Grep {
+            let hit = state.finder.selected_match();
+            state.preview.aim_at(hit);
+        }
+        let overlay = state.overlay;
         let rel = state
             .tree
             .jump
             .clone()
-            .or_else(|| state.finder.selected_path());
+            .or_else(|| state.finder.selected_path(overlay));
         return match rel {
             Some(rel) => aim(state, rel),
             None => {
@@ -182,6 +189,7 @@ pub fn sync_target(state: &mut AppState) -> Vec<Effect> {
 
 /// Points the preview at `rel` unless it is already there.
 fn aim(state: &mut AppState, rel: PathBuf) -> Vec<Effect> {
+    state.preview.aimed_at(&rel);
     if state.preview.path.as_ref() == Some(&rel) {
         return Vec::new();
     }

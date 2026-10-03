@@ -12,7 +12,9 @@ use crate::app::effect::Effect;
 use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
 use crate::core::fswatch::watcher::FsWatcher;
 use crate::core::preview::Baseline;
+use crate::core::text;
 use crate::core::{dirload, preview};
+use crate::features::finder::grep;
 
 /// How often the clock tick fires.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -128,6 +130,162 @@ fn scan_files(root: &Path, ignore_enabled: bool, generation: u64, tx: &Sender<Ac
     }
 }
 
+/// Runs one `rg` for the finder and sends its hits back (§13.3).
+///
+/// The output is read as it is produced rather than after the run, so a
+/// large repository starts filling the list while the rest of it is still
+/// being read. The limit stops the process rather than the reading of it:
+/// what has been found beyond it is never shown.
+async fn run_grep(
+    root: &Path,
+    ignore_enabled: bool,
+    generation: u64,
+    pattern: &str,
+    tx: &Sender<Action>,
+) {
+    let (program, args) = grep::command(pattern, ignore_enabled);
+    let started = tokio::process::Command::new(&program)
+        .args(&args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // A superseded run takes its process with it (invariant I3).
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match started {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            send_grep(
+                tx,
+                Action::GrepMissing {
+                    generation,
+                    message: "ripgrep (`rg`) is not installed".to_owned(),
+                },
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            send_grep(
+                tx,
+                Action::GrepFailed {
+                    generation,
+                    message: text::os_error(&err),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return;
+    };
+    // The errors are read on the side: a run that complains about every
+    // file would otherwise fill the pipe and wait on itself.
+    let drained = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut batch = Vec::with_capacity(grep::CHUNK);
+    let mut hits = 0usize;
+    let mut truncated = false;
+    let mut failure = None;
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(err) => {
+                failure = Some(text::os_error(&err));
+                break;
+            }
+        };
+        // Only `match` events carry a row; the rest of the stream is `rg`
+        // talking about itself.
+        let Some(hit) = grep::parse(&line) else {
+            continue;
+        };
+        batch.push(hit);
+        hits += 1;
+        if batch.len() >= grep::CHUNK {
+            let chunk = Action::GrepChunk {
+                generation,
+                matches: std::mem::take(&mut batch),
+            };
+            if tx.send(chunk).await.is_err() {
+                return;
+            }
+        }
+        if hits >= grep::MATCH_LIMIT {
+            truncated = true;
+            let _ = child.kill().await;
+            break;
+        }
+    }
+    if !batch.is_empty() {
+        let chunk = Action::GrepChunk {
+            generation,
+            matches: batch,
+        };
+        if tx.send(chunk).await.is_err() {
+            return;
+        }
+    }
+    let errors = drained.await.unwrap_or_default();
+    let status = child.wait().await.ok().and_then(|status| status.code());
+    // `rg` reports a pattern it cannot take as a failure (§7), which is
+    // worth showing; a run stopped at the limit reports as one too, and
+    // that is not a failure of the pattern.
+    if let Some(message) = failure {
+        send_grep(
+            tx,
+            Action::GrepFailed {
+                generation,
+                message,
+            },
+        )
+        .await;
+        return;
+    }
+    if status == Some(2) && !truncated {
+        let message = errors.trim();
+        let message = if message.is_empty() {
+            "rg failed".to_owned()
+        } else {
+            message.to_owned()
+        };
+        send_grep(
+            tx,
+            Action::GrepFailed {
+                generation,
+                message,
+            },
+        )
+        .await;
+        return;
+    }
+    send_grep(
+        tx,
+        Action::GrepDone {
+            generation,
+            truncated,
+        },
+    )
+    .await;
+}
+
+/// Sends one grep answer, or stops when nobody is reading the channel.
+async fn send_grep(tx: &Sender<Action>, action: Action) {
+    if tx.send(action).await.is_err() {
+        tracing::debug!("store is gone, dropping a grep answer");
+    }
+}
+
 /// Starts effects and returns their results as actions.
 pub struct EffectRunner {
     root: PathBuf,
@@ -143,6 +301,9 @@ pub struct EffectRunner {
     snapshot: SnapshotSlot,
     /// Whether the scan has been started, so that it runs exactly once.
     snapshot_started: AtomicBool,
+    /// The grep run the finder last asked for, so that the next one can
+    /// stop it (§13.3).
+    grep: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl EffectRunner {
@@ -156,6 +317,7 @@ impl EffectRunner {
             head: Arc::new(Mutex::new(HeadState::default())),
             snapshot: Arc::new(Mutex::new(None)),
             snapshot_started: AtomicBool::new(false),
+            grep: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -178,6 +340,32 @@ impl EffectRunner {
             ));
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(captured);
         });
+    }
+
+    /// Starts a grep run for one query, stopping whatever the last one left
+    /// behind (§13.3).
+    ///
+    /// The run waits for the query to go quiet first, so that a burst of
+    /// keystrokes costs one `rg` rather than one per character; the run
+    /// before it is aborted during that wait, so only one answer can land
+    /// (invariant I3).
+    fn start_grep(&self, generation: u64, pattern: String) {
+        let previous = self
+            .grep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+        let root = self.root.clone();
+        let ignore_enabled = self.ignore_enabled;
+        let tx = self.action_tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(grep::DEBOUNCE_MS)).await;
+            run_grep(&root, ignore_enabled, generation, &pattern, &tx).await;
+        });
+        *self.grep.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
     }
 
     /// Runs one effect.
@@ -287,6 +475,10 @@ impl EffectRunner {
                     scan_files(&root, ignore_enabled, generation, &tx);
                 });
             }
+            Effect::StartGrep {
+                generation,
+                pattern,
+            } => self.start_grep(generation, pattern),
         }
     }
 
@@ -941,5 +1133,181 @@ mod tests {
             panic!("expected a preview result");
         };
         result.expect("the preview must load")
+    }
+
+    /// One search over a small file: the hits, then the end of the run.
+    ///
+    /// A machine without `rg` answers [`Action::GrepMissing`] instead, which
+    /// is a result of its own (§13.3); the test holds either way.
+    #[tokio::test]
+    async fn a_search_reports_the_lines_the_pattern_is_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "one\nneedle here\nand needle again\n",
+        )
+        .expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        runner.run(Effect::StartGrep {
+            generation: 5,
+            pattern: "needle".to_owned(),
+        });
+
+        let mut hits = 0;
+        loop {
+            let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("no grep answer in time")
+                .expect("channel closed");
+            match action {
+                Action::GrepChunk {
+                    generation,
+                    matches,
+                } => {
+                    assert_eq!(generation, 5, "an answer to another query");
+                    assert_eq!(matches[0].rel, PathBuf::from("a.txt"));
+                    hits += matches.len();
+                }
+                Action::GrepDone {
+                    generation,
+                    truncated,
+                } => {
+                    assert_eq!(generation, 5);
+                    assert!(!truncated, "the file is nowhere near the limit");
+                    break;
+                }
+                // Nothing to run the search with: the overlay says so instead.
+                Action::GrepMissing { generation, .. } => {
+                    assert_eq!(generation, 5);
+                    return;
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+        }
+        assert_eq!(hits, 2, "the two lines the pattern is on");
+    }
+
+    #[tokio::test]
+    async fn only_the_last_search_of_a_burst_of_them_answers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut body = String::new();
+        for index in 0..400 {
+            body.push_str(&format!("line {index} needle\n"));
+        }
+        std::fs::write(dir.path().join("a.txt"), body).expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+
+        // The keystrokes of a pattern, one `StartGrep` per one of them: only
+        // the last may be heard from, and no process is left behind (I3).
+        runner.run(Effect::StartGrep {
+            generation: 1,
+            pattern: "n".to_owned(),
+        });
+        runner.run(Effect::StartGrep {
+            generation: 2,
+            pattern: "ne".to_owned(),
+        });
+        runner.run(Effect::StartGrep {
+            generation: 3,
+            pattern: "needle".to_owned(),
+        });
+
+        loop {
+            let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("no grep answer in time")
+                .expect("channel closed");
+            match action {
+                Action::GrepChunk { generation, .. } => {
+                    assert_eq!(
+                        generation, 3,
+                        "a search that was superseded answered: {action:?}"
+                    );
+                }
+                Action::GrepDone { generation, .. } | Action::GrepMissing { generation, .. } => {
+                    assert_eq!(
+                        generation, 3,
+                        "a search that was superseded answered: {action:?}"
+                    );
+                    break;
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pattern_the_engine_cannot_take_comes_back_as_a_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("a.txt"), "text\n").expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        runner.run(Effect::StartGrep {
+            generation: 1,
+            // A group that is opened and never closed (§7).
+            pattern: "(a".to_owned(),
+        });
+
+        let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no grep answer in time")
+            .expect("channel closed");
+        match action {
+            Action::GrepFailed {
+                generation,
+                message,
+            } => {
+                assert_eq!(generation, 1);
+                assert!(!message.is_empty(), "the engine said nothing about it");
+            }
+            Action::GrepMissing { .. } => {}
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_stops_at_the_limit_and_says_that_it_did() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("many.txt"),
+            "needle\n".repeat(grep::MATCH_LIMIT + 50),
+        )
+        .expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        runner.run(Effect::StartGrep {
+            generation: 1,
+            pattern: "needle".to_owned(),
+        });
+
+        let mut hits = 0;
+        loop {
+            let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("no grep answer in time")
+                .expect("channel closed");
+            match action {
+                Action::GrepChunk {
+                    generation,
+                    matches,
+                } => {
+                    assert_eq!(generation, 1);
+                    hits += matches.len();
+                }
+                Action::GrepDone {
+                    generation,
+                    truncated,
+                } => {
+                    assert_eq!(generation, 1);
+                    assert!(truncated, "the list stopped without saying so");
+                    break;
+                }
+                Action::GrepMissing { .. } => return,
+                other => panic!("unexpected answer: {other:?}"),
+            }
+        }
+        assert_eq!(hits, grep::MATCH_LIMIT, "the run was cut off at the limit");
     }
 }

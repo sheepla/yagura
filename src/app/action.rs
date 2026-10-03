@@ -82,6 +82,27 @@ pub enum Action {
         /// Walk that finished; a mismatch means it was superseded (I3).
         generation: u64,
     },
+    /// One batch of hits from the `rg` run of `generation` (§13.3).
+    GrepChunk {
+        /// Run the hits belong to; a mismatch means they are stale (I3).
+        generation: u64,
+        /// Hits relative to the root, in the order `rg` reported them, which
+        /// groups them by file.
+        matches: Vec<crate::features::finder::grep::GrepMatch>,
+    },
+    /// The run of `generation` is over (§13.3).
+    GrepDone {
+        /// Run that finished; a mismatch means it was superseded (I3).
+        generation: u64,
+        /// The run was stopped at the limit, so the list is all there is.
+        truncated: bool,
+    },
+    /// The run of `generation` could not take the pattern; the list says so
+    /// rather than hiding it (§7).
+    GrepFailed { generation: u64, message: String },
+    /// `rg` is not installed: the overlay is shut and the message is shown
+    /// on the status bar (§13.3).
+    GrepMissing { generation: u64, message: String },
 }
 
 /// The status of one path an [`crate::app::effect::Effect::ComputeStats`]

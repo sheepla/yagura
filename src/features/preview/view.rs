@@ -73,6 +73,15 @@ fn shown_node(state: &AppState) -> Option<&Node> {
 
 /// Draws the body: the document, or why there is none.
 pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    render_body_in(frame, area, state, state.preview_mode);
+}
+
+/// Draws the body the way `mode` would draw it.
+///
+/// The finder overlay passes its own way of drawing: what it shows beside
+/// the list is the file a row points at, in full rather than as a diff
+/// (§13.3).
+pub fn render_body_in(frame: &mut Frame<'_>, area: Rect, state: &AppState, mode: PreviewMode) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -91,7 +100,7 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             }
             PreviewStatus::Failed => "cannot read this file",
             _ => {
-                if state.preview_mode.is_diff() {
+                if mode.is_diff() {
                     "no changes"
                 } else {
                     "no content"
@@ -110,7 +119,7 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         );
         return;
     }
-    frame.render_widget(Paragraph::new(body(state, doc, area)), area);
+    frame.render_widget(Paragraph::new(body(state, mode, doc, area)), area);
 }
 
 /// The visible lines of the document, cut to the pane.
@@ -118,11 +127,11 @@ pub fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 /// A diff mode with a diff draws its rows, in one column or two; anything
 /// else draws the plain content. Only the rows the pane can show are built,
 /// so a 200,000 line document costs the same as a 20 line one.
-fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
-    if state.preview_mode.is_diff()
+fn body<'a>(state: &'a AppState, mode: PreviewMode, doc: &'a Doc, area: Rect) -> Text<'a> {
+    if mode.is_diff()
         && let Some(diff) = &doc.diff
     {
-        let split = state.preview_mode == PreviewMode::SideBySide && state.size.0 >= SPLIT_MIN_COLS;
+        let split = mode == PreviewMode::SideBySide && state.size.0 >= SPLIT_MIN_COLS;
         return if split {
             split_body(state, doc, &diff.rows, area)
         } else {
@@ -132,11 +141,13 @@ fn body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     plain_body(state, doc, area)
 }
 
-/// The document as it is on disk, drawn with the meanings of each line.
+/// The document as it is on disk, drawn with the meanings of each line and
+/// the hit the row is on lit up (§13.3).
 fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     let height = state.preview.height();
     // The gutter takes five columns, and the pane keeps one column of margin.
     let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
+    let marks = state.preview.marks();
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     let end = doc
         .lines
@@ -144,6 +155,11 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
         .min(state.preview.scroll_line.saturating_add(height));
     for index in state.preview.scroll_line..end {
         let runs = doc.spans.get(index).map(Vec::as_slice).unwrap_or_default();
+        // The hit is only ever on the line it names.
+        let hit = marks
+            .filter(|marks| marks.line as usize == index + 1)
+            .map(|marks| marks.ranges.as_slice())
+            .unwrap_or_default();
         let mut spans = vec![Span::styled(
             format!("{:>4} ", index + 1),
             state.theme.style(Role::PreviewGutter),
@@ -151,6 +167,7 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
         spans.extend(cut(
             &doc.lines[index],
             runs,
+            hit,
             state.preview.scroll_col,
             width,
             &state.theme,
@@ -347,43 +364,54 @@ fn side_cells<'a>(rows: &'a [Row], lines: &'a [String]) -> Vec<[Cell<'a>; 2]> {
 /// One line, cut to the pane and split by what each run of it means.
 ///
 /// The gaps between runs mean nothing and are drawn as the pane's own text,
-/// so a line the reader never highlighted still comes out whole.
+/// so a line the reader never highlighted still comes out whole. A hit on the
+/// line lights its own part up, over whatever the language says of it
+/// (§13.3).
 fn cut<'a>(
     line: &'a str,
     runs: &'a [highlight::Span],
+    hits: &[(usize, usize)],
     from: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<Span<'a>> {
     let window = crate::core::text::window(line, from, width);
-    let base = theme.style(Role::PreviewText);
-    let mut out = Vec::new();
-    let mut cursor = window.start;
+    // Every place the drawing can change: both ends of the window, the ends
+    // of the runs, and the ends of the hit.
+    let mut cuts = vec![window.start, window.end];
     for run in runs {
-        if run.end <= window.start {
+        cuts.push(run.start.max(window.start));
+        cuts.push(run.end.min(window.end));
+    }
+    for &(start, end) in hits {
+        cuts.push(start.max(window.start));
+        cuts.push(end.min(window.end));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::new();
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
             continue;
         }
-        if run.start >= window.end {
-            break;
-        }
-        let start = run.start.max(window.start);
-        let end = run.end.min(window.end);
-        if start > cursor {
-            out.push(Span::styled(&line[cursor..start], base));
-        }
-        if end > start {
-            out.push(Span::styled(
-                &line[start..end],
-                theme.style(role(run.semantic)),
-            ));
-        }
-        cursor = end;
-    }
-    if cursor < window.end {
-        out.push(Span::styled(&line[cursor..window.end], base));
+        let style = if hits
+            .iter()
+            .any(|&(hit_start, hit_end)| hit_start <= start && end <= hit_end)
+        {
+            theme.style(Role::MatchHighlight)
+        } else {
+            let meaning = runs
+                .iter()
+                .find(|run| run.start <= start && end <= run.end)
+                .map(|run| role(run.semantic))
+                .unwrap_or(Role::PreviewText);
+            theme.style(meaning)
+        };
+        out.push(Span::styled(&line[start..end], style));
     }
     if window.cut {
-        out.push(Span::styled("…", base));
+        out.push(Span::styled("…", theme.style(Role::PreviewText)));
     }
     out
 }
@@ -768,6 +796,42 @@ mod tests {
         assert_eq!(buffer[(13, 1)].fg, Color::Cyan, "42");
         assert_eq!(buffer[(17, 1)].fg, Color::DarkGray, "// note");
         assert!(buffer[(17, 1)].modifier.contains(Modifier::DIM));
+    }
+
+    /// One hit on the line `highlighted()` shows.
+    fn hit(rel: &str, line: u32) -> crate::features::finder::grep::GrepMatch {
+        crate::features::finder::grep::GrepMatch {
+            rel: PathBuf::from(rel),
+            line,
+            text: "let n = 42; // note".to_owned(),
+            submatches: vec![(8, 10)],
+        }
+    }
+
+    #[test]
+    fn the_line_of_a_hit_is_lit_up_where_the_hit_lands() {
+        let mut state = highlighted();
+        state.preview.aim_at(Some(&hit("a.rs", 1)));
+        let buffer = draw(&state);
+        // The gutter takes five columns, so the number at offset eight sits
+        // at column thirteen.
+        let at = &buffer[(13, 1)];
+        assert_eq!(at.symbol(), "4");
+        assert_eq!(at.fg, Color::Reset, "the palette gives way to the mark");
+        assert!(at.modifier.contains(Modifier::REVERSED), "not lit up");
+        assert!(buffer[(14, 1)].modifier.contains(Modifier::REVERSED));
+        // What is around the hit keeps the meaning the language gave it.
+        assert_eq!(buffer[(5, 1)].fg, Color::Yellow, "let");
+        assert_eq!(buffer[(17, 1)].fg, Color::DarkGray, "// note");
+    }
+
+    #[test]
+    fn a_mark_on_another_file_lights_nothing_up() {
+        let mut state = highlighted();
+        state.preview.aim_at(Some(&hit("other.rs", 1)));
+        let buffer = draw(&state);
+        assert_eq!(buffer[(13, 1)].fg, Color::Cyan, "the mark was drawn anyway");
+        assert!(!buffer[(13, 1)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

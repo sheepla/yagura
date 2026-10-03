@@ -15,11 +15,12 @@ notify = "8"
 nucleo = "0.5.0"
 ratatui = "0.30"
 ratatui-textarea = "0.9.2"
+serde_json = "1"
 similar = "3"
 slotmap = "1.1"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "dump-load"] }
 thiserror = "2.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

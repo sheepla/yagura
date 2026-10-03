@@ -4,10 +4,26 @@
 //! worker; what lives here is the shell around it: which file is shown, which
 //! generation of content is current, where it is scrolled to.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::preview::{Doc, Language};
+use crate::features::finder::grep::{GrepMatch, display_ranges};
+
+/// Where a grep hit sits in the file the pane is showing (§13.3).
+///
+/// It is a mark on a body rather than part of it: the pane draws it while it
+/// is pointed at the file it belongs to, and shows nothing of it once it is
+/// not.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MatchFocus {
+    /// File the hit is in.
+    pub rel: PathBuf,
+    /// Line the hit is on, one based.
+    pub line: u32,
+    /// Where on that line the hit lands, in bytes of the drawn text.
+    pub ranges: Vec<(usize, usize)>,
+}
 
 /// What the preview pane is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -43,6 +59,10 @@ pub struct PreviewState {
     pub language: String,
     /// Lines the pane can show; set from the layout when the size changes.
     pub viewport: usize,
+    /// The hit the pane is aimed at, while one is set.
+    pub focus: Option<MatchFocus>,
+    /// Line to bring to the middle once the body of the aimed file is there.
+    centre_on: Option<u32>,
 }
 
 impl PreviewState {
@@ -71,6 +91,7 @@ impl PreviewState {
         self.scroll_col = 0;
         self.total_lines = 0;
         self.language = Language::Plain.label().to_owned();
+        self.drop_focus();
     }
 
     /// The language label for the status bar.
@@ -159,6 +180,7 @@ impl PreviewState {
         self.preview = PreviewStatus::Ready;
         // A shorter document must not leave the view below its end.
         self.clamp();
+        self.centre_here();
     }
 
     /// Records that the load failed; the message is on the status bar.
@@ -167,6 +189,74 @@ impl PreviewState {
         self.total_lines = 0;
         self.preview = PreviewStatus::Failed;
         self.clamp();
+    }
+
+    /// Aims the pane at one hit, or takes the aim away when there is none
+    /// (§13.3).
+    ///
+    /// The same hit again means nothing has moved, so a scroll of the
+    /// reader's own is left where it is.
+    pub fn aim_at(&mut self, hit: Option<&GrepMatch>) {
+        let focus = hit.map(|hit| MatchFocus {
+            rel: hit.rel.clone(),
+            line: hit.line,
+            ranges: display_ranges(&hit.text, &hit.submatches),
+        });
+        if self.focus == focus {
+            return;
+        }
+        self.focus = focus;
+        self.centre_on = self.focus.as_ref().map(|focus| focus.line);
+        self.centre_here();
+    }
+
+    /// The pane has been pointed at `rel`: a mark on some other file means
+    /// nothing there, so it goes (§13.3).
+    pub fn aimed_at(&mut self, rel: &Path) {
+        if self.focus.as_ref().is_some_and(|focus| focus.rel != rel) {
+            self.drop_focus();
+        }
+    }
+
+    /// The mark on the shown line, if the pane is showing the file it is on.
+    ///
+    /// A mark is only ever read through here, which is what keeps it from
+    /// lighting up rows of some other file.
+    pub fn marks(&self) -> Option<&MatchFocus> {
+        self.focus
+            .as_ref()
+            .filter(|focus| self.path.as_ref() == Some(&focus.rel))
+    }
+
+    /// Brings the aimed line to the middle of the pane, once its body is
+    /// there to scroll (§4).
+    fn centre_here(&mut self) {
+        let Some(line) = self.centre_on else {
+            return;
+        };
+        if self.focus.is_none() {
+            // Nothing to centre on any more.
+            self.centre_on = None;
+            return;
+        }
+        if self.path.as_ref() != self.focus.as_ref().map(|focus| &focus.rel) {
+            // The mark is for a file the pane is not showing; the aim may
+            // still move, so the line waits where it is.
+            return;
+        }
+        if self.total_lines == 0 {
+            return;
+        }
+        self.centre_on = None;
+        self.scroll_line = (line as usize).saturating_sub(1);
+        self.scroll_line = self.scroll_line.saturating_sub(self.height() / 2);
+        self.clamp();
+    }
+
+    /// Forgets the mark and anything still owed to it.
+    fn drop_focus(&mut self) {
+        self.focus = None;
+        self.centre_on = None;
     }
 }
 
@@ -432,5 +522,83 @@ mod tests {
         assert_eq!(preview.preview, PreviewStatus::Empty);
         assert!(preview.path.is_none());
         assert!(preview.doc.is_none());
+    }
+
+    /// One hit, as a run reports it.
+    fn hit(rel: &str, line: u32) -> GrepMatch {
+        GrepMatch {
+            rel: PathBuf::from(rel),
+            line,
+            text: "let n = 42;".to_owned(),
+            submatches: vec![(8, 10)],
+        }
+    }
+
+    /// A pane showing a hundred lines of `a.rs`.
+    fn shown() -> PreviewState {
+        let mut preview = PreviewState {
+            viewport: 10,
+            ..Default::default()
+        };
+        preview.target(PathBuf::from("a.rs"));
+        accept(&mut preview, "a.rs", 1, Ok(doc("a.rs", &vec!["line"; 100])));
+        preview
+    }
+
+    #[test]
+    fn the_line_of_a_hit_comes_to_the_middle_once_its_body_is_there() {
+        let mut preview = shown();
+        preview.aim_at(Some(&hit("a.rs", 50)));
+        // The mark lands where the body is: line 50 with five rows above it.
+        assert_eq!(preview.scroll_line, 44);
+        assert_eq!(
+            preview.marks().map(|focus| focus.line),
+            Some(50),
+            "the pane says what it is lit on"
+        );
+    }
+
+    #[test]
+    fn the_same_hit_again_leaves_where_the_reader_has_scrolled_to() {
+        let mut preview = shown();
+        preview.aim_at(Some(&hit("a.rs", 50)));
+        preview.scroll_line = 7;
+        preview.aim_at(Some(&hit("a.rs", 50)));
+        assert_eq!(preview.scroll_line, 7, "nothing moved");
+    }
+
+    #[test]
+    fn a_mark_is_only_read_on_the_file_it_belongs_to() {
+        let mut preview = shown();
+        preview.target(PathBuf::from("b.rs"));
+        preview.aim_at(Some(&hit("a.rs", 3)));
+        assert!(preview.marks().is_none(), "another file is showing");
+        preview.aimed_at(Path::new("b.rs"));
+        assert!(preview.focus.is_none(), "the mark went with the file");
+    }
+
+    #[test]
+    fn aiming_at_nothing_takes_the_mark_away() {
+        let mut preview = shown();
+        preview.aim_at(Some(&hit("a.rs", 3)));
+        preview.aim_at(None);
+        assert!(preview.focus.is_none());
+        assert!(preview.marks().is_none());
+    }
+
+    #[test]
+    fn clearing_takes_the_mark_and_anything_still_owed_with_it() {
+        let mut preview = PreviewState {
+            viewport: 10,
+            ..Default::default()
+        };
+        preview.target(PathBuf::from("a.rs"));
+        preview.aim_at(Some(&hit("a.rs", 50)));
+        preview.clear();
+        assert!(preview.focus.is_none());
+        // The body comes back for the file, and there is no line left to
+        // bring to the middle of it.
+        accept(&mut preview, "a.rs", 1, Ok(doc("a.rs", &vec!["line"; 100])));
+        assert_eq!(preview.scroll_line, 0);
     }
 }

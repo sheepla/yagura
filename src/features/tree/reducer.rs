@@ -100,6 +100,7 @@ fn on_command(state: &mut AppState, command: Command) -> Vec<Effect> {
         // The finder overlays own their commands, and the root reducer routes
         // them there before they can reach this match (§13).
         Command::OpenFiles
+        | Command::OpenGrep
         | Command::FinderAccept
         | Command::FinderSelectUp
         | Command::FinderSelectDown

@@ -10,9 +10,9 @@ M1 (the static file tree), M2 (the preview content, with syntax highlighting),
 M3 (the git baseline and the diff), M4 (real-time updates: watching, batches,
 refreshed statistics, the head check, ages and the `F`/`c`/`o` keys), M5 (the
 snapshot baseline, for watching a directory that is not a repository) and M6
-(the file finder overlay, `Ctrl+P`).
-The grep finder, the help overlay, the editor launch and the markdown rendering
-are not implemented yet.
+(the file finder overlay, `Ctrl+P`), M7 (the grep finder, `Ctrl+G`).
+The help overlay, the editor launch and the markdown rendering are not
+implemented yet.
 
 ## Status
 
@@ -25,7 +25,8 @@ are not implemented yet.
 | M4 | filesystem watching, batched updates, statistics refresh, `.git` head check, ages and freshness, follow / filter / order | done |
 | M5 | snapshot baseline, startup scan with its budgets, `auto` fallback outside a repository, the `B` swap | done |
 | M6 | file finder overlay: query box, parallel walk, fuzzy match, preview beside the list, the jump into the tree | done |
-| M6+ | grep finder, help overlay, editor launch, markdown | not started |
+| M7 | grep finder overlay: `rg --json`, debounce and generations, hits as `path:line: text`, the lit line in the preview | done |
+| M8+ | watch overlay, help overlay, editor launch, markdown, edge cases and benchmarks | not started |
 
 ## Build
 
@@ -90,7 +91,8 @@ In the preview:
 The full table lives in `src/input/keymap.rs`, which is also what the help
 overlay will be built from.
 
-In the finder overlay, opened with `Ctrl+p`:
+In the finder overlay, opened with `Ctrl+p` (the file finder) or `Ctrl+g`
+(the grep finder; the two switch between each other):
 
 | Key | Action |
 | --- | --- |
@@ -171,6 +173,16 @@ and only the rows that fit are ever drawn. With nothing typed the changed paths
 come first, newest first. The row under the selection is previewed while the
 overlay is up, and `Enter` walks the tree down to the file, expanding the
 directories on the way, and hands the preview over.
+
+`Ctrl+g` turns the same overlay into a search of what is inside the files. It
+runs `rg` as a child process from the root, reads its output as JSON and shows
+the hits as `path:line: text`, two characters at the shortest. Every keystroke
+starts a new run after cancelling the old one, and the answer carries the
+generation it was asked for, so a search that comes back late says nothing.
+A thousand hits stop the run. `Enter` on a hit does what it does for a path,
+and lights the line it landed on in the preview, centred in the pane. If `rg`
+is not installed the overlay says so and will not open again until the program
+is restarted.
 
 The terminal is restored on quit, on a panic and on `SIGTERM` or `SIGHUP`.
 

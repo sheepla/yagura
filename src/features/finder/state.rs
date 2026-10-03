@@ -12,10 +12,16 @@ use nucleo::{Config as MatcherConfig, Nucleo};
 use ratatui::style::Style;
 use ratatui_textarea::TextArea;
 
+use crate::app::state::Overlay;
 use crate::core::baseline::ChangedEntry;
+use crate::features::finder::grep::GrepResults;
 
 /// Characters a paste may add to what the query box already holds (§13.1).
 pub const PASTE_LIMIT: usize = 1024;
+
+/// What the query box says while it is empty, for each overlay (§13.1).
+const FILES_PLACEHOLDER: &str = "type to filter files";
+const GREP_PLACEHOLDER: &str = "type to search file contents";
 
 /// How long a refresh waits for the matcher's workers before the list is
 /// built from whatever they have finished so far.
@@ -43,6 +49,9 @@ pub struct FinderState {
     pub scan_gen: u64,
     /// Whether a walk is still going, which the list header says.
     pub scanning: bool,
+    /// What the grep overlay's list holds; the other overlay never reads it
+    /// (§13.3).
+    pub grep: GrepResults,
     /// True while `shown` holds the walk order rather than the matcher's
     /// ranking, which is what an empty query lists (§7).
     walk_order: bool,
@@ -59,7 +68,7 @@ impl FinderState {
     /// generation that asked for it, and a query does not survive the overlay
     /// it was typed into.
     pub fn open(&mut self) -> u64 {
-        self.query = query_box();
+        self.query = query_box(FILES_PLACEHOLDER);
         self.found.clear();
         self.shown.clear();
         self.selected = 0;
@@ -77,6 +86,25 @@ impl FinderState {
         self.scan_gen
     }
 
+    /// Starts over for the grep overlay and returns the run it wants (§13.3).
+    ///
+    /// The list of the overlay this one replaces is dropped with everything
+    /// else, and a walk still out there answers a generation nobody waits
+    /// for: its chunks are dropped rather than listed under another overlay.
+    pub fn open_grep(&mut self) -> u64 {
+        self.query = query_box(GREP_PLACEHOLDER);
+        self.found.clear();
+        self.shown.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        self.walk_order = false;
+        self.dirty = false;
+        self.running = false;
+        self.scanning = false;
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.grep.open()
+    }
+
     /// The query as it stands.
     pub fn query_text(&self) -> String {
         self.query.lines().join("")
@@ -86,10 +114,22 @@ impl FinderState {
         self.query_text().is_empty()
     }
 
-    /// The path the list has selected, if any.
-    pub fn selected_path(&self) -> Option<PathBuf> {
+    /// The path the list has selected, for the overlay that is up: the file
+    /// of a hit while the grep list is showing.
+    pub fn selected_path(&self, overlay: Overlay) -> Option<PathBuf> {
+        match overlay {
+            Overlay::Grep => self.selected_match().map(|hit| hit.rel.clone()),
+            _ => {
+                let index = *self.shown.get(self.selected)?;
+                self.found.get(index as usize).cloned()
+            }
+        }
+    }
+
+    /// The hit the selection is on, while the grep list is showing.
+    pub fn selected_match(&self) -> Option<&crate::features::finder::grep::GrepMatch> {
         let index = *self.shown.get(self.selected)?;
-        self.found.get(index as usize).cloned()
+        self.grep.matches.get(index as usize)
     }
 
     /// Whether the matcher may still be working on the current query.
@@ -229,8 +269,16 @@ impl FinderState {
     }
 
     /// Brings the list in step with the query and the paths found so far.
-    pub fn refresh(&mut self, changed: &BTreeMap<PathBuf, ChangedEntry>) {
-        if self.is_empty_query() {
+    ///
+    /// A grep list is ordered by `rg` and not by anything here, so only the
+    /// part that keeps the selection inside it applies to that one (§13.3).
+    pub fn refresh(&mut self, overlay: Overlay, changed: &BTreeMap<PathBuf, ChangedEntry>) {
+        if overlay == Overlay::Grep {
+            // `rg` gives the list its order and its contents; all that is
+            // checked here is that every row still points at a hit (§13.3).
+            let hits = self.grep.matches.len();
+            self.shown.retain(|&index| (index as usize) < hits);
+        } else if self.is_empty_query() {
             self.list_walk_order(changed);
         } else {
             self.list_matches();
@@ -280,10 +328,10 @@ fn changed_at(changed: &BTreeMap<PathBuf, ChangedEntry>, rel: &PathBuf) -> Syste
 }
 
 /// The query box as an overlay opens it.
-fn query_box() -> TextArea<'static> {
+fn query_box(placeholder: &str) -> TextArea<'static> {
     let mut query = TextArea::default();
     query.set_cursor_line_style(Style::default());
-    query.set_placeholder_text("type to filter files");
+    query.set_placeholder_text(placeholder);
     query
 }
 
@@ -336,7 +384,7 @@ mod tests {
             &found(&["old.txt", "new.txt", "other.rs", "mid.txt"]),
             &changed,
         );
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         assert_eq!(
             listed(&finder),
             ["new.txt", "mid.txt", "old.txt", "other.rs"]
@@ -348,9 +396,9 @@ mod tests {
         let mut finder = FinderState::default();
         let changed = changed(&[("mid.txt", 10), ("new.txt", 30)]);
         finder.absorb(&found(&["mid.txt", "other.rs"]), &changed);
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         finder.absorb(&found(&["new.txt"]), &changed);
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         assert_eq!(listed(&finder), ["new.txt", "mid.txt", "other.rs"]);
     }
 
@@ -359,9 +407,9 @@ mod tests {
         let mut finder = FinderState::default();
         let changed = changed(&[("mid.txt", 10)]);
         finder.absorb(&found(&["mid.txt", "a.rs"]), &changed);
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         finder.absorb(&found(&["z.rs"]), &changed);
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         assert_eq!(listed(&finder), ["mid.txt", "a.rs", "z.rs"]);
     }
 
@@ -370,14 +418,14 @@ mod tests {
         let mut finder = FinderState::default();
         let changed = changed(&[("new.txt", 30)]);
         finder.absorb(&found(&["a.rs", "new.txt"]), &changed);
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         // A query takes the list over: the matcher ranks it.
         finder.insert_char('n');
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         assert_eq!(listed(&finder), ["new.txt"]);
         // Back at no query the walk order comes back, changed first.
         finder.delete_char();
-        finder.refresh(&changed);
+        finder.refresh(Overlay::Files, &changed);
         assert_eq!(listed(&finder), ["new.txt", "a.rs"]);
     }
 
@@ -385,11 +433,11 @@ mod tests {
     fn a_query_that_matches_nothing_lists_nothing() {
         let mut finder = FinderState::default();
         finder.absorb(&found(&["a.rs", "b.rs"]), &BTreeMap::new());
-        finder.refresh(&BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
         finder.insert_char('z');
-        finder.refresh(&BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
         assert!(finder.shown.is_empty());
-        assert_eq!(finder.selected_path(), None);
+        assert_eq!(finder.selected_path(Overlay::Files), None);
     }
 
     #[test]
@@ -407,7 +455,7 @@ mod tests {
     fn the_selection_stays_inside_the_list() {
         let mut finder = FinderState::default();
         finder.absorb(&found(&["a.rs", "b.rs"]), &BTreeMap::new());
-        finder.refresh(&BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
         finder.select_by(1);
         finder.select_by(1);
         assert_eq!(finder.selected, 1, "the list ends at the last row");
@@ -423,7 +471,7 @@ mod tests {
         let rels: Vec<String> = (0..20).map(|i| format!("f{i}.rs")).collect();
         let rels: Vec<PathBuf> = rels.iter().map(PathBuf::from).collect();
         finder.absorb(&rels, &BTreeMap::new());
-        finder.refresh(&BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
 
         finder.sync_scroll(5);
         assert_eq!(finder.scroll, 0);
@@ -443,7 +491,7 @@ mod tests {
         let mut finder = FinderState::default();
         let first = finder.open();
         finder.absorb(&found(&["a.rs"]), &BTreeMap::new());
-        finder.refresh(&BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
         assert_eq!(listed(&finder), ["a.rs"]);
 
         let second = finder.open();
@@ -464,6 +512,58 @@ mod tests {
 
     #[test]
     fn a_query_box_says_what_it_wants() {
-        assert_eq!(query_box().placeholder_text(), "type to filter files");
+        assert_eq!(
+            query_box(FILES_PLACEHOLDER).placeholder_text(),
+            "type to filter files"
+        );
+        assert_eq!(
+            query_box(GREP_PLACEHOLDER).placeholder_text(),
+            "type to search file contents"
+        );
+    }
+
+    fn hit(rel: &str, line: u32) -> crate::features::finder::grep::GrepMatch {
+        crate::features::finder::grep::GrepMatch {
+            rel: PathBuf::from(rel),
+            line,
+            text: String::new(),
+            submatches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_grep_overlay_starts_another_list_of_its_own() {
+        let mut finder = FinderState::default();
+        finder.absorb(&found(&["a.rs"]), &BTreeMap::new());
+        finder.refresh(Overlay::Files, &BTreeMap::new());
+
+        let first = finder.open_grep();
+        assert!(finder.shown.is_empty());
+        assert!(finder.found.is_empty(), "the file list is put away");
+        assert!(finder.query_text().is_empty(), "the box starts over");
+        assert!(!finder.scanning, "no walk runs under a search");
+
+        let second = finder.open_grep();
+        assert_ne!(first, second, "another run, another generation");
+    }
+
+    #[test]
+    fn a_grep_list_keeps_the_order_the_run_gave_it() {
+        let mut finder = FinderState::default();
+        let generation = finder.open_grep();
+        finder.grep.matches = vec![hit("b.rs", 2), hit("a.rs", 1)];
+        finder.shown = vec![0, 1];
+        finder.insert_char('a');
+        finder.refresh(Overlay::Grep, &BTreeMap::new());
+        assert_eq!(finder.shown, [0, 1], "the matcher re-ranked the hits");
+        assert!(finder.grep.answers(generation));
+
+        // A list that loses every row must not keep a selection outside it.
+        finder.grep.matches.clear();
+        finder.selected = 1;
+        finder.refresh(Overlay::Grep, &BTreeMap::new());
+        assert!(finder.shown.is_empty());
+        assert_eq!(finder.selected_path(Overlay::Grep), None);
+        assert_eq!(finder.selected, 0);
     }
 }

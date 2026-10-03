@@ -81,6 +81,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Paste(_) if state.overlay.is_finder() => finder_effects(state, &action),
         Action::FilesFound { .. } | Action::FilesScanDone { .. } => finder_effects(state, &action),
+        // The answers of a grep run belong to the overlay that asked for
+        // them (§13.3).
+        Action::GrepChunk { .. }
+        | Action::GrepDone { .. }
+        | Action::GrepFailed { .. }
+        | Action::GrepMissing { .. } => finder_effects(state, &action),
         Action::Paste(_)
         | Action::Command(_)
         | Action::DirLoaded { .. }

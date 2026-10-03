@@ -65,6 +65,9 @@ pub enum Command {
     // The finder overlay (§13).
     /// `Ctrl+P`: open the file finder.
     OpenFiles,
+    /// `Ctrl+G`: open the grep list, or switch to it from the file finder
+    /// (§13.3).
+    OpenGrep,
     /// `Enter`: take the selected row and close the overlay (§4).
     FinderAccept,
     /// `↑` / `Ctrl+P`: the row above in the list.

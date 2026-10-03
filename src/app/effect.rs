@@ -68,4 +68,13 @@ pub enum Effect {
         /// from a walk that has been superseded.
         generation: u64,
     },
+    /// Ask `rg` for the hits of one query (§13.3). The runner debounces it
+    /// and stops whatever the last one left behind.
+    StartGrep {
+        /// Generation the answers carry; one the state does not hold is
+        /// from a query that has been typed over.
+        generation: u64,
+        /// What to search for, at least two characters (§7).
+        pattern: String,
+    },
 }
