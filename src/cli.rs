@@ -39,7 +39,7 @@ pub struct Cli {
     pub path: Option<PathBuf>,
 
     /// Icons shown in front of tree rows.
-    #[arg(long, value_enum, default_value_t = IconStyle::Text)]
+    #[arg(long, value_enum, default_value_t = IconStyle::Nerd)]
     pub icons: IconStyle,
 
     /// Which content the diff is compared against.
@@ -148,10 +148,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_text_icons_and_auto_baseline() {
+    fn defaults_to_nerd_icons_and_auto_baseline() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = parse(&["yagura", dir.path().to_str().expect("utf8")]).expect("config");
-        assert_eq!(config.icons, IconStyle::Text);
+        assert_eq!(config.icons, IconStyle::Nerd);
         assert_eq!(config.baseline, BaselineKind::Auto);
         assert!(config.ignore_enabled);
         assert!(!config.no_color);
@@ -164,14 +164,14 @@ mod tests {
             "yagura",
             "--no-ignore",
             "--icons",
-            "nerd",
+            "text",
             "--baseline",
             "snapshot",
             dir.path().to_str().expect("utf8"),
         ])
         .expect("config");
         assert!(!config.ignore_enabled);
-        assert_eq!(config.icons, IconStyle::Nerd);
+        assert_eq!(config.icons, IconStyle::Text);
         assert_eq!(config.baseline, BaselineKind::Snapshot);
     }
 

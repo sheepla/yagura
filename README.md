@@ -48,8 +48,8 @@ yagura [PATH] [--icons text|nerd] [--baseline auto|head|snapshot] [--no-ignore] 
 | Option | Meaning |
 | --- | --- |
 | `[PATH]` | The directory to show. Defaults to the working directory. |
-| `--icons text` | ASCII icons: `d` for a directory, `f` for a file, `l` for a symlink. |
-| `--icons nerd` | Nerd Font glyphs. |
+| `--icons nerd` | Nerd Font glyphs. The default. |
+| `--icons text` | Plain ascii: `l` for a symlink and `o` for an unknown kind. The marker alone tells a directory from a file. |
 | `--baseline auto\|head\|snapshot` | Which baseline to compare against. `auto` picks the git `HEAD` inside a repository and the start of the session outside of one, and `head` outside a repository is an argument error. Without `git` installed anywhere, the baseline says `git not found` and the session snapshot stands in. |
 | `--no-ignore` | Ignore `.gitignore`, the global excludes and the user ignores. |
 | `--log PATH` | Write a `tracing` log to a file. Also read from `YAGURA_LOG`. Nothing is logged without it. |
