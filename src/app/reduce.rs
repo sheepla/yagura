@@ -185,12 +185,21 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
     state.baseline.repo = built.repo;
     state.baseline.head_oid = built.head_oid;
     state.baseline.changed = merge_changed(&state.baseline.changed, built.changed);
+    let mut effects = Vec::new();
     if matches!(state.config.baseline, crate::cli::BaselineKind::Auto)
         && !built.repo
         && state.baseline.kind == Kind::Head
     {
         // `auto` degrades to a snapshot outside a repository and says so.
+        // The rows keep what they show until that build answers, so the
+        // switch never opens a gap (§8.4).
         state.baseline.kind = Kind::Snapshot;
+        state.baseline.phase = Phase::Loading;
+        state.baseline.ver += 1;
+        effects.push(Effect::BuildBaseline {
+            kind: Kind::Snapshot,
+            ver: state.baseline.ver,
+        });
     }
     if let Some(message) = built.message {
         state.set_info(message);
@@ -200,9 +209,9 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
     // replaced, so it is drawn again against the new one (invariant I3: the
     // reload's generation discards whatever is still in flight).
     if state.preview.path.is_some() && state.preview_mode.is_diff() {
-        return preview::reducer::reload(state);
+        effects.extend(preview::reducer::reload(state));
     }
-    Vec::new()
+    effects
 }
 
 /// Writes one stats answer into the changed set (§7.3).
@@ -540,6 +549,74 @@ mod tests {
     }
 
     #[test]
+    fn b_swaps_the_baseline_without_a_pause_between_the_two() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = state();
+        state.baseline.repo = true;
+        let head = built(
+            true,
+            Some("aaa"),
+            BTreeMap::from([(
+                PathBuf::from("a.txt"),
+                entry(Status::Modified, SystemTime::UNIX_EPOCH),
+            )]),
+        );
+        reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: head,
+            },
+        );
+
+        let effects = reduce(&mut state, Action::Command(Command::ToggleBaseline));
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Snapshot,
+                ver: 2,
+            }]
+        );
+        assert_eq!(state.baseline.kind, Kind::Snapshot);
+        assert_eq!(
+            state.baseline.phase,
+            Phase::Ready,
+            "the swap waits for the answer rather than blanking the rows"
+        );
+        assert!(
+            state
+                .baseline
+                .changed
+                .contains_key(PathBuf::from("a.txt").as_path()),
+            "the old marks are still on screen until the new baseline lands"
+        );
+
+        let snapshot = Built {
+            kind: Kind::Snapshot,
+            phase: Phase::Ready,
+            repo: true,
+            head_oid: None,
+            changed: BTreeMap::new(),
+            message: None,
+        };
+        let effects = reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 2,
+                built: snapshot,
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.baseline.kind, Kind::Snapshot);
+        assert_eq!(state.baseline.phase, Phase::Ready);
+        assert!(
+            state.baseline.changed.is_empty(),
+            "the rows now say what the snapshot says"
+        );
+    }
+
+    #[test]
     fn auto_falls_back_to_a_snapshot_outside_a_repository() {
         let mut state = state();
         let built = Built {
@@ -550,11 +627,20 @@ mod tests {
             changed: BTreeMap::new(),
             message: Some("not a git repository".to_owned()),
         };
-        reduce(&mut state, Action::BaselineReady { ver: 1, built });
+        let effects = reduce(&mut state, Action::BaselineReady { ver: 1, built });
         assert_eq!(state.baseline.kind, Kind::Snapshot);
         assert_eq!(
             state.baseline.phase,
-            crate::core::baseline::Phase::Unavailable
+            crate::core::baseline::Phase::Loading,
+            "the snapshot that replaces it is being built"
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Snapshot,
+                ver: 2,
+            }],
+            "{effects:?}"
         );
         assert_eq!(
             state.visible_message().map(|message| message.text.as_str()),

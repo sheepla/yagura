@@ -50,6 +50,9 @@ pub enum Effect {
     },
     /// Work out how some paths differ from the baseline (§7.3).
     ComputeStats {
+        /// Which baseline the answer has to be against: the two kinds count
+        /// differently, and only one of them is being asked about.
+        kind: crate::core::baseline::Kind,
         /// When the changes were seen: a path that has just become changed
         /// takes this as the moment it changed (invariant I1).
         at: SystemTime,

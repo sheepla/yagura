@@ -1,9 +1,11 @@
 //! What the diff is compared against.
 
 pub mod git;
+pub mod snapshot;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::core::diff::DiffStat;
@@ -85,7 +87,16 @@ pub enum Blob {
 }
 
 /// Builds the baseline for `kind`.
-pub fn build(root: &Path, kind: Kind, now: SystemTime) -> Built {
+///
+/// `snapshot` is what the startup scan read, which only a snapshot build
+/// has: without it the snapshot baseline has no side to compare against.
+pub fn build(
+    root: &Path,
+    kind: Kind,
+    now: SystemTime,
+    snapshot: Option<Arc<snapshot::Snapshot>>,
+    ignore_enabled: bool,
+) -> Built {
     match kind {
         Kind::Head => match git::build(root, now) {
             Ok(head) => Built {
@@ -107,13 +118,16 @@ pub fn build(root: &Path, kind: Kind, now: SystemTime) -> Built {
                 message: Some(err.to_string()),
             },
         },
-        Kind::Snapshot => Built {
-            kind: Kind::Snapshot,
-            phase: Phase::Unavailable,
-            repo: git::probe(root).is_ok(),
-            head_oid: None,
-            changed: BTreeMap::new(),
-            message: Some("snapshot baseline is not available".to_owned()),
+        Kind::Snapshot => match snapshot {
+            Some(captured) => snapshot::build(root, &captured, now, ignore_enabled),
+            None => Built {
+                kind: Kind::Snapshot,
+                phase: Phase::Unavailable,
+                repo: git::probe(root).is_ok(),
+                head_oid: None,
+                changed: BTreeMap::new(),
+                message: Some("the startup scan did not finish".to_owned()),
+            },
         },
     }
 }

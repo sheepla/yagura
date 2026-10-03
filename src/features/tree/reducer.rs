@@ -10,7 +10,7 @@ use crate::app::action::Action;
 use crate::app::command::Command;
 use crate::app::effect::Effect;
 use crate::app::state::{AppState, Focus, Overlay, SortMode};
-use crate::core::baseline::{Kind, Phase};
+use crate::core::baseline::Phase;
 use crate::core::dirload::DirError;
 use crate::core::fsmodel::{NodeId, NodeKind};
 use crate::core::fswatch::{ChangeKind, FsChange};
@@ -577,9 +577,12 @@ fn request_stats(
     paths: BTreeSet<PathBuf>,
     effects: &mut Vec<Effect>,
 ) {
-    if state.baseline.kind != Kind::Head || state.baseline.phase != Phase::Ready {
+    // Before the first build has answered there is nothing to compare
+    // against; either baseline can answer afterwards (§8.3).
+    if state.baseline.phase != Phase::Ready {
         return;
     }
+    let kind = state.baseline.kind;
     let requested: Vec<(PathBuf, u64)> = paths
         .into_iter()
         .filter(|rel| !rel.as_os_str().is_empty())
@@ -591,6 +594,7 @@ fn request_stats(
         .collect();
     if !requested.is_empty() {
         effects.push(Effect::ComputeStats {
+            kind,
             at,
             paths: requested,
         });
@@ -709,7 +713,7 @@ mod tests {
     use super::*;
     use crate::app::state::Config;
     use crate::cli::{BaselineKind, IconStyle};
-    use crate::core::baseline::ChangedEntry;
+    use crate::core::baseline::{ChangedEntry, Kind};
     use crate::core::fsmodel::{DirEntry, NodeKind, Status};
 
     fn state() -> AppState {
@@ -929,6 +933,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::ComputeStats {
+                kind: Kind::Head,
                 at: at(),
                 paths: vec![(PathBuf::from("docs/guide.md"), 1)],
             }],
@@ -944,6 +949,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::ComputeStats {
+                kind: Kind::Head,
                 at: at(),
                 paths: vec![(PathBuf::from("docs/guide.md"), 2)],
             }],
@@ -952,15 +958,20 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_asked_about_without_a_baseline_to_compare_against() {
+    fn only_a_finished_baseline_is_asked_about() {
         let mut state = populated();
         let effects = on_fs_batch(
             &mut state,
             &[change("docs/guide.md", ChangeKind::Modify)],
             at(),
         );
-        assert!(effects.is_empty(), "{effects:?}");
+        assert!(
+            effects.is_empty(),
+            "before the first build has answered there is nothing to compare against: {effects:?}"
+        );
 
+        // A snapshot baseline answers the same question its own way (§8.3),
+        // so the ask is made of either kind once a build has finished.
         state.baseline.kind = Kind::Snapshot;
         state.baseline.phase = Phase::Ready;
         let effects = on_fs_batch(
@@ -968,7 +979,15 @@ mod tests {
             &[change("docs/guide.md", ChangeKind::Modify)],
             at(),
         );
-        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            effects,
+            vec![Effect::ComputeStats {
+                kind: Kind::Snapshot,
+                at: at(),
+                paths: vec![(PathBuf::from("docs/guide.md"), 1)],
+            }],
+            "{effects:?}"
+        );
     }
 
     #[test]
@@ -989,6 +1008,7 @@ mod tests {
         assert_eq!(
             first,
             vec![Effect::ComputeStats {
+                kind: Kind::Head,
                 at: at(),
                 paths: vec![(PathBuf::from("README.md"), 1)],
             }],

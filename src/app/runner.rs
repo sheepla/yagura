@@ -1,6 +1,7 @@
 //! Running effects outside the UI loop.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -46,6 +47,32 @@ fn lock(state: &Arc<Mutex<HeadState>>) -> std::sync::MutexGuard<'_, HeadState> {
 /// The source of baseline content of the newest build, with its build number.
 type BaselineSlot = Arc<Mutex<Option<(u64, Arc<dyn BaselineSource>)>>>;
 
+/// The startup scan's answer, once it has one.
+type SnapshotSlot = Arc<Mutex<Option<Arc<crate::core::baseline::snapshot::Snapshot>>>>;
+
+/// How long a build waits for the startup scan before giving up on it.
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(30);
+
+/// The snapshot out of the slot, waiting for the scan to hand it over.
+///
+/// The wait happens on a blocking worker, never on the UI thread (invariant
+/// I1); a scan of a whole tree is a few tens of mebibytes at the outside.
+fn wait_for_snapshot(
+    slot: &SnapshotSlot,
+) -> Option<Arc<crate::core::baseline::snapshot::Snapshot>> {
+    let deadline = Instant::now() + SNAPSHOT_WAIT;
+    loop {
+        if let Some(found) = slot.lock().ok().and_then(|guard| guard.clone()) {
+            return Some(found);
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!("the startup scan did not finish in time");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Starts effects and returns their results as actions.
 pub struct EffectRunner {
     root: PathBuf,
@@ -57,6 +84,10 @@ pub struct EffectRunner {
     watcher: Mutex<Option<FsWatcher>>,
     /// Whether a check of `HEAD` is wanted, and whether one is running.
     head: Arc<Mutex<HeadState>>,
+    /// What the startup scan read, started once by the first build.
+    snapshot: SnapshotSlot,
+    /// Whether the scan has been started, so that it runs exactly once.
+    snapshot_started: AtomicBool,
 }
 
 impl EffectRunner {
@@ -68,7 +99,30 @@ impl EffectRunner {
             baseline: Arc::new(Mutex::new(None)),
             watcher: Mutex::new(None),
             head: Arc::new(Mutex::new(HeadState::default())),
+            snapshot: Arc::new(Mutex::new(None)),
+            snapshot_started: AtomicBool::new(false),
         }
+    }
+
+    /// Starts the scan of the tree as it stands (§8.3), once.
+    ///
+    /// It runs from the first build of any kind, so that a snapshot needed
+    /// later is of the start of the session rather than of the moment it was
+    /// asked for.
+    fn start_snapshot(&self) {
+        if self.snapshot_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let root = self.root.clone();
+        let ignore_enabled = self.ignore_enabled;
+        let slot = Arc::clone(&self.snapshot);
+        tokio::task::spawn_blocking(move || {
+            let captured = Arc::new(crate::core::baseline::snapshot::Snapshot::capture(
+                &root,
+                ignore_enabled,
+            ));
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(captured);
+        });
     }
 
     /// Runs one effect.
@@ -127,18 +181,34 @@ impl EffectRunner {
                 });
             }
             Effect::BuildBaseline { kind, ver } => {
+                // Every build starts the startup scan, so that a snapshot is
+                // of the beginning of the session even when the first build
+                // was the git one (§8.3).
+                self.start_snapshot();
                 let root = self.root.clone();
                 let tx = self.action_tx.clone();
                 let slot = Arc::clone(&self.baseline);
+                let snapshot_slot = Arc::clone(&self.snapshot);
+                let ignore_enabled = self.ignore_enabled;
                 tokio::task::spawn_blocking(move || {
-                    let built = baseline::build(&root, kind, SystemTime::now());
+                    // Only a snapshot build has anything to read from the
+                    // scan, and it waits here rather than on the UI thread.
+                    let captured = (kind == Kind::Snapshot)
+                        .then(|| wait_for_snapshot(&snapshot_slot))
+                        .flatten();
+                    let built = baseline::build(
+                        &root,
+                        kind,
+                        SystemTime::now(),
+                        captured.clone(),
+                        ignore_enabled,
+                    );
                     // The source has to answer before the reducer can ask for
                     // a diff, so it is stored under this build number before
                     // the result goes out. A build that already moved on keeps
                     // the source it stored.
                     if built.phase == Phase::Ready
-                        && built.kind == Kind::Head
-                        && let Some(source) = git_source(&root, &built)
+                        && let Some(source) = source_for(&root, &built, captured)
                         && let Ok(mut slot) = slot.lock()
                         && slot.as_ref().is_none_or(|(stored, _)| *stored <= ver)
                     {
@@ -152,7 +222,7 @@ impl EffectRunner {
             }
             Effect::ScheduleTick => self.spawn_clock(),
             Effect::WatchDirs { add, remove } => self.watch(&add, &remove),
-            Effect::ComputeStats { at, paths } => self.compute_stats(at, &paths),
+            Effect::ComputeStats { kind, at, paths } => self.compute_stats(kind, at, &paths),
             Effect::CheckHead => self.check_head(),
         }
     }
@@ -162,14 +232,22 @@ impl EffectRunner {
     /// The question is asked off the UI thread like every other read
     /// (invariant I1), and only for the paths the reducer named: a batch of
     /// changes costs one `git status` of those paths rather than one of the
-    /// whole work tree.
-    fn compute_stats(&self, at: SystemTime, paths: &[(PathBuf, u64)]) {
+    /// whole work tree. Outside a repository there is no command to run -
+    /// the startup scan already holds the side to compare against (§8.3).
+    fn compute_stats(&self, kind: Kind, at: SystemTime, paths: &[(PathBuf, u64)]) {
         let root = self.root.clone();
         let tx = self.action_tx.clone();
         let asked = paths.to_vec();
+        let snapshot_slot = Arc::clone(&self.snapshot);
         tokio::task::spawn_blocking(move || {
             let rels: Vec<PathBuf> = asked.iter().map(|(rel, _)| rel.clone()).collect();
-            let answers = baseline::git::stats(&root, &rels, at);
+            let answers = match kind {
+                Kind::Head => baseline::git::stats(&root, &rels, at),
+                Kind::Snapshot => match wait_for_snapshot(&snapshot_slot) {
+                    Some(captured) => baseline::snapshot::stats(&root, &captured, &rels, at),
+                    None => return,
+                },
+            };
             if answers.is_empty() {
                 // Nothing could be worked out: the state it has is better
                 // than an answer nobody can check.
@@ -369,6 +447,19 @@ fn git_source(root: &Path, built: &baseline::Built) -> Option<Arc<dyn BaselineSo
     }
 }
 
+/// The content reader for a build that finished: git's when there is a
+/// `HEAD` to read through, the startup scan's own bytes otherwise (§8.3).
+fn source_for(
+    root: &Path,
+    built: &baseline::Built,
+    captured: Option<Arc<crate::core::baseline::snapshot::Snapshot>>,
+) -> Option<Arc<dyn BaselineSource>> {
+    match built.kind {
+        Kind::Head => git_source(root, built),
+        Kind::Snapshot => captured.map(|captured| captured as Arc<dyn BaselineSource>),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -470,6 +561,111 @@ mod tests {
             assert!(!built.repo);
             assert!(built.message.is_some());
         }
+    }
+
+    /// Waits for the startup scan to hand over what it read (§8.3).
+    async fn scanned(runner: &EffectRunner) {
+        let wait = async {
+            loop {
+                let done = runner
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some();
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the startup scan never finished");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_baseline_holds_the_contents_the_session_started_with() {
+        use crate::core::fsmodel::Status;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+
+        // The first build of any kind starts the scan, and a later build
+        // waits for it rather than racing it.
+        runner.run(Effect::BuildBaseline {
+            kind: Kind::Head,
+            ver: 1,
+        });
+        scanned(&runner).await;
+        let git_answer = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no baseline in time")
+            .expect("channel closed");
+        assert!(matches!(git_answer, Action::BaselineReady { ver: 1, .. }));
+
+        std::fs::write(dir.path().join("main.rs"), "fn main() { run(); }\n").expect("write");
+
+        runner.run(Effect::BuildBaseline {
+            kind: Kind::Snapshot,
+            ver: 2,
+        });
+        let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no snapshot in time")
+            .expect("channel closed");
+        let Action::BaselineReady { ver, built } = action else {
+            panic!("expected a baseline result");
+        };
+        assert_eq!(ver, 2);
+        assert_eq!(built.kind, Kind::Snapshot);
+        assert_eq!(built.phase, Phase::Ready);
+        let entry = built
+            .changed
+            .get(Path::new("main.rs"))
+            .expect("the edit is a change against the start");
+        assert_eq!(entry.status, Status::Modified);
+        assert_eq!(entry.stat.expect("counted").format(), "~1");
+    }
+
+    #[tokio::test]
+    async fn stats_for_a_snapshot_compare_with_the_scan_and_not_with_git() {
+        use crate::core::fsmodel::Status;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("kept.rs"), "one\n").expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
+        runner.run(Effect::BuildBaseline {
+            kind: Kind::Head,
+            ver: 1,
+        });
+        scanned(&runner).await;
+        let _ = rx.recv().await.expect("channel closed");
+
+        std::fs::write(dir.path().join("kept.rs"), "one\ntwo\n").expect("write");
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        runner.run(Effect::ComputeStats {
+            kind: Kind::Snapshot,
+            at,
+            paths: vec![(PathBuf::from("kept.rs"), 4)],
+        });
+        let action = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no stats in time")
+            .expect("channel closed");
+        let Action::StatsComputed { results } = action else {
+            panic!("expected a stats result");
+        };
+        assert_eq!(results.len(), 1, "{results:?}");
+        let answer = &results[0];
+        assert_eq!(answer.generation, 4);
+        assert_eq!(answer.rel, PathBuf::from("kept.rs"));
+        let entry = answer.entry.expect("the file moved since the scan");
+        assert_eq!(entry.status, Status::Modified);
+        assert_eq!(entry.stat.expect("counted").format(), "+1");
+        assert_eq!(entry.changed_at, at);
     }
 
     #[tokio::test]
@@ -646,6 +842,7 @@ mod tests {
         let runner = EffectRunner::new(dir.path().to_path_buf(), true, tx);
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
         runner.run(Effect::ComputeStats {
+            kind: Kind::Head,
             at,
             paths: vec![(PathBuf::from("a.txt"), 4), (PathBuf::from("gone.txt"), 9)],
         });
