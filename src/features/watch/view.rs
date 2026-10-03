@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     }
     frame.render_widget(Clear, popup);
-    frame.render_widget(pane_line(title(state), &state.theme), popup);
+    frame.render_widget(pane_line(title(state), &state.theme, false), popup);
     let inner = popup.inner(Margin::new(1, 1));
     if inner.width == 0 || inner.height == 0 {
         return;

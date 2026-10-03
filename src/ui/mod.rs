@@ -53,19 +53,26 @@ impl FrameSync {
     }
 }
 
-/// A bordered pane with a title.
-pub fn pane<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+/// A bordered pane with a title. The frame of the pane that holds the
+/// focus is drawn bright, the others dim.
+pub fn pane<'a>(title: &'a str, theme: &Theme, focused: bool) -> Block<'a> {
     pane_line(
         Line::from(Span::styled(title, theme.style(Role::PaneTitle))),
         theme,
+        focused,
     )
 }
 
 /// A bordered pane with a title built from separately styled pieces.
-pub fn pane_line<'a>(title: Line<'a>, theme: &Theme) -> Block<'a> {
+pub fn pane_line<'a>(title: Line<'a>, theme: &Theme, focused: bool) -> Block<'a> {
+    let border = if focused {
+        Role::PaneBorderFocused
+    } else {
+        Role::PaneBorder
+    };
     Block::bordered()
         .title(title)
-        .border_style(theme.style(Role::PaneBorder))
+        .border_style(theme.style(border))
 }
 
 /// Draws a dim, centered hint where content would go.

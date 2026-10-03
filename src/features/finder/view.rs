@@ -25,7 +25,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     frame.render_widget(Clear, areas.popup);
     frame.render_widget(
-        pane(state.overlay.label().unwrap_or("FILES"), &state.theme),
+        pane(
+            state.overlay.label().unwrap_or("FILES"),
+            &state.theme,
+            false,
+        ),
         areas.popup,
     );
     if areas.query.width == 0 || areas.query.height == 0 {
@@ -62,7 +66,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    frame.render_widget(pane(&title(state), &state.theme), area);
+    frame.render_widget(pane(&title(state), &state.theme, false), area);
     let inner = area.inner(Margin::new(1, 1));
     if inner.width == 0 || inner.height == 0 {
         return;

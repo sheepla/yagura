@@ -188,4 +188,40 @@ mod tests {
             "the panes behind the overlay show through: {text}"
         );
     }
+
+    /// The frame colours at the top left corner of the tree and of the
+    /// preview header.
+    fn frame_corners(state: &AppState) -> (ratatui::style::Color, ratatui::style::Color) {
+        let mut terminal =
+            Terminal::new(TestBackend::new(state.size.0, state.size.1)).expect("terminal");
+        terminal.draw(|frame| render(frame, state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let areas = crate::ui::layout::compute(
+            ratatui::layout::Rect::new(0, 0, state.size.0, state.size.1),
+            state.tree_visible,
+        );
+        (
+            buffer[(0, 0)].fg,
+            buffer[(areas.header.x, areas.header.y)].fg,
+        )
+    }
+
+    #[test]
+    fn the_frame_of_the_focused_pane_is_the_bright_one() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::style::Color;
+
+        let mut state = state(80, 24, false);
+        let (tree, header) = frame_corners(&state);
+        assert_eq!(tree, Color::White, "the tree holds the focus");
+        assert_eq!(header, Color::DarkGray, "the preview does not");
+
+        crate::app::reduce::reduce(
+            &mut state,
+            crate::app::Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        );
+        let (tree, header) = frame_corners(&state);
+        assert_eq!(tree, Color::DarkGray, "the focus moved away");
+        assert_eq!(header, Color::White, "the preview holds the focus now");
+    }
 }

@@ -13,6 +13,9 @@ use crate::core::fsmodel::Status;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     PaneBorder,
+    /// The frame of the pane that holds the focus, so it stands apart from
+    /// the dim frame of the pane that does not.
+    PaneBorderFocused,
     PaneTitle,
     TreeText,
     TreeDirectory,
@@ -119,6 +122,7 @@ impl Theme {
 fn color(role: Role) -> Color {
     match role {
         Role::PaneBorder | Role::StatusMuted | Role::TooSmall => Color::DarkGray,
+        Role::PaneBorderFocused => Color::White,
         Role::PaneTitle | Role::TreeText | Role::PreviewText | Role::StatusMessage => Color::Reset,
         Role::TreeDirectory => Color::Blue,
         Role::TreeSymlink => Color::Cyan,
@@ -187,7 +191,8 @@ fn modifiers(role: Role) -> Modifier {
         | Role::SyntaxNumber
         | Role::SyntaxType
         | Role::SyntaxFunction
-        | Role::PreviewInlineCode => Modifier::empty(),
+        | Role::PreviewInlineCode
+        | Role::PaneBorderFocused => Modifier::empty(),
     }
 }
 
@@ -200,6 +205,7 @@ mod tests {
         let theme = Theme::new(false);
         for role in [
             Role::PaneBorder,
+            Role::PaneBorderFocused,
             Role::TreeDirectory,
             Role::StatusError,
             Role::StatusInfo,
@@ -297,5 +303,25 @@ mod tests {
             let style = theme.style(Role::TreeSelected);
             assert!(style.add_modifier.contains(Modifier::REVERSED));
         }
+    }
+
+    /// The focused frame is the bright one, the other is dim: that is how
+    /// the pane with the focus is told apart from the one without it.
+    #[test]
+    fn the_focused_frame_stands_apart_from_the_other() {
+        let theme = Theme::new(false);
+        let focused = theme.style(Role::PaneBorderFocused);
+        let other = theme.style(Role::PaneBorder);
+        assert_eq!(focused.fg, Some(Color::White));
+        assert_eq!(other.fg, Some(Color::DarkGray));
+        assert!(!focused.add_modifier.intersects(Modifier::DIM));
+        assert!(other.add_modifier.contains(Modifier::DIM));
+        // Under NO_COLOR the two still differ, by their attributes.
+        let plain = Theme::new(true);
+        assert_ne!(
+            plain.style(Role::PaneBorderFocused).add_modifier,
+            plain.style(Role::PaneBorder).add_modifier,
+            "NO_COLOR cannot tell the focused frame from the other"
+        );
     }
 }

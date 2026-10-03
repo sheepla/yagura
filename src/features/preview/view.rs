@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
-use crate::app::state::{AppState, PreviewMode};
+use crate::app::state::{AppState, Focus, PreviewMode};
 use crate::core::diff::Row;
 use crate::core::fsmodel::{Node, Status};
 use crate::core::highlight::{self, Semantic};
@@ -59,7 +59,14 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             state.theme.style(Role::for_status(node.status)),
         ));
     }
-    frame.render_widget(pane_line(Line::from(spans), &state.theme), area);
+    frame.render_widget(
+        pane_line(
+            Line::from(spans),
+            &state.theme,
+            state.focus == Focus::Preview,
+        ),
+        area,
+    );
 }
 
 /// The tree node of the file the preview points at, when there is one.

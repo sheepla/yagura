@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::state::AppState;
+use crate::app::state::{AppState, Focus};
 use crate::core::baseline::Phase;
 use crate::core::fsmodel::{Node, NodeKind, NodeStat, Status};
 use crate::core::text;
@@ -21,7 +21,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    frame.render_widget(pane(&tree_title(state), &state.theme), area);
+    frame.render_widget(
+        pane(&tree_title(state), &state.theme, state.focus == Focus::Tree),
+        area,
+    );
     // Two cells: the border, then a cell of air, so no row touches the
     // frame and the selection stops short of it on both sides.
     let inner = area.inner(ratatui::layout::Margin::new(2, 1));
