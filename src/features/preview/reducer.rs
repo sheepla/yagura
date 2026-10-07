@@ -205,6 +205,12 @@ pub fn reload(state: &mut AppState) -> Vec<Effect> {
     let Some(rel) = state.preview.path.clone() else {
         return Vec::new();
     };
+    // The body on screen was built for the other kind of view (spec §6): a
+    // folded diff would be drawn as plain lines that are in fact two rows,
+    // so the pane waits for the read that matches instead of drawing it.
+    if state.preview.mode.is_diff() != mode_for(state).is_diff() {
+        state.preview.drop_body();
+    }
     let generation = state.preview.generation + 1;
     state.preview.generation = generation;
     vec![load(state, rel, generation)]

@@ -561,7 +561,10 @@ fn assemble(
     // The pane draws colour, so a document is not ready until it has its
     // spans. This is the one place that runs on the worker anyway.
     style(&mut doc, content);
-    if let Some(baseline) = baseline {
+    // A baseline can be handed over although the reader asked for content:
+    // the loader sees the file gone and then reads it (§12). Folding it in
+    // would give every changed line two rows in a body drawn as plain lines.
+    if !content && let Some(baseline) = baseline {
         apply_diff(&mut doc, baseline);
     }
     doc
@@ -1440,5 +1443,24 @@ mod tests {
         let path = dir.path().join("gone.txt");
         let err = load_doc_with(&path, Path::new("gone.txt"), None, true).expect_err("io");
         assert!(matches!(err, PreviewError::Io(_)));
+    }
+
+    #[test]
+    fn a_content_view_never_folds_the_rows_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(&dir, "a.txt", b"new\n");
+        // The baseline arrives although the reader asked for content: the
+        // loader checks the file, loses it to a writer, and reads it anyway
+        // (§12). Folding would give one line of content a removed and an
+        // added row, and the pane would draw both.
+        let doc = load_doc_with(
+            &path,
+            Path::new("a.txt"),
+            Some(Baseline::Bytes(b"old\n".to_vec())),
+            false,
+        )
+        .expect("doc");
+        assert!(doc.diff.is_none(), "the content view draws no diff");
+        assert_eq!(doc.lines, vec!["new"]);
     }
 }

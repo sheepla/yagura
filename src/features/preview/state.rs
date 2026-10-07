@@ -187,6 +187,17 @@ impl PreviewState {
         self.centre_here();
     }
 
+    /// Takes the body away while the read for another kind of view is on
+    /// its way (spec §6).
+    ///
+    /// A diff folds its rows into `lines`, so a body built for one kind of
+    /// view would be drawn wrongly by the other. The file and the scroll
+    /// stay, so the view is where it was once the right body arrives.
+    pub fn drop_body(&mut self) {
+        self.doc = None;
+        self.preview = PreviewStatus::Loading;
+    }
+
     /// Records that the load failed; the message is on the status bar.
     pub fn set_failed(&mut self) {
         self.doc = None;

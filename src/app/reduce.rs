@@ -1247,6 +1247,43 @@ mod tests {
     }
 
     #[test]
+    fn switching_out_of_a_diff_waits_instead_of_drawing_its_rows_twice() {
+        use crate::core::diff::Diff;
+        use crate::features::preview::PreviewStatus;
+
+        let mut state = state();
+        state.preview_mode = PreviewMode::SideBySide;
+        state.preview.path = Some(PathBuf::from("a.rs"));
+        // The diff is on the pane: it was read for the diff mode, so its
+        // `lines` are folded rows rather than the file's own lines.
+        state.preview.mode = PreviewMode::SideBySide;
+        let mut doc = scrollable();
+        doc.diff = Some(Diff::compute("old", "new").expect("a diff"));
+        state.preview.set_doc(doc);
+        state.preview.scroll_line = 7;
+
+        let effects = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::Content);
+        assert!(
+            state.preview.doc.is_none(),
+            "the folded rows must not be drawn as plain lines"
+        );
+        assert_eq!(state.preview.preview, PreviewStatus::Loading);
+        assert_eq!(state.preview.path, Some(PathBuf::from("a.rs")));
+        assert_eq!(state.preview.scroll_line, 7, "the view does not jump");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LoadPreview {
+                    mode: PreviewMode::Content,
+                    ..
+                }
+            )),
+            "the plain body is on its way: {effects:?}"
+        );
+    }
+
+    #[test]
     fn the_finder_reads_content_and_the_reader_gets_the_diff_back() {
         let mut state = state();
         state.preview_mode = PreviewMode::InlineDiff;
