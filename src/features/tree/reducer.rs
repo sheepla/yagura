@@ -178,19 +178,6 @@ fn navigate(state: &mut AppState, movement: Navigation) {
         Navigation::First => tree.select_first(),
         Navigation::Last => tree.select_last(),
     }
-    follow_selection(state);
-}
-
-/// Points the preview at whatever the tree has selected.
-fn follow_selection(state: &mut AppState) {
-    let path = state.selected_path();
-    if state.preview.path != path {
-        state.preview.path = path;
-        state.preview.scroll_line = 0;
-        state.preview.scroll_col = 0;
-    }
-    // A new generation marks the pending load as the current one.
-    state.preview.generation = state.preview.generation.wrapping_add(1);
 }
 
 /// `F`: the selection follows the changes instead of the reader's hand.
@@ -218,7 +205,9 @@ fn apply_follow(state: &mut AppState, effects: &mut Vec<Effect>) {
     };
     reveal(state, target, effects);
     state.tree.select(target);
-    follow_selection(state);
+    // Unlike a command from the keyboard, a batch of changes does not pass
+    // through the root reducer, so the preview is aimed here (design §11.4).
+    effects.extend(crate::features::preview::reducer::sync_target(state));
 }
 
 /// The path that changed last, ties going to the one that sorts last so that
@@ -354,7 +343,6 @@ fn open_selected(state: &mut AppState, effects: &mut Vec<Effect>) {
         toggle_selected(state, effects);
     } else {
         state.focus = Focus::Preview;
-        follow_selection(state);
     }
 }
 
@@ -372,7 +360,6 @@ fn collapse_or_go_up(state: &mut AppState) {
         && state.tree.model.contains(parent)
     {
         state.tree.select(parent);
-        follow_selection(state);
     }
 }
 
@@ -1321,6 +1308,37 @@ mod tests {
 
         let second = state.tree.selected.expect("a selection");
         assert_eq!(rel_of(&state, second), Some(PathBuf::from("docs/guide.md")));
+    }
+
+    /// A batch of changes does not go through the root reducer, so the pane
+    /// has to be aimed where follow took the selection (design §11.4).
+    #[test]
+    fn the_pane_reads_the_file_the_follow_takes_the_selection_to() {
+        let mut state = populated();
+        differs(&mut state, "README.md", at());
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleFollow));
+        assert_eq!(state.preview.path, Some(PathBuf::from("README.md")));
+
+        let later = at() + Duration::from_secs(5);
+        differs(&mut state, "docs/guide.md", later);
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("docs/guide.md", ChangeKind::Modify)],
+            later,
+        );
+
+        assert_eq!(
+            state.preview.path,
+            Some(PathBuf::from("docs/guide.md")),
+            "the pane points at the file the selection jumped to"
+        );
+        let loads = effects
+            .iter()
+            .filter(|effect| {
+                matches!(effect, Effect::LoadPreview { rel, .. } if rel == Path::new("docs/guide.md"))
+            })
+            .count();
+        assert_eq!(loads, 1, "and its body is asked for: {effects:?}");
     }
 
     #[test]

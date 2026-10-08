@@ -744,6 +744,26 @@ mod tests {
         assert_eq!(fingerprint(&state), before);
     }
 
+    /// A row the selection cannot leave is not a new target: the pane keeps
+    /// its body and the line it was read up to.
+    #[test]
+    fn a_navigation_that_cannot_move_leaves_the_pane_where_it_was() {
+        let mut state = tree_with_rows();
+        reduce(&mut state, Action::Command(Command::Last));
+        state.preview.set_doc(scrollable());
+        state.preview.scroll_line = 7;
+
+        let effects = reduce(&mut state, Action::Command(Command::MoveDown));
+        assert_eq!(state.preview.scroll_line, 7, "the view does not jump");
+        assert!(state.preview.doc.is_some(), "the body stayed");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadPreview { .. })),
+            "a selection that cannot move was read again: {effects:?}"
+        );
+    }
+
     /// A document long enough for the wheel to have somewhere to go.
     fn scrollable() -> crate::core::preview::Doc {
         crate::core::preview::Doc {
