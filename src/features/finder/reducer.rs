@@ -508,6 +508,107 @@ mod tests {
         assert_eq!(state.finder.selected, 0);
     }
 
+    /// Every key the query box has reaches the box: the characters, the
+    /// cursors and the three ways of taking text out (§13.1).
+    #[test]
+    fn every_editing_key_reaches_the_query_box() {
+        let mut state = state();
+        open_overlay(&mut state);
+        let edit = |state: &mut AppState, command: Command| {
+            crate::app::reduce::reduce(state, Action::Command(command));
+        };
+
+        for c in "the quick".chars() {
+            edit(&mut state, Command::FinderInsert(c));
+        }
+        assert_eq!(state.finder.query_text(), "the quick");
+
+        // Home takes the cursor to the head, forward delete the first letter.
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderDeleteForward);
+        assert_eq!(state.finder.query_text(), "he quick");
+
+        // End takes it back to the tail, backspace the last letter.
+        edit(&mut state, Command::FinderCursorEnd);
+        edit(&mut state, Command::FinderDeleteBack);
+        assert_eq!(state.finder.query_text(), "he quic");
+
+        // Left and right step over single characters, which the two inserts
+        // below land exactly where the cursor was left.
+        edit(&mut state, Command::FinderCursorLeft);
+        edit(&mut state, Command::FinderInsert('|'));
+        assert_eq!(state.finder.query_text(), "he qui|c");
+        edit(&mut state, Command::FinderCursorRight);
+        edit(&mut state, Command::FinderInsert('/'));
+        assert_eq!(state.finder.query_text(), "he qui|c/");
+
+        // Word left from the tail walks to the head of the word before it.
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderDeleteToEnd);
+        for c in "one two".chars() {
+            edit(&mut state, Command::FinderInsert(c));
+        }
+        edit(&mut state, Command::FinderCursorWordLeft);
+        edit(&mut state, Command::FinderInsert('['));
+        assert_eq!(state.finder.query_text(), "one [two");
+
+        // Word right from the head walks over the word it stands on.
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderDeleteToEnd);
+        for c in "alpha beta".chars() {
+            edit(&mut state, Command::FinderInsert(c));
+        }
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderCursorWordRight);
+        edit(&mut state, Command::FinderInsert('{'));
+        assert_eq!(state.finder.query_text(), "alpha {beta");
+
+        // A word at the cursor goes at once...
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderDeleteToEnd);
+        for c in "alpha beta".chars() {
+            edit(&mut state, Command::FinderInsert(c));
+        }
+        edit(&mut state, Command::FinderDeleteWord);
+        assert_eq!(state.finder.query_text(), "alpha ");
+
+        // ...the way back to the head goes at once...
+        edit(&mut state, Command::FinderDeleteToStart);
+        assert_eq!(state.finder.query_text(), "");
+
+        // ...and so does the way to the tail.
+        for c in "again".chars() {
+            edit(&mut state, Command::FinderInsert(c));
+        }
+        edit(&mut state, Command::FinderCursorHome);
+        edit(&mut state, Command::FinderDeleteToEnd);
+        assert_eq!(state.finder.query_text(), "");
+    }
+
+    /// The page keys move the list by a page at a time, and stop at the ends
+    /// the single-step keys stop at (§13.2).
+    #[test]
+    fn the_page_keys_move_the_list_by_a_page() {
+        let mut state = state();
+        open_overlay(&mut state);
+        let paths: Vec<String> = (0..100).map(|index| format!("f{index:03}.txt")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        chunk(&mut state, &refs);
+        assert_eq!(state.finder.shown.len(), 100);
+
+        let page = page(&state);
+        assert!(page > 0, "the popup has rows");
+        state.finder.selected = page;
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::FinderPageDown));
+        assert_eq!(state.finder.selected, page * 2, "a page down");
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::FinderPageUp));
+        assert_eq!(state.finder.selected, page, "and a page up");
+
+        state.finder.selected = 0;
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::FinderPageUp));
+        assert_eq!(state.finder.selected, 0, "the top of the list");
+    }
+
     #[test]
     fn enter_takes_the_row_all_the_way_to_the_tree_and_the_preview() {
         let mut state = state();

@@ -1388,10 +1388,10 @@ mod tests {
         let baseline = Baseline::Bytes(b"fn old() {}\n".to_vec());
         let doc = load_doc_with(&path, Path::new("main.rs"), Some(baseline), true).expect("doc");
         assert!(doc.diff.is_some());
-        assert_eq!(doc.spans.len(), doc.lines.len(), "every row keeps its runs");
+        assert_eq!(doc.spans.len(), doc.lines.len(), "every row has its runs");
         assert!(
-            doc.spans.iter().any(|runs| !runs.is_empty()),
-            "the language still colours the rows (§6)"
+            doc.spans.iter().all(|runs| !runs.is_empty()),
+            "every row is drawn with the runs of its own language (§6)"
         );
     }
 

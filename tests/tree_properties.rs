@@ -10,7 +10,7 @@ mod support;
 use std::collections::HashSet;
 
 use proptest::prelude::*;
-use yagura::app::state::AppState;
+use yagura::app::state::{AppState, Focus};
 use yagura::app::{Action, Command, Effect, reduce::reduce};
 use yagura::core::dirload::DirError;
 use yagura::core::fsmodel::NodeId;
@@ -377,6 +377,52 @@ fn expanding_a_file_asks_for_nothing() {
     );
     assert!(!state.tree.loading.contains(&file));
     assert!(!state.tree.is_expanded(file));
+}
+
+/// `Enter`: directories open, and a file hands the pane over to the preview,
+/// which asks for what it selected (spec §5).
+#[test]
+fn enter_opens_a_directory_and_hands_a_file_to_the_preview() {
+    let mut state = populated();
+    let root = state.tree.model.root_id();
+    let docs = state
+        .tree
+        .model
+        .child_id(root, std::ffi::OsStr::new("docs"))
+        .expect("the fixture has a directory");
+    state.tree.select(docs);
+
+    let effects = reduce(&mut state, Action::Command(Command::OpenPreview));
+    assert!(state.tree.is_expanded(docs), "the directory opened");
+    assert_eq!(state.focus, Focus::Tree, "the tree keeps the focus");
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::LoadDir { .. })),
+        "the listing was asked for: {effects:?}"
+    );
+
+    let readme = state
+        .tree
+        .model
+        .child_id(root, std::ffi::OsStr::new("README.md"))
+        .expect("the fixture has a file");
+    state.tree.select(readme);
+
+    let effects = reduce(&mut state, Action::Command(Command::OpenPreview));
+    assert_eq!(state.focus, Focus::Preview, "the pane takes the focus");
+    assert_eq!(
+        state.preview.path,
+        Some(std::path::PathBuf::from("README.md")),
+        "and points at the file"
+    );
+    let loads = effects
+        .iter()
+        .filter(|effect| {
+            matches!(effect, Effect::LoadPreview { rel, .. } if rel == std::path::Path::new("README.md"))
+        })
+        .count();
+    assert_eq!(loads, 1, "the file is asked for: {effects:?}");
 }
 
 #[test]

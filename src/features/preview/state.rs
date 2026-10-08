@@ -540,6 +540,23 @@ mod tests {
         assert!(preview.doc.is_none());
     }
 
+    /// The body goes while the read for the other kind of view is on its
+    /// way; the file and the line stay, so the view is where it was once
+    /// the right body arrives (spec §6).
+    #[test]
+    fn dropping_the_body_keeps_the_file_and_the_line() {
+        let mut preview = shown();
+        preview.scroll_line = 7;
+
+        preview.drop_body();
+
+        assert!(preview.doc.is_none());
+        assert_eq!(preview.preview, PreviewStatus::Loading);
+        assert_eq!(preview.path, Some(PathBuf::from("a.rs")));
+        assert_eq!(preview.scroll_line, 7);
+        assert_eq!(preview.total_lines, 100, "the size is still known");
+    }
+
     /// One hit, as a run reports it.
     fn hit(rel: &str, line: u32) -> GrepMatch {
         GrepMatch {

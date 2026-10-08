@@ -383,6 +383,95 @@ mod tests {
         assert!(store.state.quitting);
     }
 
+    /// Keys and pastes in the queue were meant for the editor that had the
+    /// terminal; only the actions behind them are handled (§8).
+    #[tokio::test]
+    async fn drain_keys_drops_what_the_editor_was_meant_to_read() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut store = store(80, 24);
+        let (action_tx, _action_rx) = tokio::sync::mpsc::channel(4);
+        let runner = EffectRunner::new(PathBuf::from("/root"), true, action_tx);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+
+        let key = |code| Action::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        input_tx
+            .send(key(KeyCode::Char('t')))
+            .await
+            .expect("queued");
+        input_tx
+            .send(Action::Paste("typed for the editor".into()))
+            .await
+            .expect("queued");
+        input_tx
+            .send(Action::Command(Command::CyclePreviewMode))
+            .await
+            .expect("queued");
+        input_tx
+            .send(key(KeyCode::Char('j')))
+            .await
+            .expect("queued");
+        input_tx
+            .send(Action::Command(Command::ToggleFocus))
+            .await
+            .expect("queued");
+
+        drain_keys(&mut store, &runner, &mut input_rx);
+
+        assert!(store.state.tree_visible, "`t` never reached the panes");
+        assert_eq!(
+            store.state.preview_mode,
+            PreviewMode::InlineDiff,
+            "the commands did"
+        );
+        assert_eq!(store.state.focus, Focus::Preview);
+        assert!(input_rx.try_recv().is_err(), "the queue was drained");
+    }
+
+    /// Background results keep being handled while the child has the
+    /// terminal, and none of them draws a frame (design §14.2).
+    #[tokio::test]
+    async fn results_arriving_while_the_child_runs_are_still_handled() {
+        let mut store = store(80, 24);
+        let (action_tx, _action_rx) = tokio::sync::mpsc::channel(4);
+        let runner = EffectRunner::new(PathBuf::from("/root"), true, action_tx);
+        let (result_tx, mut action_rx) = tokio::sync::mpsc::channel(4);
+
+        let mut child = short_lived_child();
+        result_tx
+            .send(Action::Command(Command::CyclePreviewMode))
+            .await
+            .expect("queued");
+        wait_while_working(&mut child, &mut store, &runner, &mut action_rx)
+            .await
+            .expect("wait");
+
+        assert_eq!(
+            store.state.preview_mode,
+            PreviewMode::InlineDiff,
+            "handled while waiting for the child"
+        );
+        assert_eq!(store.draw_count, 0, "no frame was drawn");
+    }
+
+    /// A child that is gone before the test would grow impatient with it.
+    fn short_lived_child() -> tokio::process::Child {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg("sleep 0.3");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("cmd");
+            command.arg("/C").arg("ping -n 2 127.0.0.1 > NUL");
+            command
+        };
+        command.kill_on_drop(true);
+        command.spawn().expect("child")
+    }
+
     #[tokio::test]
     async fn the_loop_runs_effects_and_stops_on_quit() {
         let dir = tempfile::tempdir().expect("temp dir");

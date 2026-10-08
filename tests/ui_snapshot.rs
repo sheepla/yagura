@@ -209,38 +209,40 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+/// Runs the effects and reduces everything they send until `done`.
+async fn run_until(
+    runner: &yagura::app::runner::EffectRunner,
+    rx: &mut tokio::sync::mpsc::Receiver<yagura::app::Action>,
+    state: &mut yagura::app::state::AppState,
+    effects: Vec<yagura::app::Effect>,
+    done: impl Fn(&yagura::app::Action) -> bool,
+) {
+    use std::time::Duration;
+
+    use yagura::app::reduce::reduce;
+    for effect in effects {
+        runner.run(effect);
+    }
+    loop {
+        let action = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the effects finished in time")
+            .expect("the store side of the channel stays open");
+        let matched = done(&action);
+        reduce(state, action);
+        if matched {
+            return;
+        }
+    }
+}
+
 #[test]
 fn a_changed_file_shows_a_diff_against_head() {
     use std::cell::Cell;
-    use std::time::Duration;
 
-    use yagura::app::state::{AppState, PreviewMode};
-    use yagura::app::{Action, Command, Effect, reduce::reduce};
+    use yagura::app::state::PreviewMode;
+    use yagura::app::{Action, Command, reduce::reduce};
     use yagura::features::preview::reducer::sync_target;
-
-    /// Runs the effects and reduces everything they send until `done`.
-    async fn run_until(
-        runner: &yagura::app::runner::EffectRunner,
-        rx: &mut tokio::sync::mpsc::Receiver<Action>,
-        state: &mut AppState,
-        effects: Vec<Effect>,
-        done: impl Fn(&Action) -> bool,
-    ) {
-        for effect in effects {
-            runner.run(effect);
-        }
-        loop {
-            let action = tokio::time::timeout(Duration::from_secs(20), rx.recv())
-                .await
-                .expect("the effects finished in time")
-                .expect("the store side of the channel stays open");
-            let matched = done(&action);
-            reduce(state, action);
-            if matched {
-                return;
-            }
-        }
-    }
 
     let dir = git_fixture();
     // The committed line and the file on disk now differ.
@@ -316,4 +318,121 @@ fn a_changed_file_shows_a_diff_against_head() {
         "the terminal is wide enough for the split"
     );
     assert_snapshot!("preview_split_text", render_text(&state));
+}
+
+/// The cycle goes content → inline diff → split → content, and the frame the
+/// pane draws while the content read is on its way must not draw the diff
+/// rows as plain lines: they are two rows of another view (spec §6).
+#[test]
+fn cycling_back_to_normal_never_draws_its_rows_as_content() {
+    use std::cell::Cell;
+
+    use yagura::app::state::PreviewMode;
+    use yagura::app::{Action, Command, reduce::reduce};
+    use yagura::features::preview::reducer::sync_target;
+
+    let dir = git_fixture();
+    // The committed line and the file on disk now differ.
+    std::fs::write(dir.path().join("README.md"), "# yagura!\n").expect("write");
+    let mut state = plain_state(dir.path(), false);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Action>(16);
+    runtime.block_on(async {
+        let runner = yagura::app::runner::EffectRunner::new(dir.path().to_path_buf(), true, tx);
+
+        // The listing and the baseline build both report in before the
+        // preview can ask either of them anything.
+        let listed = Cell::new(false);
+        let built = Cell::new(false);
+        let startup = state.startup_effects();
+        run_until(&runner, &mut rx, &mut state, startup, |action| {
+            listed.set(listed.get() || matches!(action, Action::DirLoaded { .. }));
+            built.set(built.get() || matches!(action, Action::BaselineReady { .. }));
+            listed.get() && built.get()
+        })
+        .await;
+
+        // Wide enough for every step of the cycle to mean what it says.
+        assert!(
+            reduce(
+                &mut state,
+                Action::Resize {
+                    width: 120,
+                    height: 30,
+                },
+            )
+            .is_empty()
+        );
+
+        let file = state
+            .tree
+            .model
+            .lookup(Path::new("README.md"))
+            .expect("the fixture has a README");
+        state.tree.select(file);
+        let load = sync_target(&mut state);
+        run_until(&runner, &mut rx, &mut state, load, |action| {
+            matches!(action, Action::PreviewLoaded { .. })
+        })
+        .await;
+
+        // The inline diff, and the split drawn from the rows it already has.
+        let cycle = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        run_until(&runner, &mut rx, &mut state, cycle, |action| {
+            matches!(action, Action::PreviewLoaded { .. })
+        })
+        .await;
+        assert!(
+            state
+                .preview
+                .doc
+                .as_deref()
+                .is_some_and(|doc| doc.diff.is_some()),
+            "the inline diff arrived"
+        );
+        assert!(
+            reduce(&mut state, Action::Command(Command::CyclePreviewMode)).is_empty(),
+            "the split draws the rows already loaded"
+        );
+        assert_eq!(state.preview_mode, PreviewMode::SideBySide);
+
+        // Back to content: the body on screen was built as a diff, so the
+        // pane waits for the read that matches instead of drawing it.
+        let cycle = reduce(&mut state, Action::Command(Command::CyclePreviewMode));
+        assert_eq!(state.preview_mode, PreviewMode::Content);
+        assert!(!cycle.is_empty(), "the read for content was asked for");
+
+        let waiting = render_text(&state);
+        assert!(
+            waiting.contains("loading…"),
+            "the pane waits instead of drawing: {waiting}"
+        );
+        assert!(
+            !waiting.lines().any(|line| line.contains("# yagura")),
+            "the diff rows were drawn as content: {waiting}"
+        );
+
+        run_until(&runner, &mut rx, &mut state, cycle, |action| {
+            matches!(action, Action::PreviewLoaded { .. })
+        })
+        .await;
+    });
+
+    assert_eq!(state.preview_mode, PreviewMode::Content);
+    let doc = state.preview.doc.as_deref().expect("the content arrived");
+    assert!(doc.diff.is_none(), "content carries no diff");
+
+    let frame = render_text(&state);
+    assert!(
+        frame.lines().any(|line| line.contains("yagura!")),
+        "the file on disk is shown: {frame}"
+    );
+    assert!(
+        !frame.lines().any(|line| line.contains("# yagura")),
+        "a diff row was drawn as content: {frame}"
+    );
 }

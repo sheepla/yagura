@@ -644,4 +644,39 @@ mod tests {
             other => panic!("expected a preview load, got {other:?}"),
         }
     }
+
+    /// The body on screen was built for the other kind of view, so the pane
+    /// waits for the read that matches instead of drawing it (spec §6).
+    #[test]
+    fn trading_the_pane_for_a_diff_takes_the_body_away() {
+        use crate::app::state::PreviewMode;
+
+        let mut state = loaded(100);
+        state.preview.scroll_line = 7;
+
+        // The pane and the reader agree on content: nothing is read again.
+        assert!(reload_for_the_mode(&mut state).is_empty());
+
+        // A diff needs a body this pane cannot draw as it stands.
+        state.preview_mode = PreviewMode::InlineDiff;
+        let mut effects = reload_for_the_mode(&mut state);
+        assert!(state.preview.doc.is_none());
+        assert_eq!(state.preview.preview, PreviewStatus::Loading);
+        assert_eq!(state.preview.path, Some(PathBuf::from("a.rs")));
+        assert_eq!(state.preview.scroll_line, 7, "the view is where it was");
+        assert_eq!(
+            state.preview.mode,
+            PreviewMode::InlineDiff,
+            "what was asked for is remembered"
+        );
+        let Effect::LoadPreview {
+            mode, generation, ..
+        } = effects.pop().expect("a read")
+        else {
+            panic!("expected a preview load");
+        };
+        assert_eq!(mode, PreviewMode::InlineDiff);
+        assert_eq!(generation, state.preview.generation);
+        assert!(effects.is_empty(), "{effects:?}");
+    }
 }
