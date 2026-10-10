@@ -376,6 +376,19 @@ mod tests {
             .collect()
     }
 
+    /// Refreshes until the matcher's workers have caught up, however slow the
+    /// machine running the tests is.
+    fn settle(finder: &mut FinderState, changed: &BTreeMap<PathBuf, ChangedEntry>) {
+        for _ in 0..100 {
+            finder.refresh(Overlay::Files, changed);
+            if !finder.matcher_running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the matcher never finished ranking");
+    }
+
     #[test]
     fn an_empty_query_lists_the_changed_paths_first_and_newest_first() {
         let mut finder = FinderState::default();
@@ -421,7 +434,7 @@ mod tests {
         finder.refresh(Overlay::Files, &changed);
         // A query takes the list over: the matcher ranks it.
         finder.insert_char('n');
-        finder.refresh(Overlay::Files, &changed);
+        settle(&mut finder, &changed);
         assert_eq!(listed(&finder), ["new.txt"]);
         // Back at no query the walk order comes back, changed first.
         finder.delete_char();
@@ -435,7 +448,7 @@ mod tests {
         finder.absorb(&found(&["a.rs", "b.rs"]), &BTreeMap::new());
         finder.refresh(Overlay::Files, &BTreeMap::new());
         finder.insert_char('z');
-        finder.refresh(Overlay::Files, &BTreeMap::new());
+        settle(&mut finder, &BTreeMap::new());
         assert!(finder.shown.is_empty());
         assert_eq!(finder.selected_path(Overlay::Files), None);
     }

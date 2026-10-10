@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::state::{AppState, Focus, PreviewMode};
 use crate::core::diff::Row;
@@ -230,6 +231,10 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
 
 /// The byte range of each display row of a laid out line, wrapped to `width`
 /// columns. A break lands after a space when the row has one (§9.4).
+///
+/// A grapheme is the unit of both the counting and the breaking: an emoji
+/// joined by zero width joiners draws as two columns and never loses half of
+/// itself to the next row.
 fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
     if line.is_empty() {
         return vec![(0, 0)];
@@ -238,8 +243,8 @@ fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
     let mut row_start = 0;
     let mut used = 0;
     let mut last_space = None;
-    for (offset, ch) in line.char_indices() {
-        let columns = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (offset, grapheme) in line.grapheme_indices(true) {
+        let columns = unicode_width::UnicodeWidthStr::width(grapheme);
         if used + columns > width && offset > row_start {
             // Breaking after a space keeps the word whole; a row without one
             // is broken where it ran out of room.
@@ -249,8 +254,8 @@ fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
             used = text::display_width(&line[break_at..offset]);
             last_space = None;
         }
-        if ch == ' ' {
-            last_space = Some(offset + ch.len_utf8());
+        if grapheme == " " {
+            last_space = Some(offset + grapheme.len());
         }
         used += columns;
     }
@@ -801,6 +806,16 @@ mod tests {
         assert!(rows[3].starts_with("      word"), "{:?}", rows[3]);
         // The pane wraps it; it never cuts a laid out line short.
         assert!(!text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn a_wrapped_row_never_breaks_an_emoji_cluster_in_half() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        // The filler ends two columns short of the row's width, so counting
+        // the joined family as its four parts used to break it in half here.
+        let filler = "word ".repeat(6);
+        let text = buffer(&laid_out(&format!("{}{family} more", filler.trim_end())));
+        assert!(text.contains(family), "the cluster was split:\n{text}");
     }
 
     #[test]

@@ -8,7 +8,8 @@
 use std::ffi::OsStr;
 use std::io;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Columns a tab is expanded to.
 pub const TAB_WIDTH: usize = 4;
@@ -116,8 +117,8 @@ pub fn truncate_tail_to_width(text: &str, max: usize) -> String {
     let budget = max - 1;
     let mut width = 0;
     let mut start = text.len();
-    for (index, ch) in text.char_indices().rev() {
-        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        width += UnicodeWidthStr::width(grapheme);
         if width > budget {
             break;
         }
@@ -162,30 +163,31 @@ pub fn window(text: &str, from: usize, width: usize) -> Window {
 
 /// Byte offset where the first `max` columns of `text` end.
 ///
-/// A character that does not fit is left out whole, so the offset always falls
-/// on a character boundary.
+/// A grapheme that does not fit is left out whole, so the offset never lands
+/// inside a cluster — an emoji joined by zero width joiners counts as the two
+/// columns it draws as, not the sum of its parts.
 fn fit_offset(text: &str, max: usize) -> usize {
     let mut width = 0;
     let mut offset = 0;
-    for (index, ch) in text.char_indices() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > max {
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max {
             break;
         }
-        width += ch_width;
-        offset = index + ch.len_utf8();
+        width += grapheme_width;
+        offset = index + grapheme.len();
     }
     offset
 }
 
 /// Byte offset where `from` columns of scrolling have been passed.
 ///
-/// A character the window starts in the middle of is kept: dropping it would
-/// leave a gap where the pane begins.
+/// A grapheme the window starts in the middle of is kept: dropping half of it
+/// would draw garbage where the pane begins.
 fn skip_offset(text: &str, from: usize) -> usize {
     let mut width = 0;
-    for (index, ch) in text.char_indices() {
-        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (index, grapheme) in text.grapheme_indices(true) {
+        width += UnicodeWidthStr::width(grapheme);
         if width > from {
             return index;
         }
@@ -266,6 +268,29 @@ mod tests {
     fn measures_east_asian_width() {
         assert_eq!(display_width("abc"), 3);
         assert_eq!(display_width("あい"), 4);
+    }
+
+    #[test]
+    fn a_window_cuts_on_emoji_cluster_edges() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let line = format!("a{family}zz");
+        // Four columns of window: the cluster is two of them and stays whole.
+        let end = window(&line, 0, 4);
+        assert_eq!(&line[end.start..end.end], format!("a{family}"));
+        // Two columns of scrolling end inside the cluster, so the window
+        // starts at its first edge rather than halfway through it.
+        let start = window(&line, 2, 4);
+        assert_eq!(&line[start.start..start.start + family.len()], family);
+    }
+
+    #[test]
+    fn a_tail_cut_keeps_its_emoji_cluster_whole() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let name = format!("aa{family}");
+        assert_eq!(
+            truncate_tail_to_width(&name, 3),
+            format!("\u{2026}{family}")
+        );
     }
 
     #[test]
