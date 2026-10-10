@@ -137,6 +137,22 @@ pub fn fill_with(doc: &mut Doc, limits: Limits) {
     doc.highlight_truncated = truncated;
 }
 
+/// [`lines_of`] for a run the budget stopped: the same lines walked to the
+/// end, with only the hard line cap still in force (design §9.3).
+///
+/// Nothing on screen waits for this walk, so its clock does not run; the
+/// bound keeps a pathological grammar from holding the worker forever.
+pub fn finish_of(language: Language, lines: &[String]) -> (Vec<Vec<Span>>, bool) {
+    lines_of(
+        language,
+        lines,
+        Limits {
+            max_lines: Limits::default().max_lines,
+            max_duration: Duration::from_secs(60),
+        },
+    )
+}
+
 /// The meaning of every one of `lines`, the way [`Doc::spans`] holds them.
 ///
 /// The second half says whether the run stopped at a limit. An empty result
@@ -573,6 +589,31 @@ mod tests {
             after.contains(&("42".to_owned(), Semantic::Number)),
             "{after:?}"
         );
+    }
+
+    /// The budget stops the first walk; a second one over the same lines
+    /// finishes the colour with no clock of its own (design §9.3).
+    #[test]
+    fn a_walk_the_budget_stopped_is_finished_by_a_second_one() {
+        let mut doc = doc(Language::Rust, &rust());
+        fill_with(
+            &mut doc,
+            Limits {
+                max_lines: 2,
+                max_duration: Duration::from_secs(60),
+            },
+        );
+        assert!(doc.highlight_truncated);
+
+        let (spans, truncated) = finish_of(doc.language, &doc.lines);
+
+        assert!(!truncated, "the second walk has no clock to run out of");
+        assert_eq!(spans.len(), doc.lines.len());
+        // Every line the budget skipped that has meaning is coloured; the
+        // lone closing brace has none to give.
+        assert!(!spans[2].is_empty(), "{:?}", spans[2]);
+        assert!(!spans[3].is_empty(), "{:?}", spans[3]);
+        assert!(!spans[4].is_empty(), "{:?}", spans[4]);
     }
 
     #[test]

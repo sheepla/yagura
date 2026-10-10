@@ -135,6 +135,26 @@ pub fn on_loaded(
     }
 }
 
+/// Takes the colours that finish a load, if the pane is still on that read.
+///
+/// The body itself arrived with [`on_loaded`]; this is the rest of the run
+/// its budget stopped (design §9.3).
+pub fn on_highlights(
+    state: &mut AppState,
+    rel: PathBuf,
+    generation: u64,
+    spans: Vec<Vec<crate::core::highlight::Span>>,
+    truncated: bool,
+) -> Vec<Effect> {
+    if !state.preview.is_current(&rel, generation) {
+        // A newer selection won the race (invariant I3).
+        tracing::debug!(?rel, generation, "dropping stale highlights");
+        return Vec::new();
+    }
+    state.preview.set_highlights(spans, truncated);
+    Vec::new()
+}
+
 /// Points the preview at whatever should be showing, and returns the load to
 /// run, or nothing when the target did not change, which is the common case:
 /// every tree event comes through here.
@@ -340,6 +360,77 @@ mod tests {
         result: Result<Doc, PreviewError>,
     ) -> Vec<Effect> {
         on_loaded(state, PathBuf::from(rel), generation, result)
+    }
+
+    /// The colours beyond a load's budget take the place of the plain lines
+    /// and end the header's warning (design §9.3).
+    #[test]
+    fn the_colours_beyond_the_budget_take_the_place_of_the_plain_lines() {
+        use crate::core::highlight::{Semantic, Span};
+
+        let mut state = with_file();
+        sync_target(&mut state);
+        let generation = state.preview.generation;
+        let mut doc = sample("a.rs", &["let x = 1;", "fn main() {}"]);
+        doc.highlight_truncated = true;
+        deliver(&mut state, "a.rs", generation, Ok(doc));
+
+        let keyword = Span {
+            start: 0,
+            end: 3,
+            semantic: Semantic::Keyword,
+        };
+        on_highlights(
+            &mut state,
+            PathBuf::from("a.rs"),
+            generation,
+            vec![vec![keyword], Vec::new()],
+            false,
+        );
+
+        let doc = state
+            .preview
+            .doc
+            .as_deref()
+            .expect("the body is still here");
+        assert_eq!(doc.spans, vec![vec![keyword], Vec::new()]);
+        assert!(!doc.highlight_truncated, "the header stops saying it");
+    }
+
+    /// Colours for a read the pane has moved on from are dropped (I3).
+    #[test]
+    fn the_colours_of_a_read_that_is_no_longer_current_are_dropped() {
+        use crate::core::highlight::{Semantic, Span};
+
+        let mut state = with_file();
+        sync_target(&mut state);
+        let stale = state.preview.generation;
+        let mut doc = sample("a.rs", &["let x = 1;"]);
+        doc.highlight_truncated = true;
+        deliver(&mut state, "a.rs", stale, Ok(doc));
+        // A newer read of the same file has taken over, body and all.
+        reload(&mut state);
+        assert_ne!(state.preview.generation, stale);
+
+        let keyword = Span {
+            start: 0,
+            end: 3,
+            semantic: Semantic::Keyword,
+        };
+        on_highlights(
+            &mut state,
+            PathBuf::from("a.rs"),
+            stale,
+            vec![vec![keyword]],
+            false,
+        );
+
+        let doc = state.preview.doc.as_deref().expect("the body is here");
+        assert!(doc.spans.is_empty(), "the old colours never landed");
+        assert!(
+            doc.highlight_truncated,
+            "nor did they end the header's warning"
+        );
     }
 
     #[test]

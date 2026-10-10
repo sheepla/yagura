@@ -187,6 +187,23 @@ impl PreviewState {
         self.centre_here();
     }
 
+    /// Takes the colours that finish the load, keeping the body that is on
+    /// screen (design §9.3). Nothing but the meanings changes, so the view
+    /// does not move.
+    pub fn set_highlights(
+        &mut self,
+        spans: Vec<Vec<crate::core::highlight::Span>>,
+        truncated: bool,
+    ) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let mut doc = (**doc).clone();
+        doc.spans = spans;
+        doc.highlight_truncated = truncated;
+        self.doc = Some(Arc::new(doc));
+    }
+
     /// Takes the body away while the read for another kind of view is on
     /// its way (spec §6).
     ///

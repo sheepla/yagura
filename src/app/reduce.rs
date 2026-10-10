@@ -37,6 +37,15 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     {
         return preview::reducer::on_loaded(state, rel, generation, result);
     }
+    if let Action::PreviewHighlights {
+        rel,
+        generation,
+        spans,
+        truncated,
+    } = action
+    {
+        return preview::reducer::on_highlights(state, rel, generation, spans, truncated);
+    }
     if let Action::BaselineReady { ver, built } = action {
         return apply_baseline(state, ver, built);
     }
@@ -103,6 +112,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         | Action::Command(_)
         | Action::DirLoaded { .. }
         | Action::PreviewLoaded { .. }
+        | Action::PreviewHighlights { .. }
         | Action::BaselineReady { .. } => {
             // The tree owns the selection, the preview owns the scroll, and the
             // selection decides what the preview should be showing.

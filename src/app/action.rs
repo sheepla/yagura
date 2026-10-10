@@ -52,6 +52,18 @@ pub enum Action {
         generation: u64,
         result: Result<Doc, PreviewError>,
     },
+    /// The colours beyond the budget of a load arrived (design §9.3).
+    PreviewHighlights {
+        /// Path of the file relative to the root.
+        rel: PathBuf,
+        /// Generation the load was issued with; a mismatch means the colours
+        /// are stale and must be dropped (invariant I3).
+        generation: u64,
+        /// The meaning of every line, walked to the end of the run.
+        spans: Vec<Vec<crate::core::highlight::Span>>,
+        /// Whether lines past the hard cap are still plain.
+        truncated: bool,
+    },
     /// The baseline finished rebuilding.
     BaselineReady {
         /// Build number the request carried; a mismatch means the result is

@@ -13,7 +13,7 @@ use crate::core::baseline::{self, BaselineSource, Blob, Kind, Phase};
 use crate::core::fswatch::watcher::FsWatcher;
 use crate::core::preview::Baseline;
 use crate::core::text;
-use crate::core::{dirload, preview};
+use crate::core::{dirload, highlight, preview};
 use crate::features::finder::grep;
 
 /// How often the clock tick fires.
@@ -453,13 +453,33 @@ impl EffectRunner {
                     let baseline =
                         resolve_baseline(&slot, baseline_ver, &rel, want_diff || !present);
                     let result = preview::load_doc_with(&path, &rel, baseline, want_diff);
+                    // A run the budget stopped has more colour to bring
+                    // back after the body is on screen (design §9.3).
+                    let rest = match &result {
+                        Ok(doc) if doc.highlight_truncated => {
+                            Some(highlight::finish_of(doc.language, &doc.lines))
+                        }
+                        _ => None,
+                    };
                     let action = Action::PreviewLoaded {
-                        rel,
+                        rel: rel.clone(),
                         generation,
                         result,
                     };
                     if let Err(err) = tx.blocking_send(action) {
                         tracing::debug!(%err, "store is gone, dropping preview");
+                        return;
+                    }
+                    if let Some((spans, truncated)) = rest {
+                        let action = Action::PreviewHighlights {
+                            rel,
+                            generation,
+                            spans,
+                            truncated,
+                        };
+                        if let Err(err) = tx.blocking_send(action) {
+                            tracing::debug!(%err, "store is gone, dropping highlights");
+                        }
                     }
                 });
             }
