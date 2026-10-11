@@ -24,6 +24,26 @@ pub enum GitError {
     Failed(String),
 }
 
+/// A `git` command pointed at the repository containing `root`.
+///
+/// `GIT_DIR`, `GIT_WORK_TREE` and friends left over from the caller's own
+/// shell would make `git -C root` operate on the wrong repository, so they
+/// are dropped before the child starts.
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root);
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// The result of [`build`].
 #[derive(Debug)]
 pub struct Head {
@@ -38,9 +58,7 @@ pub struct Head {
 /// `rev-parse --git-dir` understands gitfiles, so linked worktrees and
 /// submodules answer for themselves.
 pub fn probe(root: &Path) -> Result<(), GitError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args(["rev-parse", "--git-dir"])
         .output()
         .map_err(spawn_error)?;
@@ -54,9 +72,7 @@ pub fn probe(root: &Path) -> Result<(), GitError> {
 /// Reads the changed set and `HEAD` of the repository containing `root`.
 pub fn build(root: &Path, now: SystemTime) -> Result<Head, GitError> {
     probe(root)?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args([
             "status",
             "--porcelain=v2",
@@ -140,8 +156,8 @@ fn status(root: &Path, paths: &[PathBuf]) -> Option<std::process::Output> {
         .iter()
         .map(|rel| format!(":(literal){}", rel.to_string_lossy().replace('\\', "/")))
         .collect();
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root).args([
+    let mut command = git_command(root);
+    command.args([
         "status",
         "--porcelain=v2",
         "-z",
@@ -213,9 +229,7 @@ fn stderr_line(output: &std::process::Output) -> String {
 
 /// `HEAD`, or `None` while no commit has been made yet.
 pub fn head_oid(root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
         .ok()?;
@@ -241,9 +255,7 @@ pub struct GitSource {
 impl GitSource {
     /// Starts a reader for the repository containing `root`.
     pub fn open(root: &Path) -> std::io::Result<GitSource> {
-        let prefix = Command::new("git")
-            .arg("-C")
-            .arg(root)
+        let prefix = git_command(root)
             .args(["rev-parse", "--show-prefix"])
             .output()
             .map(|output| {
@@ -252,9 +264,7 @@ impl GitSource {
                     .to_owned()
             })
             .unwrap_or_default();
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(root)
+        let mut child = git_command(root)
             .args(["cat-file", "--batch"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -363,6 +373,12 @@ impl Batch {
             self.alive = false;
             return Blob::Unreadable;
         };
+        // A header is only a number from the other side of a pipe; one that
+        // asks for more than the pane would ever read is not obeyed.
+        if size > MAX_BYTES {
+            self.alive = false;
+            return Blob::Unreadable;
+        }
         // The content is followed by one newline the protocol adds itself.
         let mut frame = vec![0; size + 1];
         if self.stdout.read_exact(&mut frame).is_err() {

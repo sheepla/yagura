@@ -72,6 +72,8 @@ impl GrepResults {
         self.generation = self.generation.wrapping_add(1);
         self.answered = false;
         self.running = false;
+        // The limit the last run stopped at says nothing about this one.
+        self.truncated = false;
         self.generation
     }
 

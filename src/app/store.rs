@@ -254,7 +254,16 @@ async fn wait_while_working<B: Backend>(
 ) -> io::Result<()> {
     loop {
         tokio::select! {
-            status = child.wait() => return status.map(|_| ()),
+            status = child.wait() => {
+                // A non-zero exit is the editor's own answer, not an error
+                // starting it; the log is the only place to put it.
+                if let Ok(status) = &status
+                    && !status.success()
+                {
+                    tracing::warn!(%status, "editor exited with a failure");
+                }
+                return status.map(|_| ());
+            }
             action = action_rx.recv() => match action {
                 Some(action) => {
                     for effect in store.handle(action) {

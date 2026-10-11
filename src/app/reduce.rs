@@ -342,6 +342,11 @@ fn cycle_preview_mode(state: &mut AppState) -> Vec<Effect> {
         ));
     }
     if before == state.preview_mode.is_diff() {
+        // Between the two diff modes the same body is drawn another way, so
+        // the read stays valid and only the record of it moves with the mode
+        // (§9.2); leaving it behind would ask for the file to be read again
+        // for nothing.
+        state.preview.mode = state.preview_mode;
         return Vec::new();
     }
     preview::reducer::reload(state)

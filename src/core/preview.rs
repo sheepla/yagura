@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use crate::core::diff::{Diff, MAX_DIFF_LINES, Row};
 use crate::core::highlight::{Limits, Span};
 use crate::core::text::{self, sanitize};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Bytes read from a file. Anything past this is dropped.
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -458,6 +460,17 @@ struct Body {
     truncated: bool,
 }
 
+/// Truncates `bytes` to the byte limit, dropping an incomplete character at
+/// the cut so the prefix still reads as valid UTF-8 when the file is fine.
+fn truncate_to_char_boundary(bytes: &mut Vec<u8>) {
+    bytes.truncate(MAX_BYTES);
+    if let Err(err) = std::str::from_utf8(bytes)
+        && err.error_len().is_none()
+    {
+        bytes.truncate(err.valid_up_to());
+    }
+}
+
 /// The metadata and the body of the file, up to the byte limit.
 ///
 /// Every step can lose a race with a writer, which is why the whole attempt is
@@ -478,7 +491,7 @@ fn read_body(path: &Path) -> std::io::Result<Body> {
         .read_to_end(&mut bytes)?;
     let truncated = bytes.len() > MAX_BYTES;
     if truncated {
-        bytes.truncate(MAX_BYTES);
+        truncate_to_char_boundary(&mut bytes);
     }
     Ok(Body {
         size,
@@ -602,7 +615,7 @@ fn deleted_doc(
     let mut bytes = content;
     let truncated = bytes.len() > MAX_BYTES;
     if truncated {
-        bytes.truncate(MAX_BYTES);
+        truncate_to_char_boundary(&mut bytes);
     }
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         let kind = binary_kind(&name.to_string_lossy().to_lowercase());
@@ -788,13 +801,13 @@ fn cut_wide(line: &str) -> String {
     }
     let mut out = String::new();
     let mut width = 0;
-    for ch in line.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > MAX_LINE_COLS - 1 {
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > MAX_LINE_COLS - 1 {
             break;
         }
-        out.push(ch);
-        width += ch_width;
+        out.push_str(grapheme);
+        width += grapheme_width;
     }
     out.push('…');
     out
@@ -893,6 +906,19 @@ mod tests {
         assert_eq!(doc.size, (MAX_BYTES + 10) as u64);
         assert_eq!(text::display_width(&doc.lines[0]), MAX_LINE_COLS);
         assert!(doc.header().contains("truncated"));
+    }
+
+    #[test]
+    fn a_cut_inside_a_character_is_not_an_invalid_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // One byte short of the limit, then a three-byte character: the cut
+        // lands inside it and the prefix must still read as valid UTF-8.
+        let mut body = vec![b'x'; MAX_BYTES - 1];
+        body.extend_from_slice("あああ".as_bytes());
+        let path = write(&dir, "cut.txt", &body);
+        let doc = load_doc(&path, Path::new("cut.txt")).expect("doc");
+        assert!(doc.truncated);
+        assert!(!doc.invalid_utf8, "the file is fine; only the read was cut");
     }
 
     #[test]

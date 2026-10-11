@@ -152,7 +152,7 @@ pub const BINDINGS: &[Binding] = &[
     binding!(WATCH, KeyCode::Enter, NONE, WatchAccept),
     binding!(WATCH, KeyCode::Char('w'), NONE, Back),
     binding!(WATCH, KeyCode::Esc, NONE, Back),
-    binding!(WATCH, KeyCode::Char('q'), NONE, Quit),
+    binding!(WATCH, KeyCode::Char('q'), NONE, Back),
     binding!(WATCH, KeyCode::Char('c'), CONTROL, Quit),
     // The help overlay (§5).
     binding!(HELP, KeyCode::Char('j'), NONE, HelpDown),
@@ -193,7 +193,13 @@ pub fn describe(binding: &Binding) -> String {
     }
     let name = match binding.code {
         KeyCode::Char(' ') => "Space".to_owned(),
-        KeyCode::Char(letter) => letter.to_uppercase().to_string(),
+        // A control combination is spelled with the capital letter, the way
+        // the terminal reports it; a bare letter is shown as it is typed so
+        // that `n` and `N` do not become one row in the help.
+        KeyCode::Char(letter) if binding.mods.contains(KeyModifiers::CONTROL) => {
+            letter.to_uppercase().to_string()
+        }
+        KeyCode::Char(letter) => letter.to_string(),
         KeyCode::Enter => "Enter".to_owned(),
         KeyCode::Esc => "Esc".to_owned(),
         KeyCode::Tab => "Tab".to_owned(),
@@ -665,7 +671,7 @@ mod tests {
         let quit = bindings_for(Context::Tree)
             .find(|binding| binding.command == Command::Quit && binding.code == KeyCode::Char('q'))
             .expect("q binding");
-        assert_eq!(describe(quit), "Q");
+        assert_eq!(describe(quit), "q");
         let control = bindings_for(Context::Tree)
             .find(|binding| binding.mods.contains(KeyModifiers::CONTROL))
             .expect("ctrl binding");

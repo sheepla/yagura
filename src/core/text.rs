@@ -92,6 +92,11 @@ pub fn display_width(text: &str) -> usize {
 
 /// Truncates `text` to at most `max` columns, marking the cut with `…`.
 pub fn truncate_to_width(text: &str, max: usize) -> String {
+    if max == 0 {
+        // Not even the ellipsis fits; a column the pane does not have cannot
+        // be borrowed for one.
+        return String::new();
+    }
     let window = window(text, 0, max);
     if !window.cut {
         return text.to_owned();
@@ -298,6 +303,6 @@ mod tests {
         assert_eq!(truncate_to_width("abcdef", 4), "abc…");
         assert_eq!(truncate_to_width("abc", 10), "abc");
         assert_eq!(truncate_to_width("あい", 3), "あ…");
-        assert_eq!(truncate_to_width("abcdef", 0), "…");
+        assert_eq!(truncate_to_width("abcdef", 0), "");
     }
 }

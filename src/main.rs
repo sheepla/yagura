@@ -22,7 +22,11 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("cannot start the async runtime")?;
 
-    runtime.block_on(run(config))
+    let outcome = runtime.block_on(run(config));
+    // A blocking task that is stuck in the filesystem must not keep the
+    // process alive after the UI has already said goodbye.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    outcome
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
@@ -98,7 +102,9 @@ fn init_logging(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(file)
         .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
+        // The file exists to answer questions about what the watcher was
+        // doing, and most of those questions are answered by `debug!`.
+        .with_max_level(tracing::Level::DEBUG)
         .init();
     tracing::info!(log = %path.display(), "logging to file");
     Ok(())

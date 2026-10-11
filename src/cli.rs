@@ -105,7 +105,9 @@ impl Config {
             icons: cli.icons,
             baseline: cli.baseline,
             ignore_enabled: !cli.no_ignore,
-            no_color: std::env::var_os("NO_COLOR").is_some(),
+            // The convention is a set and non-empty value; an empty string
+            // means the variable was never given a value.
+            no_color: std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
             log: cli.log,
             selftest_panic: cli.selftest_panic,
         })

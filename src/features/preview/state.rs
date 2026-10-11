@@ -133,10 +133,13 @@ impl PreviewState {
 
     /// Keeps the scroll inside the document.
     ///
-    /// A reload can make a document shorter, and a resize can make the pane
-    /// shorter, so every change to the geometry ends here.
+    /// A reload can make the document shorter, and a resize can make the pane
+    /// shorter, so every change to the geometry ends here. The column is
+    /// capped by the widest line the document has, so a rewrite that took the
+    /// width away cannot leave the view starting past every line it holds.
     pub fn clamp(&mut self) {
         self.scroll_line = self.scroll_line.min(self.max_scroll());
+        self.scroll_col = self.scroll_col.min(self.widest_line().saturating_sub(1));
     }
 
     /// Scrolls by whole lines, never past either end.
@@ -340,6 +343,19 @@ mod tests {
         assert_eq!(preview.language_label(), "plain");
         assert_eq!(preview.position(), 0);
         assert_eq!(preview.generation, 0);
+    }
+
+    #[test]
+    fn a_shorter_document_pulls_the_column_back_into_it() {
+        let mut preview = PreviewState::default();
+        preview.set_doc(doc("a.rs", &["let wide = 0000000000;"]));
+        preview.scroll_col = 5;
+        // The file is rewritten without anything like its old width.
+        preview.set_doc(doc("a.rs", &["x"]));
+        assert_eq!(
+            preview.scroll_col, 0,
+            "the view cannot start past every line the document holds"
+        );
     }
 
     #[test]

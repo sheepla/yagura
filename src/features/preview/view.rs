@@ -511,16 +511,23 @@ fn cut_range<'a>(
     base: Role,
     theme: &Theme,
 ) -> Vec<Span<'a>> {
-    // Every place the drawing can change: both ends of the range, the ends
-    // of the runs, and the ends of the hit.
+    // Every place the drawing can change: both ends of the range and the ends
+    // of the runs and hits that reach into it. A run or a hit wholly outside
+    // the window is left out, so nothing past the edges can leak into the
+    // line — and no cut can fall outside `[start, end]`, where slicing would
+    // read text the window never showed or panic past the end.
     let mut cuts = vec![start, end];
     for run in runs {
-        cuts.push(run.start.max(start));
-        cuts.push(run.end.min(end));
+        if run.start < end && start < run.end {
+            cuts.push(run.start.max(start));
+            cuts.push(run.end.min(end));
+        }
     }
     for &(hit_start, hit_end) in hits {
-        cuts.push(hit_start.max(start));
-        cuts.push(hit_end.min(end));
+        if hit_start < end && start < hit_end {
+            cuts.push(hit_start.max(start));
+            cuts.push(hit_end.min(end));
+        }
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -816,6 +823,44 @@ mod tests {
         let filler = "word ".repeat(6);
         let text = buffer(&laid_out(&format!("{}{family} more", filler.trim_end())));
         assert!(text.contains(family), "the cluster was split:\n{text}");
+    }
+
+    #[test]
+    fn a_run_outside_the_window_never_reaches_the_line() {
+        let state = state();
+        let runs = [highlight::Span {
+            start: 0,
+            end: 2,
+            semantic: Semantic::Keyword,
+        }];
+        // The window starts past the run entirely: only the window's own
+        // text may come out of it.
+        let out = cut_range("abcd", &runs, &[], 2, 4, Role::PreviewText, &state.theme);
+        let text: String = out.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "cd");
+    }
+
+    #[test]
+    fn a_hit_reaching_past_the_line_is_clipped_to_it() {
+        let state = state();
+        // A grep hit measured against the raw file line lands past the drawn
+        // one, whose text a markdown layout has rewritten (§9.4).
+        let out = cut_range(
+            "abcd",
+            &[],
+            &[(1, 40)],
+            0,
+            4,
+            Role::PreviewText,
+            &state.theme,
+        );
+        let text: String = out.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "abcd");
+        assert!(
+            out.iter()
+                .any(|span| span.style == state.theme.style(Role::MatchHighlight)),
+            "the part of the hit inside the line lights up"
+        );
     }
 
     #[test]

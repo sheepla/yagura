@@ -104,7 +104,9 @@ impl Theme {
 
     /// Reads `NO_COLOR` from the environment.
     pub fn from_env() -> Self {
-        Self::new(std::env::var_os("NO_COLOR").is_some())
+        // The convention is a set and non-empty value; an empty string means
+        // the variable was never given a value.
+        Self::new(std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()))
     }
 
     pub fn is_no_color(&self) -> bool {

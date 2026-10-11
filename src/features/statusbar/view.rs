@@ -63,10 +63,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 /// The message alone, so that it is styled separately from the mode.
+///
+/// Messages are built from file names, git answers and error text; none of
+/// those are trusted, so they pass through the same sanitizing as the rest of
+/// what reaches the terminal (invariant I5).
 fn message_part(state: &AppState) -> String {
     state
         .visible_message()
-        .map(|message| message.text.clone())
+        .map(|message| crate::core::text::sanitize(&message.text))
         .unwrap_or_default()
 }
 

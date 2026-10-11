@@ -264,8 +264,10 @@ fn on_chunk(state: &mut AppState, generation: u64, matches: &[grep::GrepMatch]) 
     }
     if !state.finder.grep.answered {
         // The first answer of this run replaces the list rather than joining
-        // it: the rows still on screen are answers to the last query.
+        // it: the rows still on screen are answers to the last query, and
+        // the hits behind them have nobody to answer to any more.
         state.finder.grep.answered = true;
+        state.finder.grep.matches.clear();
         state.finder.shown.clear();
         state.finder.select_first();
         state.finder.scroll = 0;
@@ -825,6 +827,15 @@ mod tests {
         crate::app::reduce::reduce(&mut state, Action::Command(Command::FinderInsert('c')));
         grep_chunk(&mut state, &[hit("c.rs", 3)]);
         assert_eq!(grepped(&state), ["c.rs:3"], "the first batch replaces");
+        assert_eq!(
+            state.finder.grep.matches.len(),
+            1,
+            "the hits of the query before have nobody waiting for them"
+        );
+        assert!(
+            !state.finder.grep.truncated,
+            "the limit the last run stopped at is not this run's"
+        );
     }
 
     #[test]

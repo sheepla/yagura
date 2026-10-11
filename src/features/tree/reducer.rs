@@ -314,7 +314,18 @@ fn cycle_sort(state: &mut AppState) {
 
 fn expand_selected(state: &mut AppState, effects: &mut Vec<Effect>) {
     if let Some(node) = state.tree.selected {
-        expand_node(state, node, effects);
+        if state
+            .tree
+            .model
+            .get(node)
+            .is_some_and(|entry| entry.is_expandable())
+        {
+            expand_node(state, node, effects);
+        } else {
+            // A file has nothing to expand, so the key does what `Enter`
+            // does with one and hands the pane over to the preview (spec §5).
+            open_selected(state, effects);
+        }
     }
 }
 
