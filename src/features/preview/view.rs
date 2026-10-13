@@ -26,6 +26,17 @@ pub const GUTTER_COLS: usize = 5;
 /// and the status bar says why (§9.2).
 pub const SPLIT_MIN_COLS: u16 = 100;
 
+/// The columns of text the pane draws beside the gutter, the way the plain
+/// and inline layouts count them: the gutter itself and the column of air
+/// kept beside it come out of the width the pane offers.
+///
+/// `area` is the pane's inner rectangle, the margin already taken off. The
+/// sideways scroll is measured against this, so a scroll that reaches the
+/// end of the count lands on the last column the pane actually shows.
+pub fn text_width(area: Rect) -> usize {
+    area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize
+}
+
 /// Draws the file header above the body.
 pub fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
@@ -166,8 +177,7 @@ fn body<'a>(state: &'a AppState, mode: PreviewMode, doc: &'a Doc, area: Rect) ->
 /// sideways: its lines are already as wide as they read.
 fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
     let height = state.preview.height();
-    // The gutter takes five columns, and the pane keeps one column of margin.
-    let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
+    let width = text_width(area);
     let marks = state.preview.marks();
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     let mut index = state.preview.scroll_line;
@@ -235,7 +245,7 @@ fn plain_body<'a>(state: &'a AppState, doc: &'a Doc, area: Rect) -> Text<'a> {
 /// A grapheme is the unit of both the counting and the breaking: an emoji
 /// joined by zero width joiners draws as two columns and never loses half of
 /// itself to the next row.
-fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
+pub fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
     if line.is_empty() {
         return vec![(0, 0)];
     }
@@ -270,7 +280,7 @@ fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
 /// The language colours the meaning inside the row over that colour (§6).
 fn inline_body<'a>(state: &'a AppState, doc: &'a Doc, rows: &'a [Row], area: Rect) -> Text<'a> {
     let height = state.preview.height();
-    let width = area.width.saturating_sub(GUTTER_COLS as u16 + 1) as usize;
+    let width = text_width(area);
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     let end = doc
         .lines
@@ -412,6 +422,87 @@ fn cell_spans<'a>(
         ));
     }
     spans
+}
+
+/// How the split view lays the diff's rows out as cells.
+///
+/// A Removed row and the Added row beside it share one cell, so the cell
+/// count is never more than the row count. `row_to_cell[row]` is the cell
+/// the row lands on; `cell_to_row[cell]` is the first row that lands on
+/// the cell, so a scroll measured in rows can be carried into the split
+/// view and back.
+pub struct SideSpan {
+    pub row_to_cell: Vec<usize>,
+    pub cell_to_row: Vec<usize>,
+}
+
+impl SideSpan {
+    /// The mapping for `rows`, and the number of cells it becomes.
+    pub fn of(rows: &[Row]) -> SideSpan {
+        let mut row_to_cell = vec![0; rows.len()];
+        let mut cell_to_row: Vec<Option<usize>> = Vec::new();
+        let mut cell = 0;
+        let mut index = 0;
+        while index < rows.len() {
+            match &rows[index] {
+                Row::Context(_) | Row::Fold(_) => {
+                    row_to_cell[index] = cell;
+                    if cell_to_row.len() <= cell {
+                        cell_to_row.resize(cell + 1, None);
+                    }
+                    cell_to_row[cell] = Some(index);
+                    cell += 1;
+                    index += 1;
+                }
+                Row::Removed(_) | Row::Added(_) => {
+                    let start = index;
+                    while index < rows.len()
+                        && matches!(rows[index], Row::Removed(_) | Row::Added(_))
+                    {
+                        index += 1;
+                    }
+                    let mut removed_pos = 0;
+                    let mut added_pos = 0;
+                    for (offset, row) in rows[start..index].iter().enumerate() {
+                        let pos = match row {
+                            Row::Removed(_) => {
+                                let pos = removed_pos;
+                                removed_pos += 1;
+                                pos
+                            }
+                            Row::Added(_) => {
+                                let pos = added_pos;
+                                added_pos += 1;
+                                pos
+                            }
+                            _ => 0,
+                        };
+                        let here = cell + pos;
+                        row_to_cell[start + offset] = here;
+                        if cell_to_row.len() <= here {
+                            cell_to_row.resize(here + 1, None);
+                        }
+                        if cell_to_row[here].is_none() {
+                            cell_to_row[here] = Some(start + offset);
+                        }
+                    }
+                    cell += removed_pos.max(added_pos);
+                }
+            }
+        }
+        SideSpan {
+            row_to_cell,
+            cell_to_row: cell_to_row
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect(),
+        }
+    }
+
+    /// The number of cells the whole diff becomes.
+    pub fn cell_count(&self) -> usize {
+        self.cell_to_row.len()
+    }
 }
 
 /// Pairs the rows into the two columns: within a change block the two runs
@@ -1300,5 +1391,43 @@ mod tests {
                 Cell::Blank => None,
             }
         }
+    }
+
+    #[test]
+    fn the_side_span_pairs_removals_with_additions() {
+        use crate::core::diff::{Diff, Row};
+
+        // Three context lines, then a removal and an addition that pair up,
+        // then two removals against one addition: the extra removal keeps
+        // its own cell.
+        let diff = Diff::compute(
+            "keep\na\nb\nc\nold1\nold2\nold3\nend\n",
+            "keep\na\nb\nc\nnew1\nend\n",
+        )
+        .expect("diff");
+        let span = SideSpan::of(&diff.rows);
+        let cell_of = |row: usize| span.row_to_cell[row];
+        let kind = |row: usize| match &diff.rows[row] {
+            Row::Context(_) => "ctx",
+            Row::Removed(_) => "rem",
+            Row::Added(_) => "add",
+            Row::Fold(_) => "fold",
+        };
+        // The paired removal and addition share one cell.
+        let rem = (0..diff.rows.len())
+            .find(|&row| kind(row) == "rem")
+            .expect("a removal");
+        let add = (0..diff.rows.len())
+            .find(|&row| kind(row) == "add")
+            .expect("an addition");
+        assert_eq!(cell_of(rem), cell_of(add), "the pair shares a cell");
+        // The cell count never exceeds the row count.
+        assert!(span.cell_count() <= diff.rows.len());
+        // Every row lands on a cell inside the count.
+        for row in 0..diff.rows.len() {
+            assert!(cell_of(row) < span.cell_count(), "row {row}");
+        }
+        // The first cell is the first row.
+        assert_eq!(cell_of(0), 0);
     }
 }

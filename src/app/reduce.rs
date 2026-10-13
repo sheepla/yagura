@@ -496,9 +496,10 @@ fn merge_changed(
         .collect()
 }
 
-/// Gives the preview pane its height from the current layout.
+/// Gives the preview pane its height and text width from the current layout.
 pub fn sync_preview_viewport(state: &mut AppState) {
     state.preview.viewport = state.preview_viewport_height();
+    state.preview.body_width = crate::features::preview::reducer::body_width(state);
     state.preview.clamp();
 }
 

@@ -63,6 +63,9 @@ pub struct PreviewState {
     pub language: String,
     /// Lines the pane can show; set from the layout when the size changes.
     pub viewport: usize,
+    /// Columns of text the pane draws beside the gutter; set from the layout
+    /// when the size changes, and what a wrapped line is measured against.
+    pub body_width: usize,
     /// The hit the pane is aimed at, while one is set.
     pub focus: Option<MatchFocus>,
     /// Line to bring to the middle once the body of the aimed file is there.
@@ -122,8 +125,52 @@ impl PreviewState {
     }
 
     /// The last line the pane can scroll to.
+    ///
+    /// A laid out document is wrapped to the pane, so a page holds fewer
+    /// source lines than the pane is tall; the last page is found by walking
+    /// back from the end rather than by subtraction.
     pub fn max_scroll(&self) -> usize {
-        self.total_lines.saturating_sub(self.height())
+        if self.total_lines <= self.height() {
+            return 0;
+        }
+        if self
+            .doc
+            .as_ref()
+            .is_some_and(|doc| doc.formatted && self.body_width > 0)
+        {
+            self.formatted_max_scroll()
+        } else {
+            self.total_lines.saturating_sub(self.height())
+        }
+    }
+
+    /// The last line of a wrapped document the pane can start at, so that the
+    /// end of the document is still within reach.
+    ///
+    /// Walks back from the end, counting the rows each line wraps to, until
+    /// the pane would be full; the line after the one that overflowed is where
+    /// the last page begins.
+    fn formatted_max_scroll(&self) -> usize {
+        let Some(doc) = self.doc.as_ref() else {
+            return 0;
+        };
+        let width = self.body_width;
+        let height = self.height();
+        let mut rows = 0;
+        let mut line = self.total_lines;
+        while line > 0 {
+            line -= 1;
+            let wraps = super::view::wrap_ranges(&doc.lines[line], width)
+                .len()
+                .max(1);
+            if rows + wraps > height {
+                // `line` does not fit on the last page; it starts the one
+                // before. Never scroll past the last line itself.
+                return (line + 1).min(self.total_lines.saturating_sub(1));
+            }
+            rows += wraps;
+        }
+        0
     }
 
     /// How far the view is from the end, for the `Top`/`Bot`/`NN%` label.
@@ -609,6 +656,30 @@ mod tests {
         preview.target(PathBuf::from("a.rs"));
         accept(&mut preview, "a.rs", 1, Ok(doc("a.rs", &vec!["line"; 100])));
         preview
+    }
+
+    #[test]
+    fn a_wrapped_document_reaches_its_last_line() {
+        // Ten source lines, each wide enough to wrap to three rows in a pane
+        // that is five rows tall and ten columns wide: the last line is
+        // still within reach.
+        let wide = "x".repeat(25);
+        let lines: Vec<&str> = vec![wide.as_str(); 10];
+        let mut preview = PreviewState {
+            viewport: 5,
+            body_width: 10,
+            ..Default::default()
+        };
+        preview.target(PathBuf::from("a.md"));
+        let mut body = doc("a.md", &lines);
+        body.formatted = true;
+        accept(&mut preview, "a.md", 1, Ok(body));
+        // Each line wraps to three rows (25 columns at 10 wide). The last
+        // page begins where the remaining rows fit in the pane: line nine
+        // holds three rows, so it is the last line the pane can start at.
+        assert_eq!(preview.max_scroll(), 9);
+        preview.scroll_line = preview.max_scroll();
+        assert!(preview.at_bottom());
     }
 
     #[test]

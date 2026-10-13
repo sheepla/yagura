@@ -67,18 +67,39 @@ fn jump_hunk(state: &mut AppState, command: Command) -> Vec<Effect> {
     if !state.preview_mode.is_diff() {
         return Vec::new();
     }
+    let split = state.preview_mode == PreviewMode::SideBySide
+        && state.size.0 >= crate::features::preview::view::SPLIT_MIN_COLS;
     let target = state
         .preview
         .doc
         .as_ref()
         .and_then(|doc| doc.diff.as_ref())
         .and_then(|diff| {
-            let here = state.preview.scroll_line;
-            match command {
-                Command::NextHunk => diff.hunks.iter().copied().find(|hunk| *hunk > here),
-                Command::PrevHunk => diff.hunks.iter().rev().copied().find(|hunk| *hunk < here),
+            // In the split view a Removed row pairs with the Added row beside
+            // it, so the scroll is measured in cells; the hunks name rows.
+            let span = split.then(|| crate::features::preview::view::SideSpan::of(&diff.rows));
+            let here_row = match &span {
+                Some(span) => span
+                    .cell_to_row
+                    .get(state.preview.scroll_line)
+                    .copied()
+                    .unwrap_or(0),
+                None => state.preview.scroll_line,
+            };
+            let hunk_row = match command {
+                Command::NextHunk => diff.hunks.iter().copied().find(|hunk| *hunk > here_row),
+                Command::PrevHunk => diff
+                    .hunks
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|hunk| *hunk < here_row),
                 _ => None,
-            }
+            };
+            hunk_row.map(|row| match &span {
+                Some(span) => span.row_to_cell.get(row).copied().unwrap_or(row),
+                None => row,
+            })
         });
     if let Some(target) = target {
         state.preview.scroll_line = target;
@@ -97,8 +118,10 @@ pub fn body_width(state: &AppState) -> usize {
     } else {
         crate::ui::layout::compute(state.area(), state.tree_visible).preview
     };
-    let text = area.width.saturating_sub(PANE_MARGIN) as usize;
-    text.saturating_sub(super::view::GUTTER_COLS)
+    // The pane keeps a column of margin on each side before the gutter and
+    // the text are laid out; the count has to match what the pane draws.
+    let inner = area.inner(ratatui::layout::Margin::new(PANE_MARGIN, 0));
+    super::view::text_width(inner)
 }
 
 /// Columns of margin the preview pane keeps on each side.
@@ -583,11 +606,13 @@ mod tests {
         reduce(&mut state, &Action::Command(Command::ScrollRight));
         assert_eq!(state.preview.scroll_col, 1);
         // A page sideways stops where the widest line still fills the pane,
-        // so the right edge of the document is not scrolled past.
+        // so the right edge of the document is not scrolled past. The count
+        // is the text the pane draws beside the gutter, so the last column
+        // of the widest line is reachable.
         let width = body_width(&state);
-        assert_eq!(state.preview.max_scroll_col(width), 3);
+        assert_eq!(state.preview.max_scroll_col(width), 5);
         reduce(&mut state, &Action::Command(Command::ScrollPageRight));
-        assert_eq!(state.preview.scroll_col, 3);
+        assert_eq!(state.preview.scroll_col, 5);
         reduce(&mut state, &Action::Command(Command::ScrollPageLeft));
         assert_eq!(state.preview.scroll_col, 0);
         reduce(&mut state, &Action::Command(Command::ScrollLeft));
