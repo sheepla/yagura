@@ -54,6 +54,9 @@ fn git_command(root: &Path) -> Command {
         command.env_remove(name);
     }
     command.env("GIT_TERMINAL_PROMPT", "0");
+    // Older git honours the askpass helper in preference to the terminal;
+    // pointing it at `echo` answers a credential question with nothing.
+    command.env("GIT_ASKPASS", "echo");
     command
 }
 
