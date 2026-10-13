@@ -678,6 +678,11 @@ pub fn on_rescan(state: &mut AppState) -> Vec<Effect> {
     if state.preview.path.is_some() {
         effects.extend(crate::features::preview::reducer::reload(state));
     }
+    // Events were lost, and a move of `HEAD` among them would otherwise
+    // leave the baseline comparing against a commit that is no longer the
+    // tip (§8.2). The runner debounces and throttles the check, so one
+    // per rescan costs a single `rev-parse` at most.
+    effects.push(Effect::CheckHead);
     effects
 }
 

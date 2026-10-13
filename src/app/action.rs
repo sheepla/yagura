@@ -82,8 +82,13 @@ pub enum Action {
     /// So much happened at once that nothing was remembered: the tree has to
     /// be read again (§7.2).
     FsRescanNeeded,
-    /// The status of some paths came back from the baseline (§7.3).
-    StatsComputed { results: Vec<StatAnswer> },
+    /// The status of some paths came back from the baseline (§7.3), along
+    /// with the `HEAD` they were read under: one that differs from the
+    /// baseline on screen means the baseline itself is behind (§8.2).
+    StatsComputed {
+        head: Option<String>,
+        results: Vec<StatAnswer>,
+    },
     /// What `git rev-parse HEAD` answered (§8.2).
     HeadChecked { oid: Option<String> },
     /// One chunk of paths the finder's walk has found (§13.2).

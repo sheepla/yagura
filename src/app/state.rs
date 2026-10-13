@@ -146,6 +146,10 @@ pub struct BaselineState {
     pub repo: bool,
     /// `HEAD` of the last build, for the header line.
     pub head_oid: Option<String>,
+    /// A `HEAD` that moved while a build was still in flight; applied once
+    /// the build lands. The inner option is the oid itself, which may be
+    /// `None` on an unborn branch (§8.2).
+    pub pending_head: Option<Option<String>>,
     /// Every file that differs from the baseline, relative to the root.
     pub changed: BTreeMap<PathBuf, ChangedEntry>,
 }
@@ -159,6 +163,7 @@ impl BaselineState {
             ver: 1,
             repo: false,
             head_oid: None,
+            pending_head: None,
             changed: BTreeMap::new(),
         }
     }

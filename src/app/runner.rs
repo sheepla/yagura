@@ -561,10 +561,12 @@ impl EffectRunner {
         let snapshot_slot = Arc::clone(&self.snapshot);
         tokio::task::spawn_blocking(move || {
             let rels: Vec<PathBuf> = asked.iter().map(|(rel, _)| rel.clone()).collect();
-            let answers = match kind {
+            let (head, answers) = match kind {
                 Kind::Head => baseline::git::stats(&root, &rels, at),
                 Kind::Snapshot => match wait_for_snapshot(&snapshot_slot) {
-                    Some(captured) => baseline::snapshot::stats(&root, &captured, &rels, at),
+                    Some(captured) => {
+                        (None, baseline::snapshot::stats(&root, &captured, &rels, at))
+                    }
                     None => return,
                 },
             };
@@ -582,7 +584,7 @@ impl EffectRunner {
                     entry,
                 })
                 .collect();
-            let action = Action::StatsComputed { results };
+            let action = Action::StatsComputed { head, results };
             if let Err(err) = tx.blocking_send(action) {
                 tracing::debug!(%err, "store is gone, dropping stats");
             }
@@ -1015,7 +1017,7 @@ mod tests {
             .await
             .expect("no stats in time")
             .expect("channel closed");
-        let Action::StatsComputed { results } = action else {
+        let Action::StatsComputed { head: _, results } = action else {
             panic!("expected a stats result");
         };
         assert_eq!(results.len(), 1, "{results:?}");
@@ -1211,9 +1213,13 @@ mod tests {
             .await
             .expect("no stats answer in time")
             .expect("channel closed");
-        let Action::StatsComputed { results } = action else {
+        let Action::StatsComputed { head, results } = action else {
             panic!("expected a stats answer, got {action:?}");
         };
+        assert!(
+            head.is_some(),
+            "the answers say which HEAD they were read under"
+        );
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].rel, PathBuf::from("a.txt"));
         assert_eq!(results[0].generation, 4);

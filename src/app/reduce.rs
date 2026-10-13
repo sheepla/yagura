@@ -49,8 +49,8 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if let Action::BaselineReady { ver, built } = action {
         return apply_baseline(state, ver, built);
     }
-    if let Action::StatsComputed { results } = action {
-        return apply_stats(state, results);
+    if let Action::StatsComputed { head, results } = action {
+        return apply_stats(state, head, results);
     }
     if let Action::Command(Command::ToggleBaseline) = action {
         return toggle_baseline(state);
@@ -146,10 +146,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         // build has answered there is nothing to compare against, and a
         // rebuild of it would only be thrown away.
         Action::HeadChecked { oid } => {
-            if state.baseline.kind != Kind::Head
-                || state.baseline.phase != Phase::Ready
-                || oid == &state.baseline.head_oid
-            {
+            if state.baseline.kind != Kind::Head || oid == &state.baseline.head_oid {
+                return Vec::new();
+            }
+            if state.baseline.phase != Phase::Ready {
+                // The build in flight reads a `HEAD` of its own; when it
+                // lands, its oid is compared against this one and the
+                // rebuild is issued then (§8.2).
+                state.baseline.pending_head = Some(oid.clone());
                 return Vec::new();
             }
             state.baseline.ver += 1;
@@ -379,6 +383,20 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
             ver: state.baseline.ver,
         });
     }
+    // A `HEAD` that moved while this build was in flight is not what this
+    // build answers against: the rebuild the move asked for is issued now
+    // that the phase is Ready again (§8.2).
+    if let Some(pending) = state.baseline.pending_head.take()
+        && state.baseline.kind == Kind::Head
+        && state.baseline.phase == Phase::Ready
+        && pending.as_ref() != state.baseline.head_oid.as_ref()
+    {
+        state.baseline.ver += 1;
+        effects.push(Effect::BuildBaseline {
+            kind: state.baseline.kind,
+            ver: state.baseline.ver,
+        });
+    }
     if let Some(message) = built.message {
         state.set_info(message);
     }
@@ -398,7 +416,16 @@ fn apply_baseline(state: &mut AppState, ver: u64, built: Built) -> Vec<Effect> {
 /// one is already on its way, and the two would disagree only for as long
 /// as it takes to arrive. A path that no longer differs at all leaves the
 /// set, which is what takes its status off the row again.
-fn apply_stats(state: &mut AppState, results: Vec<StatAnswer>) -> Vec<Effect> {
+///
+/// The answers were read under `head`, and a `HEAD` that differs from the
+/// one the baseline was built against means the baseline itself is behind:
+/// the rebuild a move of `HEAD` asks for is issued here, for the case
+/// where no `HeadChecked` reached the reducer (§8.2).
+fn apply_stats(
+    state: &mut AppState,
+    head: Option<String>,
+    results: Vec<StatAnswer>,
+) -> Vec<Effect> {
     let mut answered = false;
     for answer in results {
         if state.stats_gen.get(&answer.rel) != Some(&answer.generation) {
@@ -421,6 +448,17 @@ fn apply_stats(state: &mut AppState, results: Vec<StatAnswer>) -> Vec<Effect> {
     }
     if answered {
         apply_changed(state);
+    }
+    if let Some(head) = head
+        && state.baseline.kind == Kind::Head
+        && state.baseline.phase == Phase::Ready
+        && Some(&head) != state.baseline.head_oid.as_ref()
+    {
+        state.baseline.ver += 1;
+        return vec![Effect::BuildBaseline {
+            kind: state.baseline.kind,
+            ver: state.baseline.ver,
+        }];
     }
     Vec::new()
 }
@@ -1575,6 +1613,7 @@ mod tests {
         let effects = reduce(
             &mut state,
             Action::StatsComputed {
+                head: None,
                 results: vec![StatAnswer {
                     rel: PathBuf::from("a.txt"),
                     generation: 1,
@@ -1600,6 +1639,7 @@ mod tests {
         reduce(
             &mut state,
             Action::StatsComputed {
+                head: None,
                 results: vec![StatAnswer {
                     rel: PathBuf::from("a.txt"),
                     generation: 1,
@@ -1636,6 +1676,7 @@ mod tests {
         reduce(
             &mut state,
             Action::StatsComputed {
+                head: None,
                 results: vec![StatAnswer {
                     rel: PathBuf::from("a.txt"),
                     generation: 1,
@@ -1707,13 +1748,105 @@ mod tests {
     }
 
     #[test]
-    fn a_head_check_has_nothing_to_compare_against_before_the_first_build() {
+    fn a_head_that_moves_before_the_first_build_is_applied_when_it_lands() {
         let mut state = state();
         assert_eq!(state.baseline.phase, Phase::Loading);
+        // The move cannot be compared against a baseline that does not
+        // exist yet, so it waits for the build in flight.
         let effects = reduce(
             &mut state,
             Action::HeadChecked {
                 oid: Some("aaa".to_owned()),
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(state.baseline.ver, 1);
+        assert_eq!(
+            state.baseline.pending_head,
+            Some(Some("aaa".to_owned())),
+            "the move waits for the build in flight"
+        );
+
+        // The build answers with an older `HEAD`: the wait's rebuild is
+        // issued now that there is a baseline to replace.
+        let effects = reduce(
+            &mut state,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(true, Some("old"), BTreeMap::new()),
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Head,
+                ver: 2
+            }],
+            "{effects:?}"
+        );
+
+        // A build that answers with the very `HEAD` that moved needs no
+        // rebuild: it already answers against it.
+        let mut already = self::state();
+        reduce(
+            &mut already,
+            Action::HeadChecked {
+                oid: Some("aaa".to_owned()),
+            },
+        );
+        let effects = reduce(
+            &mut already,
+            Action::BaselineReady {
+                ver: 1,
+                built: built(true, Some("aaa"), BTreeMap::new()),
+            },
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(already.baseline.ver, 1);
+    }
+
+    #[test]
+    fn stats_read_under_a_moved_head_rebuild_the_baseline() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = with_a_changed_file();
+        state.stats_gen.insert(PathBuf::from("a.txt"), 1);
+        let effects = reduce(
+            &mut state,
+            Action::StatsComputed {
+                head: Some("bbb".to_owned()),
+                results: vec![StatAnswer {
+                    rel: PathBuf::from("a.txt"),
+                    generation: 1,
+                    entry: Some(entry(Status::Modified, SystemTime::UNIX_EPOCH)),
+                }],
+            },
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::BuildBaseline {
+                kind: Kind::Head,
+                ver: 2
+            }],
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn stats_read_under_the_baseline_head_rebuild_nothing() {
+        use crate::core::fsmodel::Status;
+
+        let mut state = with_a_changed_file();
+        state.stats_gen.insert(PathBuf::from("a.txt"), 1);
+        let effects = reduce(
+            &mut state,
+            Action::StatsComputed {
+                head: Some("aaa".to_owned()),
+                results: vec![StatAnswer {
+                    rel: PathBuf::from("a.txt"),
+                    generation: 1,
+                    entry: Some(entry(Status::Modified, SystemTime::UNIX_EPOCH)),
+                }],
             },
         );
         assert!(effects.is_empty(), "{effects:?}");

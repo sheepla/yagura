@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use super::{BaselineSource, Blob, ChangedEntry};
 use crate::core::diff::{Diff, DiffStat};
@@ -20,15 +20,27 @@ pub enum GitError {
     NoGit,
     #[error("not a git repository")]
     NotARepo,
+    #[error("git timed out")]
+    TimedOut,
     #[error("git status failed: {0}")]
     Failed(String),
 }
+
+/// How long one `git` invocation may run before it is killed.
+///
+/// A repository on a stalled network mount, an `index.lock` left behind by
+/// a crashed `git`, or a credential prompt nobody can answer would each
+/// hold a worker forever. Ten seconds is far longer than any of these
+/// answers in good health, and short enough that the pane stays alive.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A `git` command pointed at the repository containing `root`.
 ///
 /// `GIT_DIR`, `GIT_WORK_TREE` and friends left over from the caller's own
 /// shell would make `git -C root` operate on the wrong repository, so they
-/// are dropped before the child starts.
+/// are dropped before the child starts. A prompt for credentials nobody
+/// can type is refused the same way, rather than waiting on a terminal
+/// this process does not have.
 fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(root);
@@ -41,7 +53,66 @@ fn git_command(root: &Path) -> Command {
     ] {
         command.env_remove(name);
     }
+    command.env("GIT_TERMINAL_PROMPT", "0");
     command
+}
+
+/// `git -C root <args>`, run under [`GIT_TIMEOUT`].
+fn git_output(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = git_command(root);
+    command.args(args);
+    output_with_timeout(command, GIT_TIMEOUT)
+}
+
+/// Drains one pipe of a child on a thread of its own.
+///
+/// The pipes have to be read while the child runs: a `git status` of a
+/// large work tree fills them past the point where the child would block
+/// on the write, and a blocked child never reaches the deadline.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// Runs `command` to completion, or kills it once `timeout` has passed.
+///
+/// `Command::output` waits without a bound; this is the same wait with a
+/// deadline, and the error says so when it fires.
+fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let out_thread = drain(stdout);
+    let err_thread = drain(stderr);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("git did not answer within {timeout:?}"),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
 }
 
 /// The result of [`build`].
@@ -58,10 +129,7 @@ pub struct Head {
 /// `rev-parse --git-dir` understands gitfiles, so linked worktrees and
 /// submodules answer for themselves.
 pub fn probe(root: &Path) -> Result<(), GitError> {
-    let output = git_command(root)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .map_err(spawn_error)?;
+    let output = git_output(root, &["rev-parse", "--git-dir"]).map_err(spawn_error)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -72,16 +140,17 @@ pub fn probe(root: &Path) -> Result<(), GitError> {
 /// Reads the changed set and `HEAD` of the repository containing `root`.
 pub fn build(root: &Path, now: SystemTime) -> Result<Head, GitError> {
     probe(root)?;
-    let output = git_command(root)
-        .args([
+    let output = git_output(
+        root,
+        &[
             "status",
             "--porcelain=v2",
             "-z",
             "--no-renames",
             "--untracked-files=all",
-        ])
-        .output()
-        .map_err(spawn_error)?;
+        ],
+    )
+    .map_err(spawn_error)?;
     if !output.status.success() {
         return Err(GitError::Failed(stderr_line(&output)));
     }
@@ -108,45 +177,61 @@ pub fn build(root: &Path, now: SystemTime) -> Result<Head, GitError> {
 /// filtered back down to what was asked for.
 const PATHSPEC_BUDGET: usize = 8_000;
 
-/// The status of the given paths against `HEAD` (§7.3).
+/// How long one batch of answers may take to work out.
+///
+/// A rescan asks about every file in a work tree at once; past this the
+/// rest of the batch is left unanswered rather than holding the worker,
+/// and the paths still showing a stale status are asked again on the next
+/// change or rescan.
+const STATS_BUDGET: Duration = Duration::from_millis(500);
+
+/// The status of the given paths against `HEAD` (§7.3), and the `HEAD` the
+/// answers were read under.
 ///
 /// One answer per requested path, in the order it was asked for; a path
 /// that no longer differs at all is answered with `None`, which is what
-/// takes it back out of the changed set. An empty result means nothing
-/// could be worked out - no `git`, no repository, a command that failed -
-/// and the caller then leaves what it has alone.
+/// takes it back out of the changed set. Past [`STATS_BUDGET`] the tail of
+/// the batch is simply left out. An empty result means nothing could be
+/// worked out - no `git`, no repository, a command that failed - and the
+/// caller then leaves what it has alone.
 pub fn stats(
     root: &Path,
     paths: &[PathBuf],
     at: SystemTime,
-) -> Vec<(PathBuf, Option<ChangedEntry>)> {
+) -> (Option<String>, Vec<(PathBuf, Option<ChangedEntry>)>) {
     if paths.is_empty() {
-        return Vec::new();
+        return (None, Vec::new());
     }
     let output = match status(root, paths) {
         Some(output) if output.status.success() => output,
-        _ => return Vec::new(),
+        _ => return (None, Vec::new()),
     };
     let reported = parse_status(&output.stdout, at);
     // The counts are read through one process, and only while there is a
     // `HEAD` to count against: without one the two sides cannot be compared.
-    let source = head_oid(root)
-        .is_some()
-        .then(|| GitSource::open(root).ok())
-        .flatten();
-    paths
-        .iter()
-        .map(|rel| {
-            let entry = reported.get(rel).map(|found| ChangedEntry {
-                status: found.status,
-                changed_at: at,
-                stat: source
-                    .as_ref()
-                    .and_then(|source| stat_of(source, root, rel, found.status)),
-            });
-            (rel.clone(), entry)
-        })
-        .collect()
+    let head = head_oid(root);
+    let source = head.as_ref().and_then(|_| GitSource::open(root).ok());
+    let deadline = Instant::now() + STATS_BUDGET;
+    let mut answers = Vec::with_capacity(paths.len());
+    for rel in paths {
+        let entry = reported.get(rel).map(|found| ChangedEntry {
+            status: found.status,
+            changed_at: at,
+            stat: source
+                .as_ref()
+                .and_then(|source| stat_of(source, root, rel, found.status)),
+        });
+        answers.push((rel.clone(), entry));
+        if Instant::now() >= deadline {
+            tracing::debug!(
+                answered = answers.len(),
+                asked = paths.len(),
+                "the stats budget was spent"
+            );
+            break;
+        }
+    }
+    (head, answers)
 }
 
 /// `git status` for the given paths, or for the whole work tree when they
@@ -168,7 +253,9 @@ fn status(root: &Path, paths: &[PathBuf]) -> Option<std::process::Output> {
         command.arg("--");
         command.args(specs);
     }
-    command.output().map_err(spawn_error).ok()
+    output_with_timeout(command, GIT_TIMEOUT)
+        .map_err(spawn_error)
+        .ok()
 }
 
 /// The `+N -N ~N` of one changed file against `HEAD`, or `None` when the
@@ -211,10 +298,10 @@ fn read_capped(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn spawn_error(err: std::io::Error) -> GitError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        GitError::NoGit
-    } else {
-        GitError::Failed(crate::core::text::os_error(&err))
+    match err.kind() {
+        std::io::ErrorKind::NotFound => GitError::NoGit,
+        std::io::ErrorKind::TimedOut => GitError::TimedOut,
+        _ => GitError::Failed(crate::core::text::os_error(&err)),
     }
 }
 
@@ -229,10 +316,7 @@ fn stderr_line(output: &std::process::Output) -> String {
 
 /// `HEAD`, or `None` while no commit has been made yet.
 pub fn head_oid(root: &Path) -> Option<String> {
-    let output = git_command(root)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .ok()?;
+    let output = git_output(root, &["rev-parse", "--verify", "HEAD"]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -255,9 +339,7 @@ pub struct GitSource {
 impl GitSource {
     /// Starts a reader for the repository containing `root`.
     pub fn open(root: &Path) -> std::io::Result<GitSource> {
-        let prefix = git_command(root)
-            .args(["rev-parse", "--show-prefix"])
-            .output()
+        let prefix = git_output(root, &["rev-parse", "--show-prefix"])
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
                     .trim_end()
@@ -272,12 +354,17 @@ impl GitSource {
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
+        // The answers are read on a thread of their own: a `git` that
+        // never answers costs a killed process rather than a caller that
+        // waits on the pipe forever.
+        let (answers_tx, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || read_frames(stdout, answers_tx));
         Ok(GitSource {
             prefix,
             batch: Mutex::new(Batch {
                 child,
                 stdin,
-                stdout: BufReader::new(stdout),
+                answers,
                 alive: true,
             }),
         })
@@ -321,11 +408,70 @@ impl BaselineSource for GitSource {
     }
 }
 
+/// One answer from the `cat-file --batch` process.
+enum Frame {
+    Bytes(Vec<u8>),
+    Absent,
+    /// The stream said something the protocol does not allow: it can no
+    /// longer be trusted to line answers up with requests.
+    Broken,
+}
+
+/// Reads answers off the pipe until it ends, one [`Frame`] per request.
+///
+/// This runs on a thread of its own so that a `git` that never answers is
+/// met with a timeout and a kill rather than a blocked caller.
+fn read_frames(stdout: ChildStdout, answers: std::sync::mpsc::Sender<Frame>) {
+    let mut stdout = BufReader::new(stdout);
+    loop {
+        let mut header = String::new();
+        match stdout.read_line(&mut header) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let header = header.trim_end_matches(['\r', '\n']);
+        // The answer to a name git cannot resolve is `<spec> missing`.
+        if header == "missing" || header.ends_with(" missing") {
+            if answers.send(Frame::Absent).is_err() {
+                return;
+            }
+            continue;
+        }
+        // The last field of the header is the byte count of the frame.
+        let Some(size) = header
+            .rsplit(' ')
+            .next()
+            .and_then(|last| last.parse::<usize>().ok())
+        else {
+            let _ = answers.send(Frame::Broken);
+            return;
+        };
+        // A header is only a number from the other side of a pipe; one that
+        // asks for more than the pane would ever read is not obeyed.
+        if size > MAX_BYTES {
+            let _ = answers.send(Frame::Broken);
+            return;
+        }
+        // The content is followed by one newline the protocol adds itself.
+        let mut frame = vec![0; size + 1];
+        if stdout.read_exact(&mut frame).is_err() {
+            let _ = answers.send(Frame::Broken);
+            return;
+        }
+        frame.truncate(size);
+        if answers.send(Frame::Bytes(frame)).is_err() {
+            return;
+        }
+    }
+}
+
 /// The `git cat-file --batch` process and its pipes.
 struct Batch {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// The thread started in [`GitSource::open`] hands an answer to each
+    /// request; a broken one or a silent [`GIT_TIMEOUT`] ends the batch.
+    answers: std::sync::mpsc::Receiver<Frame>,
     /// False once an answer did not arrive: the stream can no longer be
     /// trusted to line answers up with requests.
     alive: bool,
@@ -346,47 +492,18 @@ impl Batch {
             self.alive = false;
             return Blob::Unreadable;
         }
-        self.read_object()
-    }
-
-    /// Reads one `<oid> blob <size>` frame, or a `<spec> missing` answer.
-    fn read_object(&mut self) -> Blob {
-        let mut header = String::new();
-        match self.stdout.read_line(&mut header) {
-            Ok(0) | Err(_) => {
+        match self.answers.recv_timeout(GIT_TIMEOUT) {
+            Ok(Frame::Bytes(bytes)) => Blob::Bytes(bytes),
+            Ok(Frame::Absent) => Blob::Absent,
+            Ok(Frame::Broken) | Err(_) => {
+                // No answer within the bound, or one that cannot be
+                // trusted: the process goes, so the next request cannot
+                // wait on it too.
                 self.alive = false;
-                return Blob::Unreadable;
+                let _ = self.child.kill();
+                Blob::Unreadable
             }
-            Ok(_) => {}
         }
-        let header = header.trim_end_matches(['\r', '\n']);
-        // The answer to a name git cannot resolve is `<spec> missing`.
-        if header == "missing" || header.ends_with(" missing") {
-            return Blob::Absent;
-        }
-        // The last field of the header is the byte count of the frame.
-        let Some(size) = header
-            .rsplit(' ')
-            .next()
-            .and_then(|last| last.parse::<usize>().ok())
-        else {
-            self.alive = false;
-            return Blob::Unreadable;
-        };
-        // A header is only a number from the other side of a pipe; one that
-        // asks for more than the pane would ever read is not obeyed.
-        if size > MAX_BYTES {
-            self.alive = false;
-            return Blob::Unreadable;
-        }
-        // The content is followed by one newline the protocol adds itself.
-        let mut frame = vec![0; size + 1];
-        if self.stdout.read_exact(&mut frame).is_err() {
-            self.alive = false;
-            return Blob::Unreadable;
-        }
-        frame.truncate(size);
-        Blob::Bytes(frame)
     }
 }
 
@@ -755,7 +872,11 @@ mod tests {
             PathBuf::from("b.txt"),
             PathBuf::from("a.txt"),
         ];
-        let answers = stats(dir.path(), &asked, at);
+        let (head, answers) = stats(dir.path(), &asked, at);
+        assert!(
+            head.is_some(),
+            "the answers say which HEAD they are against"
+        );
         let answered: Vec<(&Path, Option<Status>)> = answers
             .iter()
             .map(|(rel, entry)| (rel.as_path(), entry.as_ref().map(|entry| entry.status)))
@@ -794,7 +915,7 @@ mod tests {
             .sum();
         assert!(budget > PATHSPEC_BUDGET, "{budget} fits on one command");
 
-        let answers = stats(dir.path(), &asked, at);
+        let (_, answers) = stats(dir.path(), &asked, at);
         assert_eq!(answers.len(), asked.len());
         assert_eq!(
             answers[0].1.as_ref().map(|entry| entry.status),
@@ -812,7 +933,40 @@ mod tests {
         let at = SystemTime::UNIX_EPOCH;
         // No repository, so nothing could be worked out: the caller is told
         // so by an empty result rather than by paths that all look clean.
-        assert!(stats(dir.path(), &[PathBuf::from("a.txt")], at).is_empty());
-        assert!(stats(dir.path(), &[], at).is_empty());
+        let (head, answers) = stats(dir.path(), &[PathBuf::from("a.txt")], at);
+        assert!(head.is_none());
+        assert!(answers.is_empty());
+        let (head, answers) = stats(dir.path(), &[], at);
+        assert!(head.is_none());
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn a_timeout_is_reported_as_such() {
+        let err = spawn_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "x"));
+        assert_eq!(err, GitError::TimedOut);
+    }
+
+    #[test]
+    fn a_command_that_does_not_answer_is_killed() {
+        // Something that would run for half a minute, given the chance.
+        let command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let started = Instant::now();
+        let err = output_with_timeout(command, Duration::from_millis(100))
+            .expect_err("the command hangs");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the kill did not come promptly: {:?}",
+            started.elapsed()
+        );
     }
 }
