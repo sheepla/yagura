@@ -36,6 +36,10 @@ pub struct TreeState {
     pub load_gen: HashMap<NodeId, u64>,
     /// Nodes with a directory load in flight.
     pub loading: HashSet<NodeId>,
+    /// Nodes whose listing was asked for again while one was already in
+    /// flight: the answer in hand predates the change that asked, so once it
+    /// lands the load is issued again rather than left to the next event.
+    pub pending_relist: HashSet<NodeId>,
     /// Sibling order.
     pub sort: SortMode,
     /// Only the rows that changed or were seen to change (`c`, design §11.3).
@@ -60,6 +64,7 @@ impl TreeState {
             cached_ver: u64::MAX,
             load_gen: HashMap::new(),
             loading: HashSet::new(),
+            pending_relist: HashSet::new(),
             sort: SortMode::Name,
             changed_only: false,
             viewport: 0,

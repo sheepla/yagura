@@ -439,6 +439,19 @@ fn issue_load(state: &mut AppState, node: NodeId, effects: &mut Vec<Effect>) {
     });
 }
 
+/// Asks for a listing again after a change (§7.2).
+///
+/// A load already in flight is marked: the answer on its way predates this
+/// change, so once it lands [`issue_load`] goes out again rather than
+/// leaving the change to the next event. A user opening a directory does
+/// not pass through here - the listing in flight is still the right one.
+fn relist(state: &mut AppState, node: NodeId, effects: &mut Vec<Effect>) {
+    if state.tree.loading.contains(&node) {
+        state.tree.pending_relist.insert(node);
+    }
+    issue_load(state, node, effects);
+}
+
 fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     let Action::DirLoaded {
         node,
@@ -451,6 +464,7 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     state.tree.loading.remove(node);
     // The node may have been removed while the listing was in flight.
     if !state.tree.model.contains(*node) {
+        state.tree.pending_relist.remove(node);
         return Vec::new();
     }
     // A newer request for the same node has been issued: this one is stale.
@@ -505,6 +519,17 @@ fn on_dir_loaded(state: &mut AppState, action: &Action) -> Vec<Effect> {
     // listing is the only thing that can bring it any closer (§4).
     if state.tree.jump.is_some() {
         finish_jump(state, &mut effects);
+    }
+    // A change asked for this listing while an older one was already in
+    // flight; the answer just landed predates that change, so the load goes
+    // out again rather than waiting for the next event.
+    if state.tree.pending_relist.remove(node) {
+        issue_load(state, *node, &mut effects);
+    }
+    // The newest change may sit below this directory, and a listing is what
+    // brings its row into reach; follow is retried now that it can (§11.4).
+    if state.follow {
+        apply_follow(state, &mut effects);
     }
     effects
 }
@@ -632,12 +657,12 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
 
     if ignore_changed {
         for node in loaded_dirs(state) {
-            issue_load(state, node, &mut effects);
+            relist(state, node, &mut effects);
         }
     }
     for parent in relists {
         if let Some(node) = state.tree.model.lookup(&parent) {
-            issue_load(state, node, &mut effects);
+            relist(state, node, &mut effects);
         }
     }
     if head_may_have_moved {
@@ -666,7 +691,7 @@ pub fn on_fs_batch(state: &mut AppState, changes: &[FsChange], at: SystemTime) -
 pub fn on_rescan(state: &mut AppState) -> Vec<Effect> {
     let mut effects = Vec::new();
     for node in loaded_dirs(state) {
-        issue_load(state, node, &mut effects);
+        relist(state, node, &mut effects);
     }
     // The listings come back either way; what they cannot say is whether a
     // file they already held has changed, so every file in them is asked
@@ -1355,6 +1380,92 @@ mod tests {
             })
             .count();
         assert_eq!(loads, 1, "and its body is asked for: {effects:?}");
+    }
+
+    #[test]
+    fn follow_reaches_a_change_a_listing_just_made_reachable() {
+        let mut state = populated();
+        differs(&mut state, "README.md", at());
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::ToggleFollow));
+        assert_eq!(
+            state.tree.selected.and_then(|n| rel_of(&state, n)),
+            Some(PathBuf::from("README.md"))
+        );
+
+        // A change below `src`, which has never been listed: the row does not
+        // exist yet, so follow cannot reach it while the listing is out.
+        let later = at() + Duration::from_secs(5);
+        differs(&mut state, "src/main.rs", later);
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("src/main.rs", ChangeKind::Modify)],
+            later,
+        );
+        assert_eq!(
+            state.tree.selected.and_then(|n| rel_of(&state, n)),
+            Some(PathBuf::from("README.md")),
+            "the row does not exist yet"
+        );
+        let src = state.tree.model.lookup(Path::new("src")).expect("src");
+        assert!(load_dirs(&effects).contains(&src), "{effects:?}");
+
+        // The listing lands, and with it the row follow was waiting for.
+        let generation = state.tree.load_gen[&src];
+        crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: src,
+                generation,
+                result: Ok(vec![entry("main.rs", NodeKind::File)]),
+            },
+        );
+        assert_eq!(
+            state.tree.selected.and_then(|n| rel_of(&state, n)),
+            Some(PathBuf::from("src/main.rs")),
+            "the listing brought the row into reach and follow took it"
+        );
+    }
+
+    #[test]
+    fn a_change_during_a_load_asks_for_the_listing_again() {
+        let mut state = populated();
+        let src = state.tree.model.lookup(Path::new("src")).expect("src");
+        state.tree.select(src);
+        crate::app::reduce::reduce(&mut state, Action::Command(Command::Expand));
+        assert!(
+            state.tree.loading.contains(&src),
+            "the load for src is in flight"
+        );
+
+        // A change arrives while the load is in flight: the answer on its way
+        // predates it, so once it lands the load goes out again rather than
+        // leaving the change to the next event.
+        let effects = on_fs_batch(
+            &mut state,
+            &[change("src/new.rs", ChangeKind::Create)],
+            at(),
+        );
+        assert!(
+            !load_dirs(&effects).contains(&src),
+            "the load is already in flight: {effects:?}"
+        );
+        assert!(state.tree.pending_relist.contains(&src));
+
+        // The listing lands (without new.rs: it predates the change).
+        let generation = state.tree.load_gen[&src];
+        let effects = crate::app::reduce::reduce(
+            &mut state,
+            Action::DirLoaded {
+                node: src,
+                generation,
+                result: Ok(vec![entry("old.rs", NodeKind::File)]),
+            },
+        );
+        assert!(
+            load_dirs(&effects).contains(&src),
+            "the load is asked again: {effects:?}"
+        );
+        assert!(!state.tree.pending_relist.contains(&src));
     }
 
     #[test]
